@@ -2,6 +2,30 @@ use zed_extension_api as zed;
 
 struct GodotExtension;
 
+struct BridgeConfig {
+    settings: zed::settings::LspSettings,
+    command: String,
+    binary_arguments: Vec<String>,
+}
+
+fn bridge_config(worktree: &zed::Worktree) -> zed::Result<BridgeConfig> {
+    let settings = zed::settings::LspSettings::for_worktree("godot", worktree)?;
+    let binary = settings.binary.as_ref();
+    let command = binary
+        .and_then(|binary| binary.path.clone())
+        .or_else(|| worktree.which("godot-bridge"))
+        .ok_or_else(|| "Install godot-bridge: cargo install --path bridge".to_string())?;
+    let binary_arguments = binary
+        .and_then(|binary| binary.arguments.clone())
+        .unwrap_or_default();
+
+    Ok(BridgeConfig {
+        settings,
+        command,
+        binary_arguments,
+    })
+}
+
 impl zed::Extension for GodotExtension {
     fn new() -> Self {
         Self
@@ -12,22 +36,15 @@ impl zed::Extension for GodotExtension {
         _language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> zed::Result<zed::Command> {
-        let settings = zed::settings::LspSettings::for_worktree("godot", worktree)?;
-        let command_settings = settings.binary.as_ref();
-        let command = command_settings
-            .and_then(|binary| binary.path.clone())
-            .or_else(|| worktree.which("godot-bridge"))
-            .ok_or_else(|| "Install godot-bridge: cargo install --path bridge".to_string())?;
+        let config = bridge_config(worktree)?;
         let mut args = vec!["lsp".to_string()];
-        if let Some(binary_arguments) =
-            command_settings.and_then(|binary| binary.arguments.as_ref())
-        {
+        if !config.binary_arguments.is_empty() {
             args.push("--".to_string());
-            args.extend(binary_arguments.iter().cloned());
+            args.extend(config.binary_arguments);
         }
 
         Ok(zed::Command {
-            command,
+            command: config.command,
             args,
             env: worktree.shell_env(),
         })
@@ -63,36 +80,34 @@ impl zed::Extension for GodotExtension {
     ) -> zed::Result<zed::DebugAdapterBinary, String> {
         let config_value: zed::serde_json::Value =
             zed::serde_json::from_str(&config.config).map_err(|error| error.to_string())?;
-        let settings = zed::settings::LspSettings::for_worktree("godot", worktree)?;
-        let binary_settings = settings.binary.as_ref();
-        let command = binary_settings
-            .and_then(|binary| binary.path.clone())
-            .or_else(|| worktree.which("godot-bridge"))
-            .ok_or_else(|| "Install godot-bridge: cargo install --path bridge".to_string())?;
+        let file = config_value
+            .get("file")
+            .and_then(|file| file.as_str())
+            .map(str::to_owned);
+        let request = self.dap_request_kind(config.adapter, config_value)?;
+        let bridge = bridge_config(worktree)?;
 
         let mut arguments = vec!["dap".to_string()];
-        if let Some(file) = config_value.get("file").and_then(|file| file.as_str()) {
-            arguments.extend(["--file".to_string(), file.to_string()]);
+        if let Some(file) = file {
+            arguments.extend(["--file".to_string(), file]);
         }
-        if let Some(binary_arguments) = binary_settings.and_then(|binary| binary.arguments.as_ref())
-        {
+        if !bridge.binary_arguments.is_empty() {
             arguments.push("--".to_string());
-            arguments.extend(binary_arguments.iter().cloned());
+            arguments.extend(bridge.binary_arguments);
         }
 
-        let request = self.dap_request_kind(config.adapter.clone(), config_value)?;
-        let settings_json = settings
+        let settings_json = bridge
             .settings
-            .as_ref()
-            .map(zed::serde_json::to_string)
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_else(|| "{}".to_string());
-        let mut envs = vec![("GODOT_BRIDGE_SETTINGS".to_string(), settings_json)];
-        envs.extend(worktree.shell_env());
+            .settings
+            .unwrap_or_else(|| zed::serde_json::json!({}));
+        let settings_json =
+            zed::serde_json::to_string(&settings_json).map_err(|error| error.to_string())?;
+        let mut envs = worktree.shell_env();
+        envs.retain(|(key, _)| key != "GODOT_BRIDGE_SETTINGS");
+        envs.push(("GODOT_BRIDGE_SETTINGS".to_string(), settings_json));
 
         Ok(zed::DebugAdapterBinary {
-            command: Some(command),
+            command: Some(bridge.command),
             arguments,
             envs,
             cwd: Some(worktree.root_path()),
