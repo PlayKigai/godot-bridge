@@ -4,6 +4,7 @@ pub mod dap;
 pub mod doc;
 pub mod docs_state;
 pub mod error;
+pub mod file_uri;
 pub mod fnv;
 pub mod framing;
 pub mod godot_bin;

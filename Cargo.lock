@@ -227,12 +227,10 @@ dependencies = [
  "json5",
  "libc",
  "notify",
- "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "url",
 ]
 
 [[package]]

@@ -9,7 +9,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use url::Url;
 
 pub enum Protocol {
     Lsp,
@@ -120,9 +119,7 @@ pub fn fixture(name: &str) -> PathBuf {
 }
 
 pub fn file_uri(path: &Path) -> String {
-    Url::from_file_path(path.canonicalize().unwrap())
-        .unwrap()
-        .to_string()
+    godot_bridge::file_uri::path_to_uri(&path.canonicalize().unwrap())
 }
 
 pub fn godot_available(test: &str) -> bool {
