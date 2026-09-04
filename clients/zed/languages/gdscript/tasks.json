@@ -1,0 +1,46 @@
+[
+  {
+    "label": "godot: run project",
+    "command": "godot-bridge",
+    "args": [
+      "run",
+      "--file",
+      "$ZED_FILE"
+    ]
+  },
+  {
+    "label": "godot: run current scene",
+    "command": "godot-bridge",
+    "args": [
+      "run",
+      "--file",
+      "$ZED_FILE",
+      "--scene",
+      "current"
+    ]
+  },
+  {
+    "label": "godot: open editor",
+    "command": "godot-bridge",
+    "args": [
+      "open-editor",
+      "--file",
+      "$ZED_FILE"
+    ]
+  },
+  {
+    "label": "godot: docs for symbol",
+    "command": "godot-bridge",
+    "args": [
+      "doc",
+      "$ZED_SYMBOL"
+    ]
+  },
+  {
+    "label": "godot: bridge status",
+    "command": "godot-bridge",
+    "args": [
+      "status"
+    ]
+  }
+]

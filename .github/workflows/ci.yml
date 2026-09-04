@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      geiger:
+        description: Run cargo geiger unsafe-code scan
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+      - run: cargo fetch --locked
+      - run: python3 scripts/check_build_scripts.py
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - run: cargo test --locked --offline
+      - run: cargo build --locked --offline --target wasm32-wasip2 -p godot-zed-extension
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua5.4 && luac5.4 -p lua/godot-bridge/init.lua plugin/godot-bridge.lua
+
+  vscode:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: ./node_modules/.bin/tsc --noEmit
+      - run: npm run build
+
+  check-windows:
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+        with:
+          components: clippy
+      - run: cargo fetch --locked
+      - run: python3 scripts/check_build_scripts.py
+      - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - run: cargo test --locked --offline -p godot-bridge
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: cargo-vet@0.10.2
+      - run: cargo vet --locked
+
+  geiger:
+    if: github.event_name == 'workflow_dispatch' && inputs.geiger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: cargo-geiger@0.13.0
+      - run: cargo geiger --manifest-path "$PWD/bridge/Cargo.toml" --output-format Ascii

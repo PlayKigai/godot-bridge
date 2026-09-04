@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "string",
+      "enum": ["launch", "attach"]
+    },
+    "scene": {
+      "type": "string"
+    },
+    "file": {
+      "type": "string"
+    }
+  },
+  "required": ["request"],
+  "additionalProperties": false
+}

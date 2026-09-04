@@ -1,0 +1,92 @@
+*godot-bridge.txt*          GDScript in Neovim via the Godot editor's own
+                            language server and debugger. Backed by the
+                            `godot-bridge` CLI.
+
+==============================================================================
+INTRODUCTION                                          *godot-bridge-intro*
+
+This plugin wires Neovim to the `godot-bridge` binary from
+https://github.com/PlayKigai/godot-bridge. It provides an LSP client for GDScript, run/editor/doc
+commands, and optional nvim-dap debugging. Neovim 0.10 or later. The only
+optional dependency is nvim-dap, required just for |godot-bridge-dap|.
+
+The bridge must be installed and on PATH, or pointed at with `bridge_path`:
+>
+    cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked
+<
+
+Install with lazy.nvim:
+>
+    {
+      "PlayKigai/godot-bridge",
+      ft = "gdscript",
+      opts = {},
+    }
+<
+lazy.nvim calls `require("godot-bridge").setup(opts)` for you.
+
+==============================================================================
+SETUP                                                     *godot-bridge-setup*
+
+The language server starts only after `require("godot-bridge").setup()`;
+the commands work with defaults without it.
+
+>
+    require("godot-bridge").setup({
+      bridge_path = "godot-bridge",      -- name on PATH, or a path (~/ and home-relative allowed)
+      settings = {                       -- sent verbatim as JSON, see below
+        project_diagnostics = false,
+      },
+    })
+<
+
+On setup the plugin runs `godot-bridge --version` asynchronously and
+warns if it fails or the major.minor differs from the plugin's version. On
+macOS the bridge is unsupported; an error is shown and nothing else happens.
+
+Settings (all optional; only keys you set are sent):
+>
+    godot_path            string   godot binary path, default "godot"
+    project_dir           string   dir containing project.godot, relative to root
+    lsp_port              integer  attach to an editor you started yourself
+    dap_port              integer  debug port, used only with lsp_port, default 6006
+    project_diagnostics   bool     diagnostics for all scripts, default true
+    diagnose_addons       bool     include addons/, default false
+    extra_args            string[] extra Godot flags
+    startup_timeout_s     integer  how long to wait for Godot, default 600
+<
+On FileType gdscript the plugin finds the project root by searching upward
+for `project.godot`. One LSP client runs per root.
+
+==============================================================================
+COMMANDS                                                  *godot-bridge-commands*
+
+:GodotRun                    Run the project.
+:GodotRunScene               Run the scene of the current file.
+:GodotEditor                 Swap headless Godot for the GUI editor.
+:GodotDoc [symbol]           Open class reference. Defaults to the word under
+                             the cursor (dots included).
+:GodotStatus                 Print bridge status.
+:GodotRestart                Stop the client for the current root and start
+                             it again.
+
+Commands run in the project root and report output on exit.
+
+==============================================================================
+DAP                                                   *godot-bridge-dap*
+
+Requires nvim-dap. Call after `require("godot-bridge").setup(...)`:
+>
+    require("godot-bridge").dap()
+<
+Registers the `godot` adapter and the `gdscript` configurations:
+>
+    Godot: run project        launch, scene "main"
+    Godot: run current scene  launch, scene "current"
+    Godot: attach             attach
+<
+The adapter passes the current buffer path as `--file`, needed for
+`scene: "current"`. The `lsp` for the same project must already be running.
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:

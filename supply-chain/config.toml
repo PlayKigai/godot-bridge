@@ -1,0 +1,275 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
+[[exemptions.anyhow]]
+version = "1.0.104"
+criteria = "safe-to-deploy"
+
+[[exemptions.bitflags]]
+version = "2.13.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.crc32fast]]
+version = "1.5.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.displaydoc]]
+version = "0.2.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.flate2]]
+version = "1.1.10"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-channel]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-core]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-executor]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-io]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-macro]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-sink]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-task]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.futures-util]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.hashbrown]]
+version = "0.15.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_collections]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_locale_core]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_normalizer]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_normalizer_data]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_properties]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_properties_data]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.icu_provider]]
+version = "2.3.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.id-arena]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.idna_adapter]]
+version = "1.2.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.indexmap]]
+version = "2.14.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.itoa]]
+version = "1.0.18"
+criteria = "safe-to-deploy"
+
+[[exemptions.libc]]
+version = "0.2.189"
+criteria = "safe-to-deploy"
+
+[[exemptions.litemap]]
+version = "0.8.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.log]]
+version = "0.4.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.memchr]]
+version = "2.8.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.miniz_oxide]]
+version = "0.9.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.once_cell]]
+version = "1.21.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.pin-project-lite]]
+version = "0.2.17"
+criteria = "safe-to-deploy"
+
+[[exemptions.potential_utf]]
+version = "0.1.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.prettyplease]]
+version = "0.2.37"
+criteria = "safe-to-deploy"
+
+[[exemptions.proc-macro2]]
+version = "1.0.107"
+criteria = "safe-to-deploy"
+
+[[exemptions.serde]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+
+[[exemptions.serde_core]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+
+[[exemptions.serde_derive]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+
+[[exemptions.serde_json]]
+version = "1.0.151"
+criteria = "safe-to-deploy"
+
+[[exemptions.simd-adler32]]
+version = "0.3.10"
+criteria = "safe-to-deploy"
+
+[[exemptions.slab]]
+version = "0.4.12"
+criteria = "safe-to-deploy"
+
+[[exemptions.smallvec]]
+version = "1.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.spdx]]
+version = "0.10.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.stable_deref_trait]]
+version = "1.2.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.syn]]
+version = "2.0.119"
+criteria = "safe-to-deploy"
+
+[[exemptions.syn]]
+version = "3.0.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.tinystr]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.unicode-ident]]
+version = "1.0.24"
+criteria = "safe-to-deploy"
+
+[[exemptions.url]]
+version = "2.5.8"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-link]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-sys]]
+version = "0.61.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.writeable]]
+version = "0.6.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.yoke]]
+version = "0.8.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.yoke-derive]]
+version = "0.8.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.zed_extension_api]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.zerofrom]]
+version = "0.1.8"
+criteria = "safe-to-deploy"
+
+[[exemptions.zerofrom-derive]]
+version = "0.1.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.zerotrie]]
+version = "0.2.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.zerovec]]
+version = "0.11.8"
+criteria = "safe-to-deploy"
+
+[[exemptions.zerovec-derive]]
+version = "0.11.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.zlib-rs]]
+version = "0.6.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.zmij]]
+version = "1.0.23"
+criteria = "safe-to-deploy"

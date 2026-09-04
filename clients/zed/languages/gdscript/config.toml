@@ -1,0 +1,19 @@
+name = "GDScript"
+grammar = "gdscript"
+path_suffixes = ["gd"]
+line_comments = ["# ", "## "]
+autoclose_before = ":.,}])>"
+brackets = [
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false },
+    { start = "'", end = "'", close = true, newline = false },
+]
+hard_tabs = true
+increase_indent_pattern = ":\\s*$"
+decrease_indent_patterns = [
+    { pattern = "^\\s*else\\b.*:", valid_after = ["if", "elif", "for", "while"] },
+    { pattern = "^\\s*elif\\b.*:", valid_after = ["if", "elif"] },
+]
+debuggers = ["godot"]

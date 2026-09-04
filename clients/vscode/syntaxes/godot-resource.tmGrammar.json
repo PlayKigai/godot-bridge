@@ -1,0 +1,42 @@
+{
+  "scopeName": "source.godot-resource",
+  "name": "Godot Resource",
+  "fileTypes": ["tscn", "tres", "godot", "gdextension"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#section" },
+    { "include": "#string" },
+    { "include": "#constant" },
+    { "include": "#number" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.semicolon.godot-resource",
+      "match": ";.*$"
+    },
+    "section": {
+      "name": "entity.name.section.godot-resource",
+      "begin": "\\[",
+      "end": "\\]"
+    },
+    "string": {
+      "name": "string.quoted.double.godot-resource",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.godot-resource",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "constant": {
+      "name": "constant.language.godot-resource",
+      "match": "\\b(true|false|null)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.godot-resource",
+      "match": "(?<![\\w.])(-?\\d[\\d_]*(\\.\\d[\\d_]*)?([eE][+-]?\\d+)?)\\b"
+    }
+  }
+}

@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: godot-bridge-${{ github.ref_name }}-x86_64-linux.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: godot-bridge-${{ github.ref_name }}-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sh scripts/check_release_version.sh "$GITHUB_REF_NAME"
+        shell: bash
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo fetch --locked
+        shell: bash
+      - run: python3 scripts/check_build_scripts.py
+        shell: bash
+      - run: cargo build --release --locked --offline -p godot-bridge --target "$TARGET"
+        shell: bash
+      - if: runner.os == 'Linux'
+        run: tar -C "target/$TARGET/release" -czf "$ARCHIVE" godot-bridge
+      - if: runner.os == 'Windows'
+        run: Compress-Archive -LiteralPath "target/$env:TARGET/release/godot-bridge.exe" -DestinationPath "$env:ARCHIVE"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ matrix.archive }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  vsix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sh scripts/check_release_version.sh "$GITHUB_REF_NAME"
+        working-directory: .
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run package
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: clients/vscode/godot-bridge-*.vsix
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: godot-bridge-${{ github.ref_name }}.vsix
+          path: clients/vscode/godot-bridge-*.vsix
+          if-no-files-found: error
+
+  release:
+    needs: [build, vsix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: cd artifacts && sha256sum * > SHA256SUMS
+      - run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

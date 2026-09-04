@@ -1,0 +1,18 @@
+# Version updates are off. Security updates come from the repo's Dependabot security updates setting.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+  - package-ecosystem: npm
+    directory: /clients/vscode
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
