@@ -422,8 +422,7 @@ async fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueu
     Ok(())
 }
 
-pub async fn run(trailing: Vec<String>) -> Result<ExitCode> {
-    let _ = trailing;
+pub async fn run() -> Result<ExitCode> {
     let mut input = FrameReader::new(tokio::io::stdin(), CLIENT_FRAME_CAP);
     let mut output = BufWriter::new(tokio::io::stdout());
     let initialize = match input.read_frame().await {

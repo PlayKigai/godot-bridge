@@ -168,8 +168,7 @@ enum InitializeWait {
     GodotDead,
 }
 
-pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> crate::error::Result<ExitCode> {
-    let _ = trailing;
+pub async fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let mut input = FrameReader::new(tokio::io::stdin(), FRAME_CAP);
     let first = match input.read_frame().await {
         Ok(Some(body)) => body,

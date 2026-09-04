@@ -23,8 +23,7 @@ enum PortReadiness {
     Deadline,
 }
 
-pub async fn run(file: &Path, trailing: Vec<String>) -> Result<ExitCode> {
-    let _ = trailing;
+pub async fn run(file: &Path) -> Result<ExitCode> {
     let root = cwd_root().map_err(Error::new)?;
     let settings = load_zed_settings(&root).map_err(Error::new)?;
     let project = find_project_dir(

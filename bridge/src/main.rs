@@ -1,6 +1,8 @@
-use clap::{Args, Parser, Subcommand};
+use cli::{Command, Invocation};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod cli;
 mod clock;
 mod dap;
 mod doc;
@@ -21,108 +23,66 @@ mod state;
 mod status;
 mod symbols;
 
-#[derive(Parser)]
-#[command(name = "godot-bridge")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Args)]
-struct FileArgs {
-    #[arg(long)]
-    file: String,
-    #[arg(trailing_var_arg = true)]
-    extra_args: Vec<String>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Lsp {
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    Dap {
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    ProjectDir(FileArgs),
-    Run {
-        #[arg(long)]
-        file: String,
-        #[arg(long)]
-        scene: Option<String>,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    OpenEditor(FileArgs),
-    Status {
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    Doc {
-        symbol: String,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     log::init();
 
-    match Cli::parse().command {
-        Command::Lsp { extra_args } => match lsp::run(extra_args).await {
+    let command = match cli::parse(std::env::args().skip(1)) {
+        Ok(Invocation::Help) => {
+            print!("{}", cli::HELP);
+            return ExitCode::SUCCESS;
+        }
+        Ok(Invocation::Command(command)) => command,
+        Err(message) => {
+            eprintln!("godot-bridge: {message}\n\n{}", cli::HELP);
+            return ExitCode::from(2);
+        }
+    };
+
+    match command {
+        Command::Lsp => match lsp::run().await {
             Ok(code) => code,
             Err(error) => {
                 eprintln!("lsp: {error}");
                 ExitCode::from(1)
             }
         },
-        Command::Dap { file, extra_args } => {
-            match dap::run(file.map(std::path::PathBuf::from), extra_args).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("dap: {error}");
-                    ExitCode::from(1)
-                }
+        Command::Dap { file } => match dap::run(file.map(PathBuf::from)).await {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("dap: {error}");
+                ExitCode::from(1)
             }
-        }
-        Command::Status { .. } => match status::run().await {
+        },
+        Command::Status => match status::run().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("status: {error}");
                 ExitCode::from(1)
             }
         },
-        Command::Run { file, scene, .. } => {
-            match run::run(std::path::Path::new(&file), scene.as_deref()) {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("run: {error}");
-                    ExitCode::from(1)
-                }
+        Command::Run { file, scene } => match run::run(Path::new(&file), scene.as_deref()) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("run: {error}");
+                ExitCode::from(1)
             }
-        }
-        Command::ProjectDir(args) => match run::project_dir(std::path::Path::new(&args.file)) {
+        },
+        Command::ProjectDir { file } => match run::project_dir(Path::new(&file)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
                 ExitCode::from(1)
             }
         },
-        Command::OpenEditor(args) => {
-            match open_editor::run(std::path::Path::new(&args.file), args.extra_args).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("open-editor: {error}");
-                    ExitCode::from(1)
-                }
+        Command::OpenEditor { file } => match open_editor::run(Path::new(&file)).await {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("open-editor: {error}");
+                ExitCode::from(1)
             }
-        }
-        Command::Doc { symbol, .. } => match doc::open_doc(&symbol) {
+        },
+        Command::Doc { symbol } => match doc::open_doc(&symbol) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("doc: {error}");
