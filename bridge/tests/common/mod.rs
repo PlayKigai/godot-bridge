@@ -162,12 +162,7 @@ pub fn initialize_dap(client: &mut BridgeClient) -> Value {
 }
 
 fn project_hash(project: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in project.canonicalize().unwrap().to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{hash:016x}")
+    godot_bridge::fnv::hash_hex(project.canonicalize().unwrap().to_string_lossy().as_bytes())
 }
 
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {

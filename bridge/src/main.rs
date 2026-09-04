@@ -1,27 +1,7 @@
-use cli::{Command, Invocation};
+use godot_bridge::cli::{self, Command, Invocation};
+use godot_bridge::{dap, doc, log, lsp, open_editor, run, status};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-mod cli;
-mod clock;
-mod dap;
-mod doc;
-mod docs_state;
-mod error;
-mod fnv;
-mod framing;
-mod godot_bin;
-mod log;
-mod lsp;
-mod open_editor;
-mod process;
-mod root;
-mod run;
-mod scene;
-mod settings_file;
-mod state;
-mod status;
-mod symbols;
 
 #[tokio::main]
 async fn main() -> ExitCode {
