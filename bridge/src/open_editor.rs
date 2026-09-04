@@ -94,7 +94,7 @@ async fn launch_or_reuse(
 ) -> Result<ExitCode> {
     let existing = read_state(&files.state)?;
     if let Some(mut state) = existing {
-        if state.mode == Mode::Gui && !matches_project(&state, project) {
+        if !matches_project(&state, project) {
             crate::bail!("project mismatch");
         }
         if state.mode == Mode::Gui && gui_process_alive(&state) {

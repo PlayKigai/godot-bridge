@@ -11,26 +11,24 @@ pub(super) async fn serve_owner_socket(
         let handoff_sender = handoff_sender.clone();
         let dap_path = dap_path.clone();
         async move {
-            match request.get("cmd").and_then(Value::as_str) {
-                Some("status") => {
-                    let state = state.read().await;
-                    if let Some(requested) = request.get("project").and_then(Value::as_str) {
-                        if requested != state.project {
-                            return json!({"error": "project mismatch"});
-                        }
-                    }
-                    serde_json::to_value(&*state).unwrap_or_else(|_| json!({}))
-                }
+            let cmd = request.get("cmd").and_then(Value::as_str);
+            if !matches!(cmd, Some("status") | Some("handoff")) {
+                return crate::state::unknown_command();
+            }
+            let requested = request.get("project").and_then(Value::as_str);
+            let state = state.read().await;
+            if requested.is_some_and(|requested| requested != state.project) {
+                return if cmd == Some("status") {
+                    json!({"error": "project mismatch"})
+                } else {
+                    json!({"version": 1, "accepted": false, "reason": "project mismatch"})
+                };
+            }
+            match cmd {
+                Some("status") => serde_json::to_value(&*state).unwrap_or_else(|_| json!({})),
                 Some("handoff") => {
-                    let decision = {
-                        let state = state.read().await;
-                        if let Some(requested) = request.get("project").and_then(Value::as_str) {
-                            if requested != state.project {
-                                return json!({"version": 1, "accepted": false, "reason": "project mismatch"});
-                            }
-                        }
-                        handoff_decision(&state)
-                    };
+                    let decision = handoff_decision(&state);
+                    drop(state);
                     match decision {
                         HandoffDecision::Reject(reason) => {
                             json!({"version": 1, "accepted": false, "reason": reason})

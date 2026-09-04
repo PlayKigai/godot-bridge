@@ -5,7 +5,6 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    std::sync::LazyLock::force(&godot_bridge::log::MAX_LEVEL);
     let arguments = std::env::args_os()
         .skip(1)
         .map(|argument| {

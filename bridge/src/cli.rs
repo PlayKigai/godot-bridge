@@ -84,19 +84,9 @@ fn collect_options(
             Some((key, value)) => (key, Some(value.to_owned())),
             None => (argument.as_str(), None),
         };
-        match key {
-            "--file" if allowed.contains(&"--file") => {
-                options.file = Some(match inline_value {
-                    Some(value) => value,
-                    None => next_value(&argument, arguments)?,
-                });
-            }
-            "--scene" if allowed.contains(&"--scene") => {
-                options.scene = Some(match inline_value {
-                    Some(value) => value,
-                    None => next_value(&argument, arguments)?,
-                });
-            }
+        let target = match key {
+            "--file" if allowed.contains(&"--file") => &mut options.file,
+            "--scene" if allowed.contains(&"--scene") => &mut options.scene,
             _ if argument.starts_with('-') => {
                 return Err(format!("unexpected argument {argument:?}"));
             }
@@ -104,7 +94,11 @@ fn collect_options(
                 options.positional = Some(argument);
                 break;
             }
-        }
+        };
+        *target = Some(match inline_value {
+            Some(value) => value,
+            None => next_value(&argument, arguments)?,
+        });
     }
     Ok(options)
 }

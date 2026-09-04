@@ -537,12 +537,7 @@ mod tests {
 
     #[test]
     fn state_naming_another_project_does_not_match() {
-        let mut current = state(None, None);
-        current.mode = Mode::Gui;
-        let pid = std::process::id();
-        current.godot_pid = Some(pid);
-        current.godot_start_ticks = start_ticks(pid);
-        assert!(gui_process_alive(&current));
+        let current = state(None, None);
         assert!(matches_project(&current, Path::new("/project")));
         assert!(!matches_project(&current, Path::new("/other")));
     }

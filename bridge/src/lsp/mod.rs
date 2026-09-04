@@ -570,91 +570,89 @@ pub async fn run() -> Result<ExitCode> {
         }
     };
     if let Ok(Some(previous)) = read_state(&files.state) {
-        if previous.mode == Mode::Gui
-            && matches_project(&previous, &project)
-            && gui_process_alive(&previous)
-        {
-            match reconnect_gui(&files, previous, settings.startup_timeout_s).await? {
-                GuiReconnect::Ready { state, connection } => {
-                    let state = Arc::new(RwLock::new(state));
-                    let (handoff_sender, handoff_receiver) = mpsc::unbounded_channel();
-                    let socket =
-                        serve_owner_socket(&files, Arc::clone(&state), handoff_sender).await?;
-                    let mut runtime = Runtime {
-                        files,
-                        state,
-                        socket: Some(socket),
-                        lock: Some(lock),
-                        handoff_receiver: Some(handoff_receiver),
-                        mode: Mode::Gui,
-                    };
-                    publish(&runtime).await?;
-                    let mut editor = Editor {
-                        child: None,
-                        connection,
-                        lsp_port: runtime
-                            .state
-                            .read()
-                            .await
-                            .lsp_port
-                            .expect("reconnected GUI has an LSP port"),
-                        dap_port: runtime
-                            .state
-                            .read()
-                            .await
-                            .dap_port
-                            .expect("reconnected GUI has a DAP port"),
-                    };
-                    if let Err(message) = forward_initialize(
-                        &mut editor,
-                        &mut output,
-                        &mut proxy,
-                        &project,
-                        settings.project_diagnostics,
-                    )
-                    .await
-                    {
-                        drop(editor);
-                        cleanup_runtime(&mut runtime, None).await;
-                        send_error(&mut output, &initialize_id, -32002, &message).await?;
-                        return Ok(ExitCode::from(1));
-                    }
-                    set_ready(&runtime, &editor).await?;
-                    return run_session(
-                        Session {
-                            input,
-                            output,
-                            proxy,
-                            settings,
-                            runtime,
-                            editor,
-                            watch: Watch::default(),
-                        },
-                        false,
-                    )
-                    .await;
-                }
-                GuiReconnect::Dead => cleanup_files(&files),
-                GuiReconnect::Deadline { pid, state } => {
-                    let _ = write_state(&files.state, &state);
-                    drop(lock);
-                    send_error(
-                        &mut output,
-                        &initialize_id,
-                        -32002,
-                        &format!("GUI editor {pid} is not answering on its ports"),
-                    )
-                    .await?;
-                    return Ok(ExitCode::from(1));
-                }
-            }
-        } else if previous.mode == Mode::Gui {
+        if previous.mode == Mode::Gui {
             if !matches_project(&previous, &project) {
                 drop(lock);
                 send_error(&mut output, &initialize_id, -32002, "project mismatch").await?;
                 return Ok(ExitCode::from(1));
+            } else if !gui_process_alive(&previous) {
+                cleanup_files(&files);
+            } else {
+                match reconnect_gui(&files, previous, settings.startup_timeout_s).await? {
+                    GuiReconnect::Ready { state, connection } => {
+                        let state = Arc::new(RwLock::new(state));
+                        let (handoff_sender, handoff_receiver) = mpsc::unbounded_channel();
+                        let socket =
+                            serve_owner_socket(&files, Arc::clone(&state), handoff_sender).await?;
+                        let mut runtime = Runtime {
+                            files,
+                            state,
+                            socket: Some(socket),
+                            lock: Some(lock),
+                            handoff_receiver: Some(handoff_receiver),
+                            mode: Mode::Gui,
+                        };
+                        publish(&runtime).await?;
+                        let mut editor = Editor {
+                            child: None,
+                            connection,
+                            lsp_port: runtime
+                                .state
+                                .read()
+                                .await
+                                .lsp_port
+                                .expect("reconnected GUI has an LSP port"),
+                            dap_port: runtime
+                                .state
+                                .read()
+                                .await
+                                .dap_port
+                                .expect("reconnected GUI has a DAP port"),
+                        };
+                        if let Err(message) = forward_initialize(
+                            &mut editor,
+                            &mut output,
+                            &mut proxy,
+                            &project,
+                            settings.project_diagnostics,
+                        )
+                        .await
+                        {
+                            drop(editor);
+                            cleanup_runtime(&mut runtime, None).await;
+                            send_error(&mut output, &initialize_id, -32002, &message).await?;
+                            return Ok(ExitCode::from(1));
+                        }
+                        set_ready(&runtime, &editor).await?;
+                        return run_session(
+                            Session {
+                                input,
+                                output,
+                                proxy,
+                                settings,
+                                runtime,
+                                editor,
+                                watch: Watch::default(),
+                            },
+                            false,
+                        )
+                        .await;
+                    }
+                    GuiReconnect::Dead => cleanup_files(&files),
+                    GuiReconnect::Deadline { pid, state } => {
+                        let _ = write_state(&files.state, &state);
+                        drop(lock);
+                        send_error(
+                            &mut output,
+                            &initialize_id,
+                            -32002,
+                            &format!("GUI editor {pid} is not answering on its ports"),
+                        )
+                        .await?;
+                        return Ok(ExitCode::from(1));
+                    }
+                }
             }
-            cleanup_files(&files);
         }
     }
     stale_cleanup(&files, &project).await;

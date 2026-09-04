@@ -16,6 +16,15 @@ const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
 const GROUP_WAIT: Duration = Duration::from_secs(5);
 
+fn open_log(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
 pub struct GodotChild {
     pub pid: u32,
     pub pgid: i32,
@@ -128,12 +137,7 @@ pub fn spawn_gui(
     dap_port: u16,
     log_path: impl AsRef<Path>,
 ) -> io::Result<(u32, i32, u64)> {
-    let output = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(log_path.as_ref())?;
+    let output = open_log(log_path.as_ref())?;
     let error_output = output.try_clone()?;
     let project = project.as_ref();
     let mut command = Command::new(bin.as_ref());
@@ -416,15 +420,7 @@ impl LogWriter {
         if length >= LOG_LIMIT {
             writer.rotate().await?;
         }
-        writer.file = Some(
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&writer.path)
-                .await?,
-        );
+        writer.file = Some(tokio::fs::File::from_std(open_log(&writer.path)?));
         Ok(writer)
     }
 
@@ -436,13 +432,7 @@ impl LogWriter {
         while offset < bytes.len() {
             if self.length >= LOG_LIMIT {
                 self.rotate().await?;
-                self.file = Some(
-                    tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&self.path)
-                        .await?,
-                );
+                self.file = Some(tokio::fs::File::from_std(open_log(&self.path)?));
             }
             let available = (LOG_LIMIT - self.length) as usize;
             let size = available.min(bytes.len() - offset);

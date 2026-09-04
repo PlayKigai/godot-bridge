@@ -6,7 +6,7 @@ pub const ERROR: u8 = 0;
 pub const WARN: u8 = 1;
 pub const DEBUG: u8 = 2;
 
-pub static MAX_LEVEL: LazyLock<u8> =
+static MAX_LEVEL: LazyLock<u8> =
     LazyLock::new(|| match std::env::var("GODOT_BRIDGE_LOG").as_deref() {
         Ok("error") => ERROR,
         Ok("debug") => DEBUG,
