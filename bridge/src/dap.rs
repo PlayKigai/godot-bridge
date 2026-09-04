@@ -326,11 +326,23 @@ async fn discover_owner(
                 settings.startup_timeout_s
             ));
         }
-        let status = socket_request(&files.sock, &json!({"cmd": "status"}), timeout)
-            .await
-            .map_err(|_| no_owner.clone())?;
+        let status = socket_request(
+            &files.sock,
+            &json!({"cmd": "status", "project": project.to_string_lossy()}),
+            timeout,
+        )
+        .await
+        .map_err(|_| no_owner.clone())?;
         match status.get("status").and_then(Value::as_str) {
             Some("ready") => {
+                if status.get("project").and_then(Value::as_str)
+                    != Some(&*project.to_string_lossy())
+                {
+                    return Err(format!(
+                        "Godot owner reports a different project than {}",
+                        project.display()
+                    ));
+                }
                 let port = status
                     .get("dap_port")
                     .and_then(Value::as_u64)

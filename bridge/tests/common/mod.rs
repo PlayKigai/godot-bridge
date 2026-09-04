@@ -204,7 +204,8 @@ pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    stream.write_all(b"{\"cmd\":\"status\"}\n").ok()?;
+    let request = serde_json::json!({"cmd": "status", "project": project.to_string_lossy()});
+    stream.write_all(format!("{request}\n").as_bytes()).ok()?;
     stream.shutdown(Shutdown::Write).ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;

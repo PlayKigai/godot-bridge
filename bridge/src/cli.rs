@@ -80,16 +80,18 @@ fn collect_options(
         if argument == "--" {
             break;
         }
-        if let Some(rest) = argument
-            .strip_prefix("--file")
-            .filter(|_| allowed.contains(&"--file"))
-        {
-            options.file = Some(flag_value(rest, "--file", arguments)?);
-        } else if let Some(rest) = argument
-            .strip_prefix("--scene")
-            .filter(|_| allowed.contains(&"--scene"))
-        {
-            options.scene = Some(flag_value(rest, "--scene", arguments)?);
+        if argument == "--file" && allowed.contains(&"--file") {
+            options.file = Some(next_value(&argument, arguments)?);
+        } else if argument == "--scene" && allowed.contains(&"--scene") {
+            options.scene = Some(next_value(&argument, arguments)?);
+        } else if let Some((key, value)) = argument.split_once('=') {
+            if key == "--file" && allowed.contains(&"--file") {
+                options.file = Some(value.to_owned());
+            } else if key == "--scene" && allowed.contains(&"--scene") {
+                options.scene = Some(value.to_owned());
+            } else {
+                return Err(format!("unexpected argument {argument:?}"));
+            }
         } else if argument.starts_with('-') {
             return Err(format!("unexpected argument {argument:?}"));
         } else {
@@ -100,20 +102,10 @@ fn collect_options(
     Ok(options)
 }
 
-fn flag_value(
-    rest: &str,
-    flag: &str,
-    arguments: &mut impl Iterator<Item = String>,
-) -> Result<String, String> {
-    if rest.is_empty() {
-        return arguments
-            .next()
-            .ok_or_else(|| format!("{flag} needs a value"));
-    }
-    match rest.strip_prefix('=') {
-        Some(value) => Ok(value.to_owned()),
-        None => Err(format!("unexpected argument \"{flag}{rest}\"")),
-    }
+fn next_value(flag: &str, arguments: &mut impl Iterator<Item = String>) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 fn required(value: Option<String>, name: &str) -> Result<String, String> {

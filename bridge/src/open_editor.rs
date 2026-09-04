@@ -33,29 +33,29 @@ pub async fn run(file: &Path) -> Result<ExitCode> {
     )?;
     let files = ProjectFiles::new(&project)?;
 
-    if let Some(response) = try_handoff(&files).await {
+    if let Some(response) = try_handoff(&files, &project).await {
         return print_response(response);
     }
 
     let lock = match try_lock(&files.lock)? {
         Some(lock) => lock,
-        None => return retry_handoff(&files).await,
+        None => return retry_handoff(&files, &project).await,
     };
     let result = launch_or_reuse(&files, &project, &settings).await;
     drop(lock);
     result
 }
 
-async fn try_handoff(files: &ProjectFiles) -> Option<Value> {
-    socket_request(&files.sock, &json!({"cmd": "handoff"}), SOCKET_TIMEOUT)
-        .await
-        .ok()
+async fn try_handoff(files: &ProjectFiles, project: &Path) -> Option<Value> {
+    try_handoff_with_timeout(files, project, SOCKET_TIMEOUT).await
 }
 
-async fn retry_handoff(files: &ProjectFiles) -> Result<ExitCode> {
+async fn retry_handoff(files: &ProjectFiles, project: &Path) -> Result<ExitCode> {
     let deadline = Instant::now() + SOCKET_TIMEOUT;
     loop {
-        if let Some(response) = try_handoff_with_timeout(files, Duration::from_millis(250)).await {
+        if let Some(response) =
+            try_handoff_with_timeout(files, project, Duration::from_millis(250)).await
+        {
             return print_response(response);
         }
         if Instant::now() >= deadline {
@@ -64,10 +64,18 @@ async fn retry_handoff(files: &ProjectFiles) -> Result<ExitCode> {
     }
 }
 
-async fn try_handoff_with_timeout(files: &ProjectFiles, timeout: Duration) -> Option<Value> {
-    socket_request(&files.sock, &json!({"cmd": "handoff"}), timeout)
-        .await
-        .ok()
+async fn try_handoff_with_timeout(
+    files: &ProjectFiles,
+    project: &Path,
+    timeout: Duration,
+) -> Option<Value> {
+    socket_request(
+        &files.sock,
+        &json!({"cmd": "handoff", "project": project.to_string_lossy()}),
+        timeout,
+    )
+    .await
+    .ok()
 }
 
 fn print_response(response: Value) -> Result<ExitCode> {

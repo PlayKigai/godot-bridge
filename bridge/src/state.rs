@@ -88,7 +88,13 @@ pub struct ProjectFiles {
 
 impl ProjectFiles {
     pub fn new(project: &Path) -> io::Result<Self> {
-        let hash = crate::fnv::hash_hex(project.to_string_lossy().as_bytes());
+        let project_str = project.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("project path {} is not valid UTF-8", project.display()),
+            )
+        })?;
+        let hash = crate::fnv::hash_hex(project_str.as_bytes());
         let mut runtime = runtime_dir()?;
         let socket = runtime.join(format!("{hash}.sock"));
         if socket.as_os_str().len() > 100 {
@@ -492,6 +498,14 @@ mod tests {
     }
 
     #[test]
+    fn project_path_with_invalid_utf8_is_rejected() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = PathBuf::from(OsStr::from_bytes(&[0x66, 0xff]));
+        assert!(ProjectFiles::new(&path).is_err());
+    }
+
+    #[test]
     fn second_lock_is_rejected() {
         let dir = tempdir().unwrap();
         let first = try_lock(&dir.path().join("lock")).unwrap().unwrap();
@@ -522,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_project_state_is_never_reused() {
+    fn state_naming_another_project_does_not_match() {
         let mut current = state(None, None);
         current.mode = Mode::Gui;
         let pid = std::process::id();

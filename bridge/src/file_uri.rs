@@ -3,7 +3,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 const ENCODED: &[u8] = b" \"<>`#?{}/%\\";
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 pub fn path_to_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
@@ -44,13 +43,12 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 fn push_encoded(bytes: &[u8], uri: &mut String) {
+    use std::fmt::Write;
     for byte in bytes {
         if byte.is_ascii() && !byte.is_ascii_control() && !ENCODED.contains(byte) {
             uri.push(char::from(*byte));
         } else {
-            uri.push('%');
-            uri.push(char::from(HEX[usize::from(byte >> 4)]));
-            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            let _ = write!(uri, "%{byte:02X}");
         }
     }
 }

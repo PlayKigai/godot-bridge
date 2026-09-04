@@ -26,55 +26,54 @@ async fn main() -> ExitCode {
         }
     };
 
-    match command {
-        Command::Lsp => match lsp::run().await {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("lsp: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Dap { file } => match dap::run(file.map(PathBuf::from)).await {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("dap: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Status => match status::run().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("status: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Run { file, scene } => match run::run(Path::new(&file), scene.as_deref()) {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("run: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Command::ProjectDir { file } => match run::project_dir(Path::new(&file)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
+    let (label, result): (&str, Result<ExitCode, String>) = match command {
+        Command::Lsp => ("lsp", lsp::run().await.map_err(|error| error.to_string())),
+        Command::Dap { file } => (
+            "dap",
+            dap::run(file.map(PathBuf::from))
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        Command::Status => (
+            "status",
+            status::run()
+                .await
+                .map(|()| ExitCode::SUCCESS)
+                .map_err(|error| error.to_string()),
+        ),
+        Command::Run { file, scene } => (
+            "run",
+            run::run(Path::new(&file), scene.as_deref()).map_err(|error| error.to_string()),
+        ),
+        Command::ProjectDir { file } => (
+            "",
+            run::project_dir(Path::new(&file))
+                .map(|()| ExitCode::SUCCESS)
+                .map_err(|error| error.to_string()),
+        ),
+        Command::OpenEditor { file } => (
+            "open-editor",
+            open_editor::run(Path::new(&file))
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        Command::Doc { symbol } => (
+            "doc",
+            doc::open_doc(&symbol)
+                .map(|()| ExitCode::SUCCESS)
+                .map_err(|error| error.to_string()),
+        ),
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            if label.is_empty() {
                 eprintln!("{error}");
-                ExitCode::from(1)
+            } else {
+                eprintln!("{label}: {error}");
             }
-        },
-        Command::OpenEditor { file } => match open_editor::run(Path::new(&file)).await {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("open-editor: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Doc { symbol } => match doc::open_doc(&symbol) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("doc: {error}");
-                ExitCode::from(1)
-            }
-        },
+            ExitCode::from(1)
+        }
     }
 }

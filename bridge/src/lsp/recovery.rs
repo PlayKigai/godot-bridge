@@ -369,7 +369,7 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
             .reader
             .read_frame()
             .await?
-            .ok_or_else(|| Error::new("Godot closed during recovery initialize"))?;
+            .ok_or_else(|| crate::error::Error::new("Godot closed during recovery initialize"))?;
         let message = parse_message(&body)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {

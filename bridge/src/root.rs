@@ -193,13 +193,9 @@ pub fn path_to_uri(path: &Path) -> String {
 }
 
 pub fn uri_to_path(uri: &str) -> Result<PathBuf, RootError> {
-    let decoded = crate::file_uri::uri_to_path(uri).ok_or(RootError::CannotDetermineRoot)?;
-    let path = normalize_absolute(&decoded);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(RootError::CannotDetermineRoot)
-    }
+    Ok(normalize_absolute(
+        &crate::file_uri::uri_to_path(uri).ok_or(RootError::CannotDetermineRoot)?,
+    ))
 }
 
 pub fn doc_key(uri_or_path: &str) -> PathBuf {

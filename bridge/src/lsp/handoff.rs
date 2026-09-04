@@ -16,10 +16,17 @@ pub(super) async fn serve_owner_socket(
                     serde_json::to_value(&*state.read().await).unwrap_or_else(|_| json!({}))
                 }
                 Some("handoff") => {
-                    let decision = {
+                    let requested_project = request.get("project").and_then(Value::as_str).map(str::to_owned);
+                    let (matches, decision) = {
                         let state = state.read().await;
-                        handoff_decision(&state)
+                        (
+                            requested_project.as_deref() == Some(state.project.as_str()),
+                            handoff_decision(&state),
+                        )
                     };
+                    if !matches {
+                        return json!({"version": 1, "accepted": false, "reason": "project mismatch"});
+                    }
                     match decision {
                         HandoffDecision::Reject(reason) => {
                             json!({"version": 1, "accepted": false, "reason": reason})

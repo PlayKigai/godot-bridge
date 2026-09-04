@@ -1,4 +1,4 @@
-use crate::error::{Context, Error, Result};
+use crate::error::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -311,7 +311,7 @@ async fn wait_for_detached_ports_during_handoff(
                         queue_recovery_message(queue, &mut session.output, &body).await?
                     }
                     Ok(None) => crate::bail!("Zed closed during GUI handoff"),
-                    Err(error) => return Err(Error::new(error)),
+                    Err(error) => return Err(error.into()),
                 }
             }
             _ = tokio::time::sleep(sleep_for) => {}
