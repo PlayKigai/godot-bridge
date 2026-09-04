@@ -105,8 +105,7 @@ pub(super) async fn recover(
     if let Some(child) = session.editor.child.take() {
         terminate_editor_child(child).await;
     }
-    let binary =
-        resolve_godot(session.settings.godot_path.as_deref().map(Path::new)).map_err(Error::new)?;
+    let binary = resolve_godot(session.settings.godot_path.as_deref().map(Path::new))?;
     let deadline = startup_deadline(session.settings.startup_timeout_s);
     let mut candidate = None;
     let mut last_error = None;
@@ -296,7 +295,7 @@ pub(super) async fn queue_recovery_message(
     output: &mut ClientWriter,
     body: &[u8],
 ) -> Result<()> {
-    let message = parse_message(body).map_err(Error::new)?;
+    let message = parse_message(body)?;
     let size = serde_json::to_vec(&message)?.len();
     if message.get("method").is_some() {
         if message.get("id").is_some() {
@@ -369,10 +368,9 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
             .connection
             .reader
             .read_frame()
-            .await
-            .map_err(Error::new)?
+            .await?
             .ok_or_else(|| Error::new("Godot closed during recovery initialize"))?;
-        let message = parse_message(&body).map_err(Error::new)?;
+        let message = parse_message(&body)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {
             check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;

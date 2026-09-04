@@ -23,9 +23,9 @@ use crate::process::{
 use crate::root::{find_project_dir, worktree_root_from_initialize};
 use crate::settings_file::{parse_settings, Settings};
 use crate::state::{
-    clear_owner_identity, gui_process_alive, handoff_decision, read_state, remove_if_stale,
-    serve_socket, set_owner_identity, start_ticks, try_lock, write_state, HandoffDecision,
-    LockGuard, Mode, ProjectFiles, State, Status,
+    clear_owner_identity, gui_process_alive, handoff_decision, matches_project, read_state,
+    remove_if_stale, serve_socket, set_owner_identity, start_ticks, try_lock, write_state,
+    HandoffDecision, LockGuard, Mode, ProjectFiles, State, Status,
 };
 use crate::symbols::{self, Symbol};
 
@@ -344,9 +344,8 @@ async fn perform_handoff(session: &mut Session, handoff: HandoffRequest) -> Resu
             kill_group(child).await?;
         }
         wait_for_ports_closed(old_lsp_port, old_dap_port).await;
-        let binary = resolve_godot(session.settings.godot_path.as_deref().map(Path::new))
-            .map_err(Error::new)?;
-        check_version(&binary).map_err(Error::new)?;
+        let binary = resolve_godot(session.settings.godot_path.as_deref().map(Path::new))?;
+        check_version(&binary)?;
         let (pid, pgid, ticks) = spawn_gui(
             &binary,
             &session.settings.extra_args,
@@ -426,7 +425,7 @@ pub async fn run() -> Result<ExitCode> {
     let mut input = FrameReader::new(tokio::io::stdin(), CLIENT_FRAME_CAP);
     let mut output = BufWriter::new(tokio::io::stdout());
     let initialize = match input.read_frame().await {
-        Ok(Some(body)) => parse_message(&body).map_err(Error::new)?,
+        Ok(Some(body)) => parse_message(&body)?,
         Ok(None) => return Ok(ExitCode::SUCCESS),
         Err(error) => {
             crate::error!("invalid initialize frame: {error}");
@@ -571,7 +570,10 @@ pub async fn run() -> Result<ExitCode> {
         }
     };
     if let Ok(Some(previous)) = read_state(&files.state) {
-        if previous.mode == Mode::Gui && gui_process_alive(&previous) {
+        if previous.mode == Mode::Gui
+            && matches_project(&previous, &project)
+            && gui_process_alive(&previous)
+        {
             match reconnect_gui(&files, previous, settings.startup_timeout_s).await? {
                 GuiReconnect::Ready { state, connection } => {
                     let state = Arc::new(RwLock::new(state));
@@ -650,7 +652,7 @@ pub async fn run() -> Result<ExitCode> {
             cleanup_files(&files);
         }
     }
-    stale_cleanup(&files).await;
+    stale_cleanup(&files, &project).await;
     let binary = match resolve_godot(settings.godot_path.as_deref().map(Path::new)) {
         Ok(binary) => binary,
         Err(error) => {
@@ -900,10 +902,10 @@ async fn forward_server_message(
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
-    let message = parse_message(body).map_err(Error::new)?;
+    let message = parse_message(body)?;
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if method == "gdscript_client/changeWorkspace" {
-            check_workspace(&message, &proxy.project, Some(editor.lsp_port)).map_err(Error::new)?;
+            check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;
             if let Some(id) = message.get("id") {
                 send_godot(
                     &mut editor.connection.writer,
@@ -1292,9 +1294,7 @@ fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
 }
 
 async fn send_client<W: AsyncWrite + Unpin>(writer: &mut W, message: &Value) -> Result<()> {
-    write_json(writer, message, CLIENT_FRAME_CAP, true)
-        .await
-        .map_err(Error::new)?;
+    write_json(writer, message, CLIENT_FRAME_CAP, true).await?;
     Ok(())
 }
 

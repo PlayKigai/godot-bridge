@@ -1,13 +1,20 @@
 use godot_bridge::cli::{self, Command, Invocation};
-use godot_bridge::{dap, doc, log, lsp, open_editor, run, status};
+use godot_bridge::{dap, doc, lsp, open_editor, run, status};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    log::init();
+    let arguments = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|argument| format!("argument is not valid UTF-8: {argument:?}"))
+        })
+        .collect::<Result<Vec<String>, String>>();
 
-    let command = match cli::parse(std::env::args().skip(1)) {
+    let command = match arguments.and_then(cli::parse) {
         Ok(Invocation::Help) => {
             print!("{}", cli::HELP);
             return ExitCode::SUCCESS;

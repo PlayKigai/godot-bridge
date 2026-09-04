@@ -36,9 +36,11 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
         rest = &authority[split..];
     }
     let end = rest.find(['?', '#']).unwrap_or(rest.len());
-    Some(PathBuf::from(OsString::from_vec(decode(
-        &rest.as_bytes()[..end],
-    ))))
+    let decoded = decode(&rest.as_bytes()[..end]);
+    if !decoded.starts_with(b"/") {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(decoded)))
 }
 
 fn push_encoded(bytes: &[u8], uri: &mut String) {
@@ -163,6 +165,12 @@ mod tests {
         assert_eq!(uri_to_path("file://elsewhere/tmp/a.gd"), None);
         assert_eq!(uri_to_path("https://example.com/a.gd"), None);
         assert_eq!(uri_to_path("file"), None);
+    }
+
+    #[test]
+    fn rejects_paths_that_are_not_absolute() {
+        assert_eq!(uri_to_path("file:"), None);
+        assert_eq!(uri_to_path("file:x/../../etc"), None);
     }
 
     #[test]

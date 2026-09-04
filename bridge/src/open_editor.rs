@@ -10,8 +10,8 @@ use crate::process::{kill_recorded, pick_free_port, spawn_gui};
 use crate::root::{cwd_root, find_project_dir};
 use crate::settings_file::{load_zed_settings, Settings};
 use crate::state::{
-    detached_gui_state, gui_process_alive, read_state, socket_request, try_lock, write_state, Mode,
-    ProjectFiles, State, Status,
+    detached_gui_state, gui_process_alive, matches_project, read_state, socket_request, try_lock,
+    write_state, Mode, ProjectFiles, State, Status,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,14 +24,13 @@ enum PortReadiness {
 }
 
 pub async fn run(file: &Path) -> Result<ExitCode> {
-    let root = cwd_root().map_err(Error::new)?;
-    let settings = load_zed_settings(&root).map_err(Error::new)?;
+    let root = cwd_root()?;
+    let settings = load_zed_settings(&root)?;
     let project = find_project_dir(
         &root,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
-    )
-    .map_err(Error::new)?;
+    )?;
     let files = ProjectFiles::new(&project)?;
 
     if let Some(response) = try_handoff(&files).await {
@@ -91,7 +90,8 @@ async fn launch_or_reuse(
 ) -> Result<ExitCode> {
     let existing = read_state(&files.state)?;
     if let Some(mut state) = existing {
-        if state.mode == Mode::Gui && gui_process_alive(&state) {
+        if state.mode == Mode::Gui && matches_project(&state, project) && gui_process_alive(&state)
+        {
             let (pid, ticks, lsp_port, dap_port) = recorded_gui(&state)?;
             match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s).await {
                 PortReadiness::Ready => {
@@ -113,9 +113,8 @@ async fn launch_or_reuse(
         remove_files(files);
     }
 
-    let binary =
-        resolve_godot(settings.godot_path.as_deref().map(Path::new)).map_err(Error::new)?;
-    check_version(&binary).map_err(Error::new)?;
+    let binary = resolve_godot(settings.godot_path.as_deref().map(Path::new))?;
+    check_version(&binary)?;
     let lsp_port = pick_free_port(6005..=6999)?;
     let dap_port = pick_free_port(7005..=7999)?;
     let (pid, pgid, ticks) = spawn_gui(
@@ -148,7 +147,7 @@ async fn launch_or_reuse(
                 Status::Starting => "GUI editor did not start",
                 Status::Ready | Status::Recovering => "GUI editor exited",
             };
-            Err(Error::new(format!("{message}: {tail}")))
+            crate::bail!("{message}: {tail}")
         }
     }
 }

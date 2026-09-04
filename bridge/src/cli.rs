@@ -80,9 +80,15 @@ fn collect_options(
         if argument == "--" {
             break;
         }
-        if let Some(rest) = flag_rest(&argument, "--file", allowed) {
+        if let Some(rest) = argument
+            .strip_prefix("--file")
+            .filter(|_| allowed.contains(&"--file"))
+        {
             options.file = Some(flag_value(rest, "--file", arguments)?);
-        } else if let Some(rest) = flag_rest(&argument, "--scene", allowed) {
+        } else if let Some(rest) = argument
+            .strip_prefix("--scene")
+            .filter(|_| allowed.contains(&"--scene"))
+        {
             options.scene = Some(flag_value(rest, "--scene", arguments)?);
         } else if argument.starts_with('-') {
             return Err(format!("unexpected argument {argument:?}"));
@@ -92,13 +98,6 @@ fn collect_options(
         }
     }
     Ok(options)
-}
-
-fn flag_rest<'a>(argument: &'a str, flag: &str, allowed: &[&str]) -> Option<&'a str> {
-    if !allowed.contains(&flag) {
-        return None;
-    }
-    argument.strip_prefix(flag)
 }
 
 fn flag_value(

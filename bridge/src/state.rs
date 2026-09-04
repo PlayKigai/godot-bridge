@@ -223,6 +223,10 @@ pub fn clear_owner_identity(state: &mut State) {
     state.owner_start_ticks = None;
 }
 
+pub fn matches_project(state: &State, project: &Path) -> bool {
+    state.project == project.to_string_lossy()
+}
+
 pub fn gui_process_alive(state: &State) -> bool {
     state.mode == Mode::Gui
         && state
@@ -515,6 +519,18 @@ mod tests {
         let ticks = start_ticks(pid).unwrap();
         write_state(&project_files.state, &state(Some(pid), Some(ticks + 1))).unwrap();
         assert!(remove_if_stale(&project_files.state, &project_files.sock).unwrap());
+    }
+
+    #[test]
+    fn foreign_project_state_is_never_reused() {
+        let mut current = state(None, None);
+        current.mode = Mode::Gui;
+        let pid = std::process::id();
+        current.godot_pid = Some(pid);
+        current.godot_start_ticks = start_ticks(pid);
+        assert!(gui_process_alive(&current));
+        assert!(matches_project(&current, Path::new("/project")));
+        assert!(!matches_project(&current, Path::new("/other")));
     }
 
     #[test]

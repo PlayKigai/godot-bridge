@@ -8,15 +8,14 @@ use crate::settings_file;
 
 pub fn run(file: &Path, scene: Option<&str>) -> crate::error::Result<ExitCode> {
     let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree).map_err(crate::error::Error::new)?;
+    let settings = settings_file::load_zed_settings(&worktree)?;
     let project = root::find_project_dir(
         &worktree,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
     )?;
-    let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))
-        .map_err(crate::error::Error::new)?;
-    godot_bin::check_version(&godot).map_err(crate::error::Error::new)?;
+    let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))?;
+    godot_bin::check_version(&godot)?;
 
     let scene = match scene {
         None | Some("main") => None,
@@ -40,7 +39,7 @@ pub fn run(file: &Path, scene: Option<&str>) -> crate::error::Result<ExitCode> {
 
 pub fn project_dir(file: &Path) -> crate::error::Result<()> {
     let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree).map_err(crate::error::Error::new)?;
+    let settings = settings_file::load_zed_settings(&worktree)?;
     let project = root::find_project_dir(
         &worktree,
         Some(file),

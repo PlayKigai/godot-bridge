@@ -17,7 +17,11 @@ impl Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
@@ -27,6 +31,12 @@ impl From<std::io::Error> for Error {
 
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
+        Self::new(error)
+    }
+}
+
+impl From<crate::framing::FrameError> for Error {
+    fn from(error: crate::framing::FrameError) -> Self {
         Self::new(error)
     }
 }
