@@ -20,3 +20,4 @@ pub mod settings_file;
 pub mod state;
 pub mod status;
 pub mod symbols;
+pub mod watch;

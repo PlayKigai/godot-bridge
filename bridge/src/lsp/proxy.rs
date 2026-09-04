@@ -27,7 +27,8 @@ pub(super) async fn run_session(mut session: Session, unmanaged: bool) -> Result
     let mut handoff_receiver = session.runtime.handoff_receiver.take();
     if session.settings.project_diagnostics {
         session.watch.watcher = Some(
-            docs_state::watch_project(&session.proxy.project).context("cannot watch project")?,
+            crate::watch::watch_project(&session.proxy.project, session.settings.diagnose_addons)
+                .context("cannot watch project")?,
         );
     }
     let mut gui_check = tokio::time::interval(Duration::from_millis(200));

@@ -203,14 +203,24 @@ pub(super) async fn recover(
 
 pub(super) fn absorb_watcher_event(
     watch: &mut Watch,
-    result: Option<notify::Result<notify::Event>>,
+    result: Option<std::io::Result<WatcherChange>>,
 ) {
     match result {
-        Some(Ok(event)) => {
-            watch.pending.extend(docs_state::watcher_changes(event));
+        Some(Ok(change)) => {
+            watch.pending.push(change);
             if watch.pending.len() > WATCHER_PENDING_CAP {
                 watch.pending = coalesce_watcher_changes(std::mem::take(&mut watch.pending));
-                watch.pending.truncate(WATCHER_PENDING_CAP);
+                let rescan = watch
+                    .pending
+                    .iter()
+                    .find(|change| change.kind == WatcherChangeKind::Rescan)
+                    .cloned();
+                watch
+                    .pending
+                    .truncate(WATCHER_PENDING_CAP - usize::from(rescan.is_some()));
+                if let Some(rescan) = rescan {
+                    watch.pending.push(rescan);
+                }
                 crate::warn!("project diagnostics watcher queue is full");
             }
             watch.deadline = Some(Instant::now() + Duration::from_millis(300));

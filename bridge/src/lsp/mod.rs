@@ -11,8 +11,8 @@ use tokio::sync::mpsc::{self, Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 
 use crate::docs_state::{
-    self, DocumentAction, DocumentEvent, DocumentOwner, DocumentState, ProjectWatcher,
-    WatcherChange, WatcherChangeKind, BULK_DOCUMENTS, BULK_INTERVAL_MS,
+    self, DocumentAction, DocumentEvent, DocumentOwner, DocumentState, WatcherChange,
+    WatcherChangeKind, BULK_DOCUMENTS, BULK_INTERVAL_MS,
 };
 use crate::framing::{parse_json_object, write_json, FrameReader};
 use crate::godot_bin::{check_version, resolve_godot};
@@ -28,6 +28,7 @@ use crate::state::{
     HandoffDecision, LockGuard, Mode, ProjectFiles, State, Status,
 };
 use crate::symbols::{self, Symbol};
+use crate::watch::ProjectWatcher;
 
 mod handoff;
 mod proxy;
@@ -1199,6 +1200,45 @@ async fn process_watcher_changes(
     if !settings.project_diagnostics || !proxy.zed_initialized {
         return Ok(());
     }
+    let mut changes = changes;
+    if changes
+        .iter()
+        .any(|change| change.kind == WatcherChangeKind::Rescan)
+    {
+        let project = proxy.project.clone();
+        let diagnose_addons = settings.diagnose_addons;
+        let documents = tokio::task::spawn_blocking(move || {
+            docs_state::scan_project(&project, diagnose_addons)
+        })
+        .await
+        .unwrap_or_default();
+        let scanned_keys = documents
+            .iter()
+            .map(|document| document.key.clone())
+            .collect::<HashSet<_>>();
+        changes.retain(|change| change.kind != WatcherChangeKind::Rescan);
+        changes.extend(documents.iter().map(|document| WatcherChange {
+            kind: if proxy.documents.owner(&document.key).is_some() {
+                WatcherChangeKind::Modified
+            } else {
+                WatcherChangeKind::Created
+            },
+            path: document.path.clone(),
+        }));
+        changes.extend(
+            proxy
+                .documents
+                .open_docs
+                .iter()
+                .filter(|(key, document)| {
+                    document.owner == DocumentOwner::Bridge && !scanned_keys.contains(*key)
+                })
+                .map(|(key, _)| WatcherChange {
+                    kind: WatcherChangeKind::Removed,
+                    path: key.clone(),
+                }),
+        );
+    }
     for change in changes {
         let path = docs_state::normalize_path(&change.path);
         match change.kind {
@@ -1268,6 +1308,7 @@ async fn process_watcher_changes(
                 )
                 .await?;
             }
+            WatcherChangeKind::Rescan => {}
         }
     }
     Ok(())
@@ -1275,7 +1316,7 @@ async fn process_watcher_changes(
 
 async fn next_watcher_event(
     watcher: &mut Option<ProjectWatcher>,
-) -> Option<notify::Result<notify::Event>> {
+) -> Option<std::io::Result<WatcherChange>> {
     match watcher.as_mut() {
         Some(watcher) => watcher.receiver.recv().await,
         None => std::future::pending().await,

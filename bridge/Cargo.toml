@@ -9,7 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-notify = "8"
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
