@@ -133,9 +133,7 @@ pub(super) fn new_state(project: &Path, mode: Mode) -> State {
         owner_pid: Some(owner_pid),
         owner_start_ticks: start_ticks(owner_pid),
         godot_start_ticks: None,
-        started_at: OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_default(),
+        started_at: crate::clock::now_rfc3339(),
         bridge_version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }

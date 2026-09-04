@@ -209,9 +209,7 @@ pub fn detached_gui_state(project: &Path, status: Status) -> State {
         owner_pid: None,
         owner_start_ticks: None,
         godot_start_ticks: None,
-        started_at: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
+        started_at: crate::clock::now_rfc3339(),
         bridge_version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }

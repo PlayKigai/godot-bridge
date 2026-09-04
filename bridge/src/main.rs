@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 
+mod clock;
 mod dap;
 mod doc;
 mod docs_state;
