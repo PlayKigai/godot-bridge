@@ -5,6 +5,7 @@ mod clock;
 mod dap;
 mod doc;
 mod docs_state;
+mod error;
 mod fnv;
 mod framing;
 mod godot_bin;
@@ -76,7 +77,7 @@ async fn main() -> ExitCode {
         Command::Lsp { extra_args } => match lsp::run(extra_args).await {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("lsp: {error:#}");
+                eprintln!("lsp: {error}");
                 ExitCode::from(1)
             }
         },
@@ -84,7 +85,7 @@ async fn main() -> ExitCode {
             match dap::run(file.map(std::path::PathBuf::from), extra_args).await {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("dap: {error:#}");
+                    eprintln!("dap: {error}");
                     ExitCode::from(1)
                 }
             }
@@ -92,7 +93,7 @@ async fn main() -> ExitCode {
         Command::Status { .. } => match status::run().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("status: {error:#}");
+                eprintln!("status: {error}");
                 ExitCode::from(1)
             }
         },
@@ -100,7 +101,7 @@ async fn main() -> ExitCode {
             match run::run(std::path::Path::new(&file), scene.as_deref()) {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("run: {error:#}");
+                    eprintln!("run: {error}");
                     ExitCode::from(1)
                 }
             }
@@ -108,7 +109,7 @@ async fn main() -> ExitCode {
         Command::ProjectDir(args) => match run::project_dir(std::path::Path::new(&args.file)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("{error:#}");
+                eprintln!("{error}");
                 ExitCode::from(1)
             }
         },
@@ -116,7 +117,7 @@ async fn main() -> ExitCode {
             match open_editor::run(std::path::Path::new(&args.file), args.extra_args).await {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("open-editor: {error:#}");
+                    eprintln!("open-editor: {error}");
                     ExitCode::from(1)
                 }
             }
@@ -124,7 +125,7 @@ async fn main() -> ExitCode {
         Command::Doc { symbol, .. } => match doc::open_doc(&symbol) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("doc: {error:#}");
+                eprintln!("doc: {error}");
                 ExitCode::from(1)
             }
         },

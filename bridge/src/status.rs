@@ -8,12 +8,12 @@ use crate::state::{remove_if_stale, runtime_dir, socket_request};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run() -> crate::error::Result<()> {
     let stdout = io::stdout();
     run_in(&runtime_dir()?, &mut stdout.lock()).await
 }
 
-async fn run_in(dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+async fn run_in(dir: &Path, out: &mut impl Write) -> crate::error::Result<()> {
     for state_path in list_state_files(dir)? {
         let sock_path = state_path.with_extension("sock");
         match socket_request(&sock_path, &json!({"cmd": "status"}), STATUS_TIMEOUT).await {

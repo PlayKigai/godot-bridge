@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use crate::error::{Error, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::ExitCode;
@@ -25,14 +25,14 @@ enum PortReadiness {
 
 pub async fn run(file: &Path, trailing: Vec<String>) -> Result<ExitCode> {
     let _ = trailing;
-    let root = cwd_root().map_err(|error| anyhow!(error.to_string()))?;
-    let settings = load_zed_settings(&root).map_err(|error| anyhow!(error))?;
+    let root = cwd_root().map_err(Error::new)?;
+    let settings = load_zed_settings(&root).map_err(Error::new)?;
     let project = find_project_dir(
         &root,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
     )
-    .map_err(|error| anyhow!(error.to_string()))?;
+    .map_err(Error::new)?;
     let files = ProjectFiles::new(&project)?;
 
     if let Some(response) = try_handoff(&files).await {
@@ -61,7 +61,7 @@ async fn retry_handoff(files: &ProjectFiles) -> Result<ExitCode> {
             return print_response(response);
         }
         if Instant::now() >= deadline {
-            return Err(anyhow!("An owner exists but does not answer"));
+            crate::bail!("An owner exists but does not answer");
         }
     }
 }
@@ -107,16 +107,16 @@ async fn launch_or_reuse(
                     state.owner_pid = None;
                     state.owner_start_ticks = None;
                     write_state(&files.state, &state)?;
-                    return Err(anyhow!("GUI editor {pid} is not answering on its ports"));
+                    crate::bail!("GUI editor {pid} is not answering on its ports");
                 }
             }
         }
         remove_files(files);
     }
 
-    let binary = resolve_godot(settings.godot_path.as_deref().map(Path::new))
-        .map_err(|error| anyhow!(error))?;
-    check_version(&binary).map_err(|error| anyhow!(error))?;
+    let binary =
+        resolve_godot(settings.godot_path.as_deref().map(Path::new)).map_err(Error::new)?;
+    check_version(&binary).map_err(Error::new)?;
     let lsp_port = pick_free_port(6005..=6999)?;
     let dap_port = pick_free_port(7005..=7999)?;
     let (pid, pgid, ticks) = spawn_gui(
@@ -149,7 +149,7 @@ async fn launch_or_reuse(
                 Status::Starting => "GUI editor did not start",
                 Status::Ready | Status::Recovering => "GUI editor exited",
             };
-            Err(anyhow!("{message}: {tail}"))
+            Err(Error::new(format!("{message}: {tail}")))
         }
     }
 }
@@ -157,16 +157,16 @@ async fn launch_or_reuse(
 fn recorded_gui(state: &State) -> Result<(u32, u64, u16, u16)> {
     let pid = state
         .godot_pid
-        .ok_or_else(|| anyhow!("detached GUI state has no process id"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no process id"))?;
     let ticks = state
         .godot_start_ticks
-        .ok_or_else(|| anyhow!("detached GUI state has no process identity"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no process identity"))?;
     let lsp_port = state
         .lsp_port
-        .ok_or_else(|| anyhow!("detached GUI state has no LSP port"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no LSP port"))?;
     let dap_port = state
         .dap_port
-        .ok_or_else(|| anyhow!("detached GUI state has no DAP port"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no DAP port"))?;
     Ok((pid, ticks, lsp_port, dap_port))
 }
 

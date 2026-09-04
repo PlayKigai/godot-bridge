@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use crate::error::{Error, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -104,7 +104,7 @@ impl<W: AsyncWrite + Unpin> ClientOutput<W> {
         message["seq"] = json!(seq);
         write_json(&mut self.writer, &message, FRAME_CAP, true)
             .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+            .map_err(Error::new)?;
         Ok(())
     }
 
@@ -168,7 +168,7 @@ enum InitializeWait {
     GodotDead,
 }
 
-pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> anyhow::Result<ExitCode> {
+pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> crate::error::Result<ExitCode> {
     let _ = trailing;
     let mut input = FrameReader::new(tokio::io::stdin(), FRAME_CAP);
     let first = match input.read_frame().await {
@@ -646,7 +646,7 @@ fn rewrite_launch_or_attach(
 async fn send_to_godot(writer: &mut OwnedWriteHalf, message: &Value) -> Result<()> {
     write_json(writer, message, FRAME_CAP, true)
         .await
-        .map_err(|error| anyhow!(error.to_string()))?;
+        .map_err(Error::new)?;
     Ok(())
 }
 

@@ -94,7 +94,7 @@ pub(super) async fn recover(
         .await?;
         let child = session.editor.child.take();
         cleanup_runtime(&mut session.runtime, child).await;
-        return Err(anyhow!("Godot keeps crashing"));
+        crate::bail!("Godot keeps crashing");
     }
     send_show_message(
         &mut session.output,
@@ -105,8 +105,8 @@ pub(super) async fn recover(
     if let Some(child) = session.editor.child.take() {
         terminate_editor_child(child).await;
     }
-    let binary = resolve_godot(session.settings.godot_path.as_deref().map(Path::new))
-        .map_err(|error| anyhow!(error))?;
+    let binary =
+        resolve_godot(session.settings.godot_path.as_deref().map(Path::new)).map_err(Error::new)?;
     let deadline = startup_deadline(session.settings.startup_timeout_s);
     let mut candidate = None;
     let mut last_error = None;
@@ -143,7 +143,7 @@ pub(super) async fn recover(
                         }
                         Err(error) => {
                             crate::error!("malformed client frame during recovery: {error}");
-                            return Err(anyhow!("malformed client frame during recovery"));
+                            crate::bail!("malformed client frame during recovery");
                         }
                     }
                 }
@@ -181,7 +181,7 @@ pub(super) async fn recover(
         if let Some(error) = last_error {
             send_show_message(&mut session.output, &error.message()).await?;
         }
-        return Err(anyhow!("recovery failed"));
+        crate::bail!("recovery failed");
     };
     if !session.watch.pending.is_empty() {
         let changes = coalesce_watcher_changes(std::mem::take(&mut session.watch.pending));
@@ -296,7 +296,7 @@ pub(super) async fn queue_recovery_message(
     output: &mut ClientWriter,
     body: &[u8],
 ) -> Result<()> {
-    let message = parse_message(body).map_err(|error| anyhow!(error))?;
+    let message = parse_message(body).map_err(Error::new)?;
     let size = serde_json::to_vec(&message)?.len();
     if message.get("method").is_some() {
         if message.get("id").is_some() {
@@ -370,9 +370,9 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
             .reader
             .read_frame()
             .await
-            .map_err(|error| anyhow!(error.to_string()))?
-            .ok_or_else(|| anyhow!("Godot closed during recovery initialize"))?;
-        let message = parse_message(&body).map_err(|error| anyhow!(error))?;
+            .map_err(Error::new)?
+            .ok_or_else(|| Error::new("Godot closed during recovery initialize"))?;
+        let message = parse_message(&body).map_err(Error::new)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {
             check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;

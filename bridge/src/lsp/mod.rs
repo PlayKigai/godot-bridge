@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Context, Error, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -310,8 +310,8 @@ async fn wait_for_detached_ports_during_handoff(
                     Ok(Some(body)) => {
                         queue_recovery_message(queue, &mut session.output, &body).await?
                     }
-                    Ok(None) => return Err(anyhow!("Zed closed during GUI handoff")),
-                    Err(error) => return Err(anyhow!(error.to_string())),
+                    Ok(None) => crate::bail!("Zed closed during GUI handoff"),
+                    Err(error) => return Err(Error::new(error)),
                 }
             }
             _ = tokio::time::sleep(sleep_for) => {}
@@ -345,8 +345,8 @@ async fn perform_handoff(session: &mut Session, handoff: HandoffRequest) -> Resu
         }
         wait_for_ports_closed(old_lsp_port, old_dap_port).await;
         let binary = resolve_godot(session.settings.godot_path.as_deref().map(Path::new))
-            .map_err(|error| anyhow!(error))?;
-        check_version(&binary).map_err(|error| anyhow!(error))?;
+            .map_err(Error::new)?;
+        check_version(&binary).map_err(Error::new)?;
         let (pid, pgid, ticks) = spawn_gui(
             &binary,
             &session.settings.extra_args,
@@ -379,9 +379,9 @@ async fn perform_handoff(session: &mut Session, handoff: HandoffRequest) -> Resu
         .await?
         {
             DetachedPorts::Ready(stream) => connection_from_stream(stream),
-            DetachedPorts::Dead => return Err(anyhow!("GUI editor exited during handoff")),
+            DetachedPorts::Dead => crate::bail!("GUI editor exited during handoff"),
             DetachedPorts::Deadline => {
-                return Err(anyhow!("GUI editor {pid} is not answering on its ports"))
+                crate::bail!("GUI editor {pid} is not answering on its ports")
             }
         };
         let mut replacement = Editor {
@@ -427,7 +427,7 @@ pub async fn run(trailing: Vec<String>) -> Result<ExitCode> {
     let mut input = FrameReader::new(tokio::io::stdin(), CLIENT_FRAME_CAP);
     let mut output = BufWriter::new(tokio::io::stdout());
     let initialize = match input.read_frame().await {
-        Ok(Some(body)) => parse_message(&body).map_err(|error| anyhow!(error))?,
+        Ok(Some(body)) => parse_message(&body).map_err(Error::new)?,
         Ok(None) => return Ok(ExitCode::SUCCESS),
         Err(error) => {
             crate::error!("invalid initialize frame: {error}");
@@ -789,7 +789,7 @@ async fn forward_client_message(
     if message.get("id").is_some() && method.is_none() {
         let body = serde_json::to_vec(&message)?;
         if body.len() > GODOT_WRITE_CAP {
-            return Err(anyhow!("Zed response is too large for Godot"));
+            crate::bail!("Zed response is too large for Godot");
         }
         let id = message.get("id").map(Value::to_string).unwrap_or_default();
         if proxy.server_requests.remove(&id) {
@@ -901,11 +901,10 @@ async fn forward_server_message(
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
-    let message = parse_message(body).map_err(|error| anyhow!(error))?;
+    let message = parse_message(body).map_err(Error::new)?;
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if method == "gdscript_client/changeWorkspace" {
-            check_workspace(&message, &proxy.project, Some(editor.lsp_port))
-                .map_err(|error| anyhow!(error.to_string()))?;
+            check_workspace(&message, &proxy.project, Some(editor.lsp_port)).map_err(Error::new)?;
             if let Some(id) = message.get("id") {
                 send_godot(
                     &mut editor.connection.writer,
@@ -1228,7 +1227,7 @@ async fn process_watcher_changes(
                 if !recovering {
                     if let Some(action) = action {
                         let Some(editor) = editor.as_deref_mut() else {
-                            return Err(anyhow!("project diagnostics editor is unavailable"));
+                            crate::bail!("project diagnostics editor is unavailable");
                         };
                         send_godot(
                             &mut editor.connection.writer,
@@ -1252,7 +1251,7 @@ async fn process_watcher_changes(
                 schedule_close(proxy, &uri);
                 if !recovering {
                     let Some(editor) = editor.as_deref_mut() else {
-                        return Err(anyhow!("project diagnostics editor is unavailable"));
+                        crate::bail!("project diagnostics editor is unavailable");
                     };
                     send_godot(&mut editor.connection.writer, &close_message(&uri), false).await?;
                 }
@@ -1296,7 +1295,7 @@ fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
 async fn send_client<W: AsyncWrite + Unpin>(writer: &mut W, message: &Value) -> Result<()> {
     write_json(writer, message, CLIENT_FRAME_CAP, true)
         .await
-        .map_err(|error| anyhow!(error.to_string()))?;
+        .map_err(Error::new)?;
     Ok(())
 }
 
@@ -1337,7 +1336,7 @@ async fn send_godot(writer: &mut OwnedWriteHalf, message: &Value, request: bool)
     let body = serde_json::to_vec(message)?;
     if body.len() > GODOT_WRITE_CAP {
         if request {
-            return Err(anyhow!("message too large for Godot"));
+            crate::bail!("message too large for Godot");
         }
         crate::warn!(
             "dropping oversized notification to Godot, {} bytes",
@@ -1363,11 +1362,11 @@ fn check_workspace(message: &Value, project: &Path, port: Option<u16>) -> Result
         .unwrap_or_else(|_| PathBuf::from(path));
     if actual != project {
         let port = port.map_or_else(|| "unknown".to_owned(), |port| port.to_string());
-        return Err(anyhow!(
+        crate::bail!(
             "Editor on {port} serves {}, expected {}",
             actual.display(),
             project.display()
-        ));
+        );
     }
     Ok(())
 }

@@ -28,7 +28,7 @@ pub(super) async fn run_session(mut session: Session, unmanaged: bool) -> Result
     if session.settings.project_diagnostics {
         session.watch.watcher = Some(
             docs_state::watch_project(&session.proxy.project)
-                .map_err(|error| anyhow!("cannot watch project: {error}"))?,
+                .map_err(|error| Error::new(format!("cannot watch project: {error}")))?,
         );
     }
     let mut gui_check = tokio::time::interval(Duration::from_millis(200));
