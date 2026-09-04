@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use serde_json::Value;
+use crate::json::Value;
 
 const ROOT_MESSAGE: &str =
     "godot-bridge: cannot determine a local worktree root from initialize params";

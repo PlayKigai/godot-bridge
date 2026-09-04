@@ -19,21 +19,21 @@ pub(super) async fn serve_owner_socket(
             let state = state.read().await;
             if requested.is_some_and(|requested| requested != state.project) {
                 return if cmd == Some("status") {
-                    json!({"error": "project mismatch"})
+                    crate::json!({"error": "project mismatch"})
                 } else {
-                    json!({"version": 1, "accepted": false, "reason": "project mismatch"})
+                    crate::json!({"version": 1, "accepted": false, "reason": "project mismatch"})
                 };
             }
             match cmd {
-                Some("status") => serde_json::to_value(&*state).unwrap_or_else(|_| json!({})),
+                Some("status") => state.to_value(),
                 Some("handoff") => {
                     let decision = handoff_decision(&state);
                     drop(state);
                     match decision {
                         HandoffDecision::Reject(reason) => {
-                            json!({"version": 1, "accepted": false, "reason": reason})
+                            crate::json!({"version": 1, "accepted": false, "reason": reason})
                         }
-                        HandoffDecision::AlreadyGui => json!({"version": 1, "accepted": true}),
+                        HandoffDecision::AlreadyGui => crate::json!({"version": 1, "accepted": true}),
                         HandoffDecision::Swap => match try_lock(&dap_path) {
                             Ok(Some(guard)) => {
                                 let handoff = HandoffRequest {
@@ -42,16 +42,16 @@ pub(super) async fn serve_owner_socket(
                                     },
                                 };
                                 if handoff_sender.send(handoff).is_ok() {
-                                    json!({"version": 1, "accepted": true})
+                                    crate::json!({"version": 1, "accepted": true})
                                 } else {
-                                    json!({"version": 1, "accepted": false, "reason": "owner is shutting down"})
+                                    crate::json!({"version": 1, "accepted": false, "reason": "owner is shutting down"})
                                 }
                             }
                             Ok(None) => {
-                                json!({"version": 1, "accepted": false, "reason": "a debug session is active"})
+                                crate::json!({"version": 1, "accepted": false, "reason": "a debug session is active"})
                             }
                             Err(error) => {
-                                json!({"version": 1, "accepted": false, "reason": error.to_string()})
+                                crate::json!({"version": 1, "accepted": false, "reason": (error.to_string())})
                             }
                         },
                     }

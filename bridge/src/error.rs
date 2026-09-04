@@ -29,8 +29,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
+impl From<crate::json::Error> for Error {
+    fn from(error: crate::json::Error) -> Self {
         Self::new(error)
     }
 }

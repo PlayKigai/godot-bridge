@@ -262,10 +262,10 @@ async fn replay_open_documents(session: &mut Session) -> Result<()> {
         .values_mut()
         .map(|doc| {
             doc.version = 1;
-            json!({
+            crate::json!({
                 "jsonrpc": "2.0",
                 "method": "textDocument/didOpen",
-                "params": {"textDocument": {"uri": doc.uri, "languageId": "gdscript", "version": 1, "text": doc.text}}
+                "params": {"textDocument": {"uri": (doc.uri.clone()), "languageId": "gdscript", "version": 1, "text": (doc.text.clone())}}
             })
         })
         .collect::<Vec<_>>();
@@ -296,7 +296,7 @@ pub(super) async fn queue_recovery_message(
     body: &[u8],
 ) -> Result<()> {
     let message = parse_message(body)?;
-    let size = serde_json::to_vec(&message)?.len();
+    let size = crate::json::to_vec(&message).len();
     if message.get("method").is_some() {
         if message.get("id").is_some() {
             if queue.requests >= RECOVERY_QUEUE_CAP
@@ -320,7 +320,7 @@ pub(super) async fn queue_recovery_message(
                     .position(|item| matches!(item, RecoveryItem::Notification(_)))
                 {
                     if let Some(RecoveryItem::Notification(old)) = queue.items.remove(index) {
-                        queue.bytes = queue.bytes.saturating_sub(serde_json::to_vec(&old)?.len());
+                        queue.bytes = queue.bytes.saturating_sub(crate::json::to_vec(&old).len());
                     }
                     queue.notifications -= 1;
                     crate::warn!("dropping oldest notification from recovery queue");
@@ -353,7 +353,7 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
     if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
         params.remove("initializationOptions");
     }
-    initialize["id"] = json!(id);
+    initialize["id"] = crate::json!(id);
     proxy.pending.insert(
         id,
         PendingRequest {
@@ -377,19 +377,19 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
             if message.get("id").is_some() {
                 send_godot(
                     &mut editor.connection.writer,
-                    &json!({"jsonrpc":"2.0","id":message["id"],"result":null}),
+                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
                     false,
                 )
                 .await?;
             }
             continue;
         }
-        if message.get("id") == Some(&json!(id)) {
+        if message.get("id") == Some(&crate::json!(id)) {
             proxy.pending.remove(&id);
             if proxy.zed_initialized {
                 send_godot(
                     &mut editor.connection.writer,
-                    &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+                    &crate::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
                     false,
                 )
                 .await?;
@@ -399,7 +399,7 @@ pub(super) async fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyStat
         if message.get("method").is_some() && message.get("id").is_some() {
             send_godot(
                 &mut editor.connection.writer,
-                &json!({"jsonrpc":"2.0","id":message["id"],"result":null}),
+                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
                 false,
             )
             .await?;

@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use serde_json::{json, Value};
+use crate::json::Value;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -67,7 +67,7 @@ async fn try_handoff_with_timeout(
 ) -> Option<Value> {
     socket_request(
         &files.sock,
-        &json!({"cmd": "handoff", "project": project.to_string_lossy()}),
+        &crate::json!({"cmd": "handoff", "project": (project.to_string_lossy())}),
         timeout,
     )
     .await
@@ -200,7 +200,7 @@ async fn wait_for_ports(
 }
 
 fn print_state(state: State) -> Result<ExitCode> {
-    println!("{}", serde_json::to_string(&state)?);
+    println!("{}", state.to_value());
     Ok(ExitCode::SUCCESS)
 }
 

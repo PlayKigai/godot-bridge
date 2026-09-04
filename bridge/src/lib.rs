@@ -8,6 +8,7 @@ pub mod file_uri;
 pub mod fnv;
 pub mod framing;
 pub mod godot_bin;
+pub mod json;
 pub mod log;
 pub mod lsp;
 pub mod open_editor;

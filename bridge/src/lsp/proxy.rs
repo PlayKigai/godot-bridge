@@ -237,7 +237,7 @@ pub(super) async fn forward_initialize(
     if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
         params.remove("initializationOptions");
     }
-    initialize["id"] = json!(bridge_id);
+    initialize["id"] = crate::json!(bridge_id);
     if let Err(error) = send_godot(&mut editor.connection.writer, &initialize, true).await {
         return Err(error.to_string());
     }
@@ -259,7 +259,7 @@ pub(super) async fn forward_initialize(
             if message.get("id").is_some()
                 && send_godot(
                     &mut editor.connection.writer,
-                    &json!({"jsonrpc":"2.0","id":message["id"],"result":null}),
+                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
                     false,
                 )
                 .await
@@ -269,7 +269,7 @@ pub(super) async fn forward_initialize(
             }
             continue;
         }
-        if message.get("id") == Some(&json!(bridge_id)) {
+        if message.get("id") == Some(&crate::json!(bridge_id)) {
             let mut response = message;
             response["id"] = original_id;
             patch_initialize_response(&mut response);

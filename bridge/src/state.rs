@@ -1,5 +1,4 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use crate::json::{Map, Value};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -148,7 +147,7 @@ pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub version: u32,
     pub project: String,
@@ -165,20 +164,138 @@ pub struct State {
     pub bridge_version: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Starting,
     Ready,
     Recovering,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Headless,
     Gui,
     Unmanaged,
+}
+
+impl State {
+    pub fn to_value(&self) -> Value {
+        let mut object = Map::new();
+        object.insert("version".to_owned(), self.version.into());
+        object.insert("project".to_owned(), self.project.clone().into());
+        object.insert(
+            "status".to_owned(),
+            match self.status {
+                Status::Starting => "starting",
+                Status::Ready => "ready",
+                Status::Recovering => "recovering",
+            }
+            .into(),
+        );
+        object.insert(
+            "mode".to_owned(),
+            match self.mode {
+                Mode::Headless => "headless",
+                Mode::Gui => "gui",
+                Mode::Unmanaged => "unmanaged",
+            }
+            .into(),
+        );
+        object.insert("godot_pid".to_owned(), self.godot_pid.into());
+        object.insert("godot_pgid".to_owned(), self.godot_pgid.into());
+        object.insert("lsp_port".to_owned(), self.lsp_port.into());
+        object.insert("dap_port".to_owned(), self.dap_port.into());
+        object.insert("owner_pid".to_owned(), self.owner_pid.into());
+        object.insert(
+            "owner_start_ticks".to_owned(),
+            self.owner_start_ticks.into(),
+        );
+        object.insert(
+            "godot_start_ticks".to_owned(),
+            self.godot_start_ticks.into(),
+        );
+        object.insert("started_at".to_owned(), self.started_at.clone().into());
+        object.insert(
+            "bridge_version".to_owned(),
+            self.bridge_version.clone().into(),
+        );
+        Value::Object(object)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "state must be an object".to_owned())?;
+        let version = field(object, "version")?
+            .as_u64()
+            .ok_or_else(|| "state.version must be an unsigned integer".to_owned())?
+            .try_into()
+            .map_err(|_| "state.version must be a 32-bit integer".to_owned())?;
+        let status = match field(object, "status")?.as_str() {
+            Some("starting") => Status::Starting,
+            Some("ready") => Status::Ready,
+            Some("recovering") => Status::Recovering,
+            _ => return Err("state.status is invalid".to_owned()),
+        };
+        let mode = match field(object, "mode")?.as_str() {
+            Some("headless") => Mode::Headless,
+            Some("gui") => Mode::Gui,
+            Some("unmanaged") => Mode::Unmanaged,
+            _ => return Err("state.mode is invalid".to_owned()),
+        };
+        Ok(Self {
+            version,
+            project: string_field(object, "project")?,
+            status,
+            mode,
+            godot_pid: optional_u32(object, "godot_pid")?,
+            godot_pgid: optional_u32(object, "godot_pgid")?,
+            lsp_port: optional_u16(object, "lsp_port")?,
+            dap_port: optional_u16(object, "dap_port")?,
+            owner_pid: optional_u32(object, "owner_pid")?,
+            owner_start_ticks: optional_u64(object, "owner_start_ticks")?,
+            godot_start_ticks: optional_u64(object, "godot_start_ticks")?,
+            started_at: string_field(object, "started_at")?,
+            bridge_version: string_field(object, "bridge_version")?,
+        })
+    }
+}
+
+fn field<'a>(object: &'a Map, key: &str) -> Result<&'a Value, String> {
+    object
+        .get(key)
+        .ok_or_else(|| format!("state is missing {key}"))
+}
+
+fn string_field(object: &Map, key: &str) -> Result<String, String> {
+    field(object, key)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("state.{key} must be a string"))
+}
+
+fn optional_u64(object: &Map, key: &str) -> Result<Option<u64>, String> {
+    match field(object, key)? {
+        Value::Null => Ok(None),
+        value => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("state.{key} must be an unsigned integer or null")),
+    }
+}
+
+fn optional_u32(object: &Map, key: &str) -> Result<Option<u32>, String> {
+    optional_u64(object, key)?
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| format!("state.{key} must be a 32-bit integer or null"))
+}
+
+fn optional_u16(object: &Map, key: &str) -> Result<Option<u16>, String> {
+    optional_u64(object, key)?
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| format!("state.{key} must be a 16-bit integer or null"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,7 +360,7 @@ pub fn gui_process_alive(state: &State) -> bool {
 
 pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
     let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    let bytes = crate::json::to_vec(&state.to_value());
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -273,7 +390,8 @@ pub fn read_state(path: &Path) -> io::Result<Option<State>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    serde_json::from_slice(&bytes)
+    let value = crate::json::from_slice(&bytes).map_err(io::Error::other)?;
+    State::from_value(&value)
         .map(Some)
         .map_err(io::Error::other)
 }
@@ -353,7 +471,7 @@ where
 }
 
 pub fn unknown_command() -> Value {
-    serde_json::json!({"error": "unknown cmd"})
+    crate::json!({"error": "unknown cmd"})
 }
 
 async fn handle_client<F, Fut>(
@@ -372,7 +490,7 @@ async fn handle_client<F, Fut>(
             Ok(Ok(Some(line))) => line,
             _ => break,
         };
-        let response = match serde_json::from_slice::<Value>(&line) {
+        let response = match crate::json::from_slice(&line) {
             Ok(request) => {
                 let known = matches!(
                     request.get("cmd").and_then(Value::as_str),
@@ -381,17 +499,15 @@ async fn handle_client<F, Fut>(
                 if known {
                     match tokio::time::timeout(SOCKET_TIMEOUT, handler(request)).await {
                         Ok(response) => response,
-                        Err(_) => serde_json::json!({"error": "request timed out"}),
+                        Err(_) => crate::json!({"error": "request timed out"}),
                     }
                 } else {
                     unknown_command()
                 }
             }
-            Err(_) => serde_json::json!({"error": "invalid json"}),
+            Err(_) => crate::json!({"error": "invalid json"}),
         };
-        let Ok(mut bytes) = serde_json::to_vec(&response) else {
-            break;
-        };
+        let mut bytes = crate::json::to_vec(&response);
         bytes.push(b'\n');
         if !matches!(
             tokio::time::timeout(SOCKET_TIMEOUT, write.write_all(&bytes)).await,
@@ -447,14 +563,14 @@ pub async fn socket_request(
     tokio::time::timeout(timeout, async {
         let stream = UnixStream::connect(path).await?;
         let (read, mut write) = stream.into_split();
-        let mut bytes = serde_json::to_vec(req).map_err(io::Error::other)?;
+        let mut bytes = crate::json::to_vec(req);
         bytes.push(b'\n');
         write.write_all(&bytes).await?;
         let mut reader = BufReader::new(read);
         let line = read_line_limited(&mut reader)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
-        serde_json::from_slice(&line).map_err(io::Error::other)
+        crate::json::from_slice(&line).map_err(io::Error::other)
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket request timed out"))?
@@ -544,7 +660,7 @@ mod tests {
 
     #[test]
     fn starting_state_serializes_nullable_fields_as_null() {
-        let value = serde_json::to_value(state(None, None)).unwrap();
+        let value = state(None, None).to_value();
         assert!(value["godot_pid"].is_null());
         assert!(value["lsp_port"].is_null());
         assert_eq!(value["status"], "starting");
@@ -589,9 +705,7 @@ mod tests {
 
     #[test]
     fn detached_gui_state_has_null_owner_fields() {
-        let value =
-            serde_json::to_value(detached_gui_state(Path::new("/project"), Status::Starting))
-                .unwrap();
+        let value = detached_gui_state(Path::new("/project"), Status::Starting).to_value();
         assert_eq!(value["mode"], "gui");
         assert_eq!(value["status"], "starting");
         assert!(value["owner_pid"].is_null());
@@ -607,16 +721,16 @@ mod tests {
         let path = dir.path().join("status.sock");
         let handle = serve_socket(&path, |request| async move {
             if request["cmd"] == "status" {
-                serde_json::json!({"status": "ready"})
+                crate::json!({"status": "ready"})
             } else {
-                serde_json::json!({"error": "unexpected"})
+                crate::json!({"error": "unexpected"})
             }
         })
         .await
         .unwrap();
         let response = socket_request(
             &path,
-            &serde_json::json!({"cmd": "status"}),
+            &crate::json!({"cmd": "status"}),
             Duration::from_secs(1),
         )
         .await

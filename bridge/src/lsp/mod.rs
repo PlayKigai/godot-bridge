@@ -1,5 +1,5 @@
 use crate::error::{Context, Result};
-use serde_json::{json, Value};
+use crate::json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
@@ -436,7 +436,7 @@ pub async fn run() -> Result<ExitCode> {
     let params = initialize
         .get("params")
         .cloned()
-        .unwrap_or_else(|| json!({}));
+        .unwrap_or_else(|| crate::json!({}));
     let settings = match params.get("initializationOptions") {
         Some(options) => match parse_settings(options) {
             Ok(settings) => settings,
@@ -766,7 +766,7 @@ async fn forward_client_message(
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            send_client(output, &json!({"jsonrpc":"2.0","id":message["id"],"result":symbols::search(&result, query).iter().map(symbols::symbol_information).collect::<Vec<_>>() })).await?;
+            send_client(output, &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(symbols::search(&result, query).iter().map(symbols::symbol_information).collect::<Vec<_>>()) })).await?;
             return Ok(());
         }
         if method == "initialized" {
@@ -791,7 +791,7 @@ async fn forward_client_message(
         }
     }
     if message.get("id").is_some() && method.is_none() {
-        let body = serde_json::to_vec(&message)?;
+        let body = crate::json::to_vec(&message);
         if body.len() > GODOT_WRITE_CAP {
             crate::bail!("Zed response is too large for Godot");
         }
@@ -823,15 +823,15 @@ async fn forward_client_request(
     let is_shutdown = message.get("method").and_then(Value::as_str) == Some("shutdown");
     let bridge_id = proxy.next_id;
     proxy.next_id += 1;
-    message["id"] = json!(bridge_id);
-    let body = serde_json::to_vec(&message)?;
+    message["id"] = crate::json!(bridge_id);
+    let body = crate::json::to_vec(&message);
     if body.len() > GODOT_WRITE_CAP {
         send_error(output, &zed_id, -32803, "message too large for Godot").await?;
         return Ok(());
     }
     if proxy.pending.len() >= IN_FLIGHT_CAP && !is_shutdown {
         message["id"] = zed_id;
-        let queued_size = serde_json::to_vec(&message)?.len();
+        let queued_size = crate::json::to_vec(&message).len();
         if proxy.queued_bytes.saturating_add(queued_size) > QUEUE_BYTES_CAP {
             if let Some(id) = message.get("id") {
                 send_error(output, id, -32803, "RequestFailed").await?;
@@ -881,7 +881,7 @@ async fn cancel_request(
         if let Some(queued) = proxy.queued.remove(index) {
             proxy.queued_bytes = proxy
                 .queued_bytes
-                .saturating_sub(serde_json::to_vec(&queued)?.len());
+                .saturating_sub(crate::json::to_vec(&queued).len());
         }
         send_error(output, &target, -32800, "RequestCancelled").await?;
         return Ok(());
@@ -892,7 +892,7 @@ async fn cancel_request(
         .find(|(_, pending)| pending.zed_id == target)
     {
         let translated =
-            json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":bridge_id}});
+            crate::json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":bridge_id}});
         send_godot(&mut editor.connection.writer, &translated, false).await?;
     }
     Ok(())
@@ -912,7 +912,7 @@ async fn forward_server_message(
             if let Some(id) = message.get("id") {
                 send_godot(
                     &mut editor.connection.writer,
-                    &json!({"jsonrpc":"2.0","id":id,"result":null}),
+                    &crate::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     false,
                 )
                 .await?;
@@ -971,12 +971,12 @@ async fn flush_queued(
         };
         proxy.queued_bytes = proxy
             .queued_bytes
-            .saturating_sub(serde_json::to_vec(&message)?.len());
+            .saturating_sub(crate::json::to_vec(&message).len());
         let zed_id = message.get("id").cloned().unwrap_or(Value::Null);
         let bridge_id = proxy.next_id;
         proxy.next_id += 1;
-        message["id"] = json!(bridge_id);
-        let body = serde_json::to_vec(&message)?;
+        message["id"] = crate::json!(bridge_id);
+        let body = crate::json::to_vec(&message);
         if body.len() > GODOT_WRITE_CAP {
             send_error(output, &zed_id, -32803, "message too large for Godot").await?;
             continue;
@@ -1028,7 +1028,7 @@ fn rewrite_document_messages(
                 .unwrap_or_default()
                 .to_owned();
             let planned = proxy.documents.planned_zed_open(&uri, text.clone());
-            if serde_json::to_vec(&document_action_message(planned))?.len() > GODOT_WRITE_CAP {
+            if crate::json::to_vec(&document_action_message(planned)).len() > GODOT_WRITE_CAP {
                 crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
@@ -1056,14 +1056,13 @@ fn rewrite_document_messages(
                 .to_owned();
             let planned = proxy.documents.planned_zed_change(&uri, text.clone());
             if planned.is_some_and(|action| {
-                serde_json::to_vec(&document_action_message(action))
-                    .is_ok_and(|body| body.len() > GODOT_WRITE_CAP)
+                crate::json::to_vec(&document_action_message(action)).len() > GODOT_WRITE_CAP
             }) {
                 crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
             }
             let Some(action) = proxy.documents.zed_change(&uri, text) else {
-                if serde_json::to_vec(&message)?.len() > GODOT_WRITE_CAP {
+                if crate::json::to_vec(&message).len() > GODOT_WRITE_CAP {
                     crate::warn!("skipping oversized didChange for Godot {uri}");
                     return Ok(Vec::new());
                 }
@@ -1101,23 +1100,23 @@ fn document_action_message(action: DocumentAction) -> Value {
     match action {
         DocumentAction::Open {
             uri, version, text, ..
-        } => json!({
+        } => crate::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
             "params": {"textDocument": {"uri": uri, "languageId": "gdscript", "version": version, "text": text}}
         }),
         DocumentAction::Change {
             uri, version, text, ..
-        } => json!({
+        } => crate::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
-            "params": {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": text}]}
+            "params": {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": (text)}]}
         }),
     }
 }
 
 fn close_message(uri: &str) -> Value {
-    json!({
+    crate::json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didClose",
         "params": {"textDocument": {"uri": uri}}
@@ -1261,7 +1260,7 @@ async fn process_watcher_changes(
                 }
                 send_client(
                     output,
-                    &json!({
+                    &crate::json!({
                         "jsonrpc": "2.0",
                         "method": "textDocument/publishDiagnostics",
                         "params": {"uri": uri, "diagnostics": []}
@@ -1309,7 +1308,7 @@ async fn send_error<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     send_client(
         writer,
-        &json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
+        &crate::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
     )
     .await
 }
@@ -1329,13 +1328,13 @@ async fn send_message_type<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     send_client(
         writer,
-        &json!({"jsonrpc":"2.0","method":"window/showMessage","params":{"type":message_type,"message":message}}),
+        &crate::json!({"jsonrpc":"2.0","method":"window/showMessage","params":{"type":message_type,"message":message}}),
     )
     .await
 }
 
 async fn send_godot(writer: &mut OwnedWriteHalf, message: &Value, request: bool) -> Result<()> {
-    let body = serde_json::to_vec(message)?;
+    let body = crate::json::to_vec(message);
     if body.len() > GODOT_WRITE_CAP {
         if request {
             crate::bail!("message too large for Godot");
@@ -1475,7 +1474,7 @@ async fn send_due_symbol_requests(editor: &mut Editor, proxy: &mut ProxyState) -
                 symbol: Some((uri.clone(), generation, version)),
             },
         );
-        send_godot(&mut editor.connection.writer, &json!({"jsonrpc":"2.0","id":id,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}), true).await?;
+        send_godot(&mut editor.connection.writer, &crate::json!({"jsonrpc":"2.0","id":id,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}), true).await?;
     }
     Ok(())
 }
@@ -1512,7 +1511,7 @@ mod tests {
             next_id: 1,
             initialized_forwarded: false,
             zed_initialized: false,
-            initialize: json!({}),
+            initialize: crate::json!({}),
             project: PathBuf::from("/tmp"),
             recovery_times: VecDeque::new(),
             project_diagnostics_started: false,
@@ -1523,7 +1522,7 @@ mod tests {
             symbol_scheduled: HashMap::new(),
             bulk_generation: 0,
         };
-        let message = json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
+        let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =
             rewrite_document_messages(&mut proxy, message, "textDocument/didOpen", true).unwrap();
         assert_eq!(rewritten[0]["params"]["textDocument"]["version"], 1);

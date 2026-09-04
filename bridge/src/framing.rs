@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde_json::Value;
+use crate::json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const HEADER_CAP: usize = 16 * 1024;
@@ -170,7 +170,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 }
 
 pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|error| {
+    let value: Value = crate::json::from_slice(body).map_err(|error| {
         if protocol.is_empty() {
             format!("invalid JSON: {error}")
         } else {
@@ -189,8 +189,7 @@ pub async fn write_json<W: AsyncWrite + Unpin>(
     cap: usize,
     flush: bool,
 ) -> Result<(), FrameError> {
-    let body = serde_json::to_vec(message)
-        .map_err(|error| FrameError::Malformed(format!("cannot serialize JSON: {error}")))?;
+    let body = crate::json::to_vec(message);
     write_frame(writer, &body, cap).await?;
     if flush {
         writer.flush().await.map_err(FrameError::Io)?;

@@ -1,5 +1,5 @@
 use crate::error::Result;
-use serde_json::{json, Value};
+use crate::json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -80,7 +80,7 @@ impl ClientBuffer {
         let message = self.messages.pop_front()?;
         self.bytes = self
             .bytes
-            .saturating_sub(serde_json::to_vec(&message).map_or(0, |bytes| bytes.len()));
+            .saturating_sub(crate::json::to_vec(&message).len());
         Some(message)
     }
 }
@@ -101,15 +101,15 @@ impl<W: AsyncWrite + Unpin> ClientOutput<W> {
     async fn send(&mut self, mut message: Value) -> Result<()> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        message["seq"] = json!(seq);
+        message["seq"] = crate::json!(seq);
         write_json(&mut self.writer, &message, FRAME_CAP, true).await?;
         Ok(())
     }
 
     async fn failure(&mut self, initialize: &Value, message: &str) -> Result<()> {
-        self.send(json!({
+        self.send(crate::json!({
             "type": "response",
-            "request_seq": initialize.get("seq").cloned().unwrap_or(Value::Null),
+            "request_seq": (initialize.get("seq").cloned().unwrap_or(Value::Null)),
             "command": "initialize",
             "success": false,
             "message": message,
@@ -135,7 +135,7 @@ impl ServerRequests {
                 self.original_sequences.insert(bridge_seq, original);
             }
         }
-        message["seq"] = json!(bridge_seq);
+        message["seq"] = crate::json!(bridge_seq);
     }
 
     fn restore_response(&mut self, message: &mut Value) {
@@ -276,7 +276,7 @@ async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
 
 fn read_settings() -> std::result::Result<Settings, String> {
     let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
-        Ok(contents) if contents.len() <= 1024 * 1024 => serde_json::from_str(&contents)
+        Ok(contents) if contents.len() <= 1024 * 1024 => crate::json::from_str(&contents)
             .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
         Ok(_) => return Err("GODOT_BRIDGE_SETTINGS exceeds 1 MiB".to_owned()),
         Err(std::env::VarError::NotPresent) => Value::Null,
@@ -328,7 +328,7 @@ async fn discover_owner(
         }
         let status = socket_request(
             &files.sock,
-            &json!({"cmd": "status", "project": project.to_string_lossy()}),
+            &crate::json!({"cmd": "status", "project": (project.to_string_lossy())}),
             timeout,
         )
         .await
@@ -522,7 +522,7 @@ async fn wait_for_initialize(
                             }
                         };
                         let is_initialize_response = message.get("type").and_then(Value::as_str) == Some("response")
-                            && message.get("command") == Some(&json!("initialize"))
+                            && message.get("command") == Some(&crate::json!("initialize"))
                             && message.get("request_seq") == Some(&initialize_seq);
                         server_requests.restore_response(&mut message);
                         let seq = output.next_seq;
@@ -582,7 +582,7 @@ async fn send_request_failure(
     message: String,
 ) -> Result<()> {
     output
-        .send(json!({
+        .send(crate::json!({
             "type": "response",
             "request_seq": request_seq,
             "command": command,
@@ -611,11 +611,10 @@ fn rewrite_launch_or_attach(
         }
         return Ok(());
     }
-    let Some(arguments) = object
-        .entry("arguments")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-    else {
+    if object.get("arguments").is_none() {
+        object.insert("arguments".to_owned(), crate::json!({}));
+    }
+    let Some(arguments) = object.get_mut("arguments").and_then(Value::as_object_mut) else {
         return Err((request_seq, "DAP arguments must be an object".to_owned()));
     };
     arguments.remove("adapter");
@@ -651,10 +650,10 @@ async fn send_to_godot(writer: &mut OwnedWriteHalf, message: &Value) -> Result<(
 
 async fn godot_died(output: &mut ClientOutput<tokio::io::Stdout>) -> Result<ExitCode> {
     output
-        .send(json!({"type": "event", "event": "terminated"}))
+        .send(crate::json!({"type": "event", "event": "terminated"}))
         .await?;
     output
-        .send(json!({"type": "event", "event": "exited"}))
+        .send(crate::json!({"type": "event", "event": "exited"}))
         .await?;
     Ok(ExitCode::from(1))
 }
@@ -697,7 +696,7 @@ mod tests {
 
     #[test]
     fn rewrites_launch_arguments() {
-        let mut message = json!({
+        let mut message = crate::json!({
             "type": "request",
             "seq": 4,
             "command": "launch",
@@ -719,7 +718,7 @@ mod tests {
 
     #[test]
     fn missing_current_file_has_exact_error() {
-        let mut message = json!({
+        let mut message = crate::json!({
             "type": "request",
             "seq": 2,
             "command": "launch",
@@ -727,16 +726,16 @@ mod tests {
         });
         assert_eq!(
             rewrite_launch_or_attach(&mut message, "launch", Path::new("/project"), None),
-            Err((json!(2), "scene current requires --file".to_owned()))
+            Err((crate::json!(2), "scene current requires --file".to_owned()))
         );
     }
 
     #[test]
     fn server_request_sequence_is_restored() {
         let mut requests = ServerRequests::new();
-        let mut request = json!({"type":"request","seq":17});
+        let mut request = crate::json!({"type":"request","seq":17});
         requests.rewrite(&mut request, 1);
-        let mut response = json!({"type":"response","request_seq":1});
+        let mut response = crate::json!({"type":"response","request_seq":1});
         requests.restore_response(&mut response);
         assert_eq!(response["request_seq"], 17);
     }
@@ -744,11 +743,11 @@ mod tests {
     #[test]
     fn drops_lifecycle_events_before_process() {
         let messages = [
-            json!({"type":"event","event":"exited"}),
-            json!({"type":"event","event":"terminated"}),
-            json!({"type":"event","event":"process"}),
-            json!({"type":"event","event":"exited"}),
-            json!({"type":"event","event":"terminated"}),
+            crate::json!({"type":"event","event":"exited"}),
+            crate::json!({"type":"event","event":"terminated"}),
+            crate::json!({"type":"event","event":"process"}),
+            crate::json!({"type":"event","event":"exited"}),
+            crate::json!({"type":"event","event":"terminated"}),
         ];
         let mut process_seen = false;
         let forwarded = messages
@@ -758,7 +757,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             forwarded,
-            [json!("process"), json!("exited"), json!("terminated")]
+            [
+                crate::json!("process"),
+                crate::json!("exited"),
+                crate::json!("terminated"),
+            ]
         );
     }
 }
