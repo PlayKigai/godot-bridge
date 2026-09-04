@@ -1,0 +1,5 @@
+[
+  { "label": "Godot: launch main scene", "adapter": "godot", "request": "launch", "scene": "main" },
+  { "label": "Godot: launch scene of current file", "adapter": "godot", "request": "launch", "scene": "current", "file": "$ZED_FILE" },
+  { "label": "Godot: attach", "adapter": "godot", "request": "attach" }
+]

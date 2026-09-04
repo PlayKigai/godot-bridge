@@ -1,0 +1,26 @@
+id = "godot"
+name = "Godot"
+version = "0.1.0"
+schema_version = 1
+authors = ["Godot Zed contributors"]
+description = "Godot language support for Zed."
+repository = "https://github.com/example/zed-godot"
+
+[grammars.gdscript]
+repository = "https://github.com/PrestonKnopp/tree-sitter-gdscript"
+commit = "c5c8fa4861b5a4f04a7e60d97587fc3b6cc5639e"
+
+[grammars.godot_resource]
+repository = "https://github.com/PrestonKnopp/tree-sitter-godot-resource"
+commit = "302c1895f54bf74d53a08572f7b26a6614209adc"
+
+[grammars.gdshader]
+repository = "https://github.com/GodOfAvacyn/tree-sitter-gdshader"
+commit = "14e834063e136fa69b6d91f711f4f1981acf424b"
+
+[language_servers.godot]
+name = "godot-bridge"
+languages = ["GDScript"]
+
+[debug_adapters.godot]
+schema_path = "debug_adapter_schemas/godot.json"

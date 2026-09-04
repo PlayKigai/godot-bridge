@@ -1,0 +1,10 @@
+[package]
+name = "godot-zed-extension"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7"
