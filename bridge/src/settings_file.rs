@@ -63,15 +63,18 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
-    let user_path = user_settings_path();
+    load_zed_settings_with(worktree, &user_settings_path())
+}
+
+fn load_zed_settings_with(worktree: &Path, user_path: &Path) -> Result<Settings, String> {
     let project_path = worktree.join(".zed").join("settings.json");
 
-    let user_section = read_settings_section(&user_path)?;
+    let user_section = read_settings_section(user_path)?;
     let project_section = read_settings_section(&project_path)?;
 
     let mut merged = Map::new();
     if let Some(section) = user_section {
-        validate_section(&user_path, &section)?;
+        validate_section(user_path, &section)?;
         merged.extend(section);
     }
     if let Some(section) = project_section {
@@ -159,20 +162,11 @@ fn user_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
     use tempfile::tempdir;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_config_dir(dir: &Path, run: impl FnOnce()) {
-        let old = env::var_os("XDG_CONFIG_HOME");
-        env::set_var("XDG_CONFIG_HOME", dir);
-        run();
-        match old {
-            Some(value) => env::set_var("XDG_CONFIG_HOME", value),
-            None => env::remove_var("XDG_CONFIG_HOME"),
-        }
+    fn user_settings_path_in(config_dir: &Path) -> PathBuf {
+        config_dir.join("zed").join("settings.json")
     }
 
     fn write_user_settings(config_dir: &Path, contents: &str) {
@@ -223,7 +217,6 @@ mod tests {
 
     #[test]
     fn project_settings_override_user_per_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         write_user_settings(
             config_dir.path(),
@@ -256,22 +249,21 @@ mod tests {
                 }
             }"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-            assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
-            assert_eq!(settings.lsp_port, None);
-            assert_eq!(settings.dap_port, 5555);
-            assert_eq!(settings.startup_timeout_s, 30);
-            assert!(!settings.project_diagnostics);
-            assert!(settings.diagnose_addons);
-            assert_eq!(settings.extra_args, ["--verbose"]);
-        });
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
+        assert_eq!(settings.lsp_port, None);
+        assert_eq!(settings.dap_port, 5555);
+        assert_eq!(settings.startup_timeout_s, 30);
+        assert!(!settings.project_diagnostics);
+        assert!(settings.diagnose_addons);
+        assert_eq!(settings.extra_args, ["--verbose"]);
     }
 
     #[test]
     fn comment_bearing_settings_file_parses() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         let worktree = tempdir().unwrap();
         write_project_settings(
@@ -288,26 +280,25 @@ mod tests {
                 },
             }"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-            assert_eq!(settings.extra_args, ["--verbose"]);
-        });
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.extra_args, ["--verbose"]);
     }
 
     #[test]
     fn validation_error_names_the_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         let worktree = tempdir().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{"lsp": {"godot": {"settings": {"extra_args": ["--editor"]}}}}"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let error = load_zed_settings(worktree.path()).unwrap_err();
-            assert!(error.contains(".zed/settings.json"), "{error}");
-            assert!(error.contains("--editor"), "{error}");
-        });
+        let error =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap_err();
+        assert!(error.contains(".zed/settings.json"), "{error}");
+        assert!(error.contains("--editor"), "{error}");
     }
 }

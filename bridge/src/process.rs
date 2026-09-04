@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::TcpListener;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,8 @@ pub fn spawn_gui(
     let output = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(log_path.as_ref())?;
     let error_output = output.try_clone()?;
     let project = project.as_ref();
@@ -417,6 +420,8 @@ impl LogWriter {
             tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&writer.path)
                 .await?,
         );

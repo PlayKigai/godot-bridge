@@ -649,6 +649,11 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
         } else if previous.mode == Mode::Gui {
+            if !matches_project(&previous, &project) {
+                drop(lock);
+                send_error(&mut output, &initialize_id, -32002, "project mismatch").await?;
+                return Ok(ExitCode::from(1));
+            }
             cleanup_files(&files);
         }
     }

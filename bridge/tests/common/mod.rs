@@ -204,7 +204,8 @@ pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let request = serde_json::json!({"cmd": "status", "project": project.to_string_lossy()});
+    let canonical = project.canonicalize().unwrap();
+    let request = serde_json::json!({"cmd": "status", "project": canonical.to_string_lossy()});
     stream.write_all(format!("{request}\n").as_bytes()).ok()?;
     stream.shutdown(Shutdown::Write).ok()?;
     let mut line = String::new();

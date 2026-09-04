@@ -56,12 +56,12 @@ pub(super) async fn stale_cleanup(files: &ProjectFiles, project: &Path) {
             let _ = std::fs::remove_file(&files.sock);
             return;
         }
-        if let (true, Some(pid), Some(pgid), Some(ticks)) = (
-            matches_project(&state, project),
-            state.godot_pid,
-            state.godot_pgid,
-            state.godot_start_ticks,
-        ) {
+        if !matches_project(&state, project) {
+            return;
+        }
+        if let (Some(pid), Some(pgid), Some(ticks)) =
+            (state.godot_pid, state.godot_pgid, state.godot_start_ticks)
+        {
             if crate::state::pid_alive_with_ticks(pid, ticks) {
                 if let Err(error) = kill_recorded(pid, pgid as i32, ticks).await {
                     crate::warn!("cannot terminate stale Godot editor: {error}");

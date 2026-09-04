@@ -335,14 +335,6 @@ async fn discover_owner(
         .map_err(|_| no_owner.clone())?;
         match status.get("status").and_then(Value::as_str) {
             Some("ready") => {
-                if status.get("project").and_then(Value::as_str)
-                    != Some(&*project.to_string_lossy())
-                {
-                    return Err(format!(
-                        "Godot owner reports a different project than {}",
-                        project.display()
-                    ));
-                }
                 let port = status
                     .get("dap_port")
                     .and_then(Value::as_u64)

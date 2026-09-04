@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    std::sync::LazyLock::force(&godot_bridge::log::MAX_LEVEL);
     let arguments = std::env::args_os()
         .skip(1)
         .map(|argument| {
@@ -26,53 +27,23 @@ async fn main() -> ExitCode {
         }
     };
 
-    let (label, result): (&str, Result<ExitCode, String>) = match command {
-        Command::Lsp => ("lsp", lsp::run().await.map_err(|error| error.to_string())),
-        Command::Dap { file } => (
-            "dap",
-            dap::run(file.map(PathBuf::from))
-                .await
-                .map_err(|error| error.to_string()),
-        ),
-        Command::Status => (
-            "status",
-            status::run()
-                .await
-                .map(|()| ExitCode::SUCCESS)
-                .map_err(|error| error.to_string()),
-        ),
-        Command::Run { file, scene } => (
-            "run",
-            run::run(Path::new(&file), scene.as_deref()).map_err(|error| error.to_string()),
-        ),
+    let (label, result): (&str, godot_bridge::error::Result<ExitCode>) = match command {
+        Command::Lsp => ("lsp: ", lsp::run().await),
+        Command::Dap { file } => ("dap: ", dap::run(file.map(PathBuf::from)).await),
+        Command::Status => ("status: ", status::run().await.map(|()| ExitCode::SUCCESS)),
+        Command::Run { file, scene } => ("run: ", run::run(Path::new(&file), scene.as_deref())),
         Command::ProjectDir { file } => (
             "",
-            run::project_dir(Path::new(&file))
-                .map(|()| ExitCode::SUCCESS)
-                .map_err(|error| error.to_string()),
+            run::project_dir(Path::new(&file)).map(|()| ExitCode::SUCCESS),
         ),
-        Command::OpenEditor { file } => (
-            "open-editor",
-            open_editor::run(Path::new(&file))
-                .await
-                .map_err(|error| error.to_string()),
-        ),
-        Command::Doc { symbol } => (
-            "doc",
-            doc::open_doc(&symbol)
-                .map(|()| ExitCode::SUCCESS)
-                .map_err(|error| error.to_string()),
-        ),
+        Command::OpenEditor { file } => ("open-editor: ", open_editor::run(Path::new(&file)).await),
+        Command::Doc { symbol } => ("doc: ", doc::open_doc(&symbol).map(|()| ExitCode::SUCCESS)),
     };
 
     match result {
         Ok(code) => code,
         Err(error) => {
-            if label.is_empty() {
-                eprintln!("{error}");
-            } else {
-                eprintln!("{label}: {error}");
-            }
+            eprintln!("{label}{error}");
             ExitCode::from(1)
         }
     }

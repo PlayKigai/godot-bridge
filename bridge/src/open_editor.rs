@@ -33,7 +33,7 @@ pub async fn run(file: &Path) -> Result<ExitCode> {
     )?;
     let files = ProjectFiles::new(&project)?;
 
-    if let Some(response) = try_handoff(&files, &project).await {
+    if let Some(response) = try_handoff_with_timeout(&files, &project, SOCKET_TIMEOUT).await {
         return print_response(response);
     }
 
@@ -44,10 +44,6 @@ pub async fn run(file: &Path) -> Result<ExitCode> {
     let result = launch_or_reuse(&files, &project, &settings).await;
     drop(lock);
     result
-}
-
-async fn try_handoff(files: &ProjectFiles, project: &Path) -> Option<Value> {
-    try_handoff_with_timeout(files, project, SOCKET_TIMEOUT).await
 }
 
 async fn retry_handoff(files: &ProjectFiles, project: &Path) -> Result<ExitCode> {
@@ -98,8 +94,10 @@ async fn launch_or_reuse(
 ) -> Result<ExitCode> {
     let existing = read_state(&files.state)?;
     if let Some(mut state) = existing {
-        if state.mode == Mode::Gui && matches_project(&state, project) && gui_process_alive(&state)
-        {
+        if state.mode == Mode::Gui && !matches_project(&state, project) {
+            crate::bail!("project mismatch");
+        }
+        if state.mode == Mode::Gui && gui_process_alive(&state) {
             let (pid, ticks, lsp_port, dap_port) = recorded_gui(&state)?;
             match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s).await {
                 PortReadiness::Ready => {

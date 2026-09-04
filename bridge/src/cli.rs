@@ -80,23 +80,30 @@ fn collect_options(
         if argument == "--" {
             break;
         }
-        if argument == "--file" && allowed.contains(&"--file") {
-            options.file = Some(next_value(&argument, arguments)?);
-        } else if argument == "--scene" && allowed.contains(&"--scene") {
-            options.scene = Some(next_value(&argument, arguments)?);
-        } else if let Some((key, value)) = argument.split_once('=') {
-            if key == "--file" && allowed.contains(&"--file") {
-                options.file = Some(value.to_owned());
-            } else if key == "--scene" && allowed.contains(&"--scene") {
-                options.scene = Some(value.to_owned());
-            } else {
+        let (key, inline_value) = match argument.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        match key {
+            "--file" if allowed.contains(&"--file") => {
+                options.file = Some(match inline_value {
+                    Some(value) => value,
+                    None => next_value(&argument, arguments)?,
+                });
+            }
+            "--scene" if allowed.contains(&"--scene") => {
+                options.scene = Some(match inline_value {
+                    Some(value) => value,
+                    None => next_value(&argument, arguments)?,
+                });
+            }
+            _ if argument.starts_with('-') => {
                 return Err(format!("unexpected argument {argument:?}"));
             }
-        } else if argument.starts_with('-') {
-            return Err(format!("unexpected argument {argument:?}"));
-        } else {
-            options.positional = Some(argument);
-            break;
+            _ => {
+                options.positional = Some(argument);
+                break;
+            }
         }
     }
     Ok(options)
