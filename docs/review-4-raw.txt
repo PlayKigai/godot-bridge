@@ -1,0 +1,87 @@
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll read both documents end to end, then cross-check phase requirements against verified facts and prior-review context only where needed.
+[0m→ [0mRead SPEC.md
+[0m→ [0mRead TASKS.md
+[0m✱ [0mGlob "review-*-raw.txt"[90m in docs · 3 matches[0m
+[0m→ [0mRead docs/gates.md
+[0m→ [0mRead docs/review-3-raw.txt
+[0m✱ [0mGrep "changeWorkspace|capabilities|initialize|4 MiB|crash recovery|queue"[90m in docs · 15 matches[0m
+[0m✱ [0mGrep "T0\.4|Phase 0|phase 1|server-to-client request|initialized"[90m in . · 8 matches[0m
+[0m→ [0mRead docs/review-log.md
+**Phase 0**
+
+Phase 0: ready
+
+**Phase 1**
+
+1. Quote: “Frame cap 4 MiB toward Godot ... and 64 MiB from Zed.”
+
+Problem: These describe the same direction while leaving Godot-to-bridge and bridge-to-Zed limits undefined.
+
+Exact fix text: “The Zed-input decoder cap is 64 MiB. Messages forwarded to Godot must not exceed 4 MiB. The Godot-input decoder and Zed-output writer caps are 64 MiB. Godot input exceeding 64 MiB is treated as a malformed Godot frame. A Zed response exceeding 4 MiB is a fatal client protocol error; log, clean up, and exit 1.”
+
+2. Quote: “Forward `initialize` ... Wait for the response.” / “Trigger: child exit observed, or malformed frame or TCP EOF from Godot.”
+
+Problem: A crash while waiting for the first initialize response falls ambiguously between startup retry and recovery. Applying recovery would fail Zed’s initialize request but continue running an unusable session.
+
+Exact fix text: “Crash recovery becomes active only after the initial Godot initialize response has been returned to Zed. Before that point, child exit, malformed input, or TCP EOF consumes another attempt from the original startup budget, respawns Godot, and re-forwards the original initialize request. On exhaustion, return the startup `-32002` error for that request and exit 1.”
+
+3. Quote: “notifications ... are queued, bounded 1000” / “requests ... are queued, bounded 1000” / “Flush the queues in arrival order.”
+
+Problem: Separate queues cannot establish a shared arrival order.
+
+Exact fix text: “Use one tagged FIFO preserving request and notification arrival order, with independent counts capped at 1000 requests and 1000 notifications. Overflow rejects a newly arriving request and drops the oldest queued notification. Flush the tagged FIFO in order.”
+
+**Phase 2**
+
+4. Quote: “`lsp_port` set in settings: connect straight to `dap_port`, skip 4 and 5.”
+
+Problem: This skips the DAP lock, contradicting “`<hash>.dap.lock`: `flock` held by one `dap` session at a time.”
+
+Exact fix text: “Take `<hash>.dap.lock` for every DAP session after resolving the project. When `lsp_port` is set, skip only owner-socket discovery and connect directly to `dap_port`.”
+
+5. Quote: “poll ... up to `startup_timeout_s`.”
+
+Problem: With `startup_timeout_s = 0`, this implies immediate failure, contradicting the setting rule that zero disables the deadline.
+
+Exact fix text: “Poll until ready using a monotonic `startup_timeout_s` deadline; when the value is 0, poll without a deadline while still detecting owner disappearance or socket failure.”
+
+6. Quote: “All bridge-generated DAP messages use a `seq` counter that starts above the highest `seq` seen from Godot.”
+
+Problem: Godot may later emit the same or a lower sequence number, so locally generated launch failures can make the combined adapter stream duplicate or regress sequence numbers.
+
+Exact fix text: “Every message sent to the DAP client receives a monotonically increasing bridge-owned `seq`, starting at 1. Rewrite forwarded Godot messages too. For Godot requests, retain an original-to-rewritten sequence map and restore the original value when forwarding the client’s `request_seq` response.”
+
+**Phase 3**
+
+7. Quote: “Bridge-owned URI modified or created: `didChange` from disk.”
+
+Problem: A newly created file has no `open_docs` owner and cannot correctly receive `didChange`.
+
+Exact fix text: “An eligible created URI absent from `open_docs` receives `didOpen` and becomes Bridge-owned. A modified Bridge-owned URI receives `didChange`. Created or modified Zed-owned URIs are ignored.”
+
+8. Quote: “Responses for an older version are discarded.” / “Removed: ... drop cached symbols.”
+
+Problem: An in-flight response for a removed document can match its last version and repopulate the deleted cache entry.
+
+Exact fix text: “Consume a document-symbol response only when the URI still exists in `open_docs`, remains at the tagged version, and has not been closed or removed since the request was issued.”
+
+9. Quote: “Empty query returns the first 200 by the same order.”
+
+Problem: “total unmatched gap” and “first match offset” are undefined for an empty query.
+
+Exact fix text: “For an empty query, define unmatched gap and first-match offset as zero for every symbol, then order by name, URI, and range start and truncate to 200.”
+
+**Phase 4**
+
+10. Quote: “`owner_pid`: N” / “the state file is kept with `owner_pid` cleared” / stale cleanup “Never adopt.” / later cleanup “connects to it as `unmanaged`.”
+
+Problem: The state schema, phase-1 orphan cleanup, and phase-4 GUI adoption rules directly contradict one another. Treating the replacement bridge as unmanaged would also remove its owner socket, breaking DAP discovery.
+
+Exact fix text: “`owner_pid` and `owner_start_ticks` are nullable only for a detached GUI state. After taking the project lock, `lsp` must recognize a matching live `mode: gui` state with no live owner, bind the owner socket, replace the owner identity, retain the recorded ports, and connect to the GUI without killing it. Keep mode `gui`, not `unmanaged`, so DAP discovery remains available. If the recorded GUI identity or ports are stale, remove the state and perform normal headless startup.”
+
+NOT READY
+
+[exited with code 0]

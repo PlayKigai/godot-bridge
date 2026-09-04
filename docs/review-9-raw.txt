@@ -1,0 +1,59 @@
+ok v8
+ok tasks
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll read both specifications end to end, then cross-check any repository facts needed to identify only implementation-blocking ambiguities or contradictions.
+[0m→ [0mRead TASKS.md
+[0m→ [0mRead SPEC.md
+[0m→ [0mRead docs/review-8-raw.txt
+[0m✱ [0mGlob "docs/**/*"[90m in . · 14 matches[0m
+[0m✱ [0mGlob "extension/**/*"[90m in . · 0 matches[0m
+[0m✱ [0mGlob "bridge/**/*"[90m in . · 0 matches[0m
+[0m→ [0mRead docs/review-log.md
+[0m→ [0mRead docs/gates.md
+[0m→ [0mRead docs/sample/.zed/tasks.json
+[0m→ [0mRead docs/sample/.zed/debug.json
+[0m✱ [0mGrep "settings|reap|case-fold|watcher|recovery"[90m in docs · 39 matches[0m
+[0m✱ [0mGrep "current|attach|DAP|debug_adapter_schemas"[90m in docs · 62 matches[0m
+**Phase 0**
+
+Phase 0: ready
+
+**Phase 1**
+
+Phase 1: ready
+
+**Phase 2**
+
+1. Quote: “Zed settings path `lsp.godot.settings` in user settings or `.zed/settings.json`.” / “`run`, `project-dir`, `open-editor`, `doc`: read `<worktree>/.zed/settings.json`.”
+
+Problem: CLI subcommands ignore user settings. A globally configured `godot_path`, `project_dir`, or `extra_args` therefore applies to LSP and DAP but not run or GUI hand-off, potentially selecting a different project or Godot binary.
+
+Exact fix text: “For `run`, `project-dir`, `open-editor`, and `doc`, read both Zed’s user settings file and `<worktree>/.zed/settings.json` as JSONC. Extract `lsp.godot.settings` from each and merge settings keys with project values overriding user values. Missing files mean defaults; parse or validation errors exit 1.”
+
+**Phase 3**
+
+2. Quote: “During recovery ... watcher events still update Bridge-owned `open_docs` text” / “A Bridge-owned URI removed: `didClose`, drop cached symbols, and send Zed `publishDiagnostics` with an empty array.”
+
+Problem: A removed file has no text to update, and the recovery rule does not say whether removal deletes its entry or whether stale diagnostics are cleared. Implementers may replay deleted documents or leave diagnostics behind.
+
+Exact fix text: “During recovery, watcher creates and modifications update `open_docs` without sending to Godot or scheduling symbols. A Bridge-owned removal deletes the entry and cached symbols immediately and sends Zed an empty `publishDiagnostics`; no `didClose` is sent to the disconnected Godot. Recovery replay therefore excludes the removed URI.”
+
+3. Quote: “case-folded subsequence match ... Score: total unmatched gap ascending, then first match offset ascending.”
+
+Problem: Queries with repeated characters can have several valid subsequence alignments with different scores. The alignment-selection rule is undefined, so symbol ordering is not deterministic across implementations.
+
+Exact fix text: “For each candidate, evaluate all subsequence alignments and select the lexicographically smallest tuple `(total gaps between matched characters, first-match offset, matched-index sequence)`. Rank candidates by that selected gap and offset, then name, URI, and range start.”
+
+**Phase 4**
+
+4. Quote: A standalone GUI is launched “detached (`setsid`...)” and later adopted by `lsp`; crash recovery says a live process is killed and reaped first.
+
+Problem: The adopting `lsp` is not the detached GUI’s parent and cannot reap it with `waitpid`. Implementers may incorrectly treat adopted and directly spawned GUI processes alike.
+
+Exact fix text: “Track whether the current bridge is the Godot process’s parent. For a direct child, terminate the process group and `waitpid`. For an adopted detached GUI, verify PID start ticks, signal the recorded process group, and wait for the recorded PID to disappear; never call `waitpid` for it. Then continue normal headless recovery.”
+
+NOT READY
+
+[exited with code 0]

@@ -1,0 +1,79 @@
+ok
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll compare the complete spec and task plan against the prior review and repository facts, then report only implementation-blocking ambiguities or contradictions.
+[0m→ [0mRead SPEC.md
+[0m→ [0mRead TASKS.md
+[0m→ [0mRead docs/review-4-raw.txt
+[0m→ [0mRead docs/gates.md
+[0m→ [0mRead docs/review-log.md
+[0m✱ [0mGlob "**/*"[90m in . · 12 matches[0m
+The cross-check found concrete conflicts in project selection, detached GUI state, and current-scene behavior. I’m narrowing the final list to issues that change observable implementation, not stylistic underspecification.
+[0m→ [0mRead docs/review-3-raw.txt[90m [offset=1, limit=260][0m
+[0m✱ [0mGrep "additionalProperties|dap_config_to_scenario|get_dap_binary"[90m in /home/dig · 100 matches[0m
+[0m✱ [0mGlob "**/debug_adapter_schemas/*.json"[90m in /home/dig · 0 matches[0m
+[0m→ [0mRead docs/sample/.zed/tasks.json
+[0m→ [0mRead docs/sample/.zed/debug.json
+[0m→ [0mRead docs/dev-setup.md
+**Phase 0**
+
+1. Quote: “`main.gd` attached” / T3.2 verifies query `"ready"` returns `_ready` / acceptance requires “a sample `.gdshader`”.
+
+Problem: T0.2 requires neither `_ready` nor a shader fixture. Later verification may be impossible, and T1.9 is restricted to other files.
+
+Exact fix text: “T0.2 creates `fixtures/minimal-project/main.gd` containing `_ready`, and `fixtures/minimal-project/sample.gdshader` containing representative keyword and string syntax used by T1.9 acceptance.”
+
+**Phase 1**
+
+2. Quote: “An input that yields zero moves to the next.” / “`project_dir` setting ... Must contain `project.godot`, else error.”
+
+Problem: An invalid configured `project_dir` either falls through or fails immediately.
+
+Exact fix text: “Zero results move to the next input except for an explicitly configured `project_dir`; if that path lacks `project.godot`, return `project_dir <p> has no project.godot` immediately.”
+
+**Phase 2**
+
+3. Quote: “`run --scene current` goes through scene resolution.” / “Scene resolution for a script at `<project>/rel/path.gd`” / DAP separately handles `.tscn`.
+
+Problem: `run --scene current` is undefined when `--file` names a `.tscn` or another non-`.gd` file.
+
+Exact fix text: “For `run --scene current`, apply the same rule as DAP: a `.tscn` file resolves directly to its canonical `res://` path; any other file uses the reference-search scene resolution; no match exits 1 with `No scene uses <file>`.”
+
+**Phase 3**
+
+4. Quote: “Pending bridge-internal requests: string ids prefixed `godot-bridge/`.”
+
+Problem: JSON-RPC permits Zed to use the same string IDs. Collisions can cause client responses to be consumed as internal responses or cancellation to target the wrong request.
+
+Exact fix text: “Rewrite every Zed request ID sent to Godot to a unique bridge-owned ID and retain an original-ID mapping. Rewrite `$/cancelRequest` targets through that mapping and restore original IDs in responses to Zed. Allocate internal requests from the same collision-free sequence and consume only entries marked internal.”
+
+5. Quote: “Zed messages received from now on go into one FIFO” / “One task owns `open_docs` and serializes Zed events and watcher events.”
+
+Problem: Watcher behavior during recovery is undefined. Implementations may write to a dead connection, queue stale versions, or lose disk changes.
+
+Exact fix text: “During recovery, watcher events continue updating Bridge-owned `open_docs` state but emit no messages to Godot and schedule no symbol requests. Recovery replay uses that latest state. After `ready`, resume watcher output; Zed traffic remains governed by the recovery FIFO.”
+
+6. Quote: “With `project_diagnostics` false, only Zed-open files are covered, and the connect showMessage says so.”
+
+Problem: No message text, type, or emission point is defined.
+
+Exact fix text: “When `project_diagnostics` is false, immediately after returning the initial `initialize` response send `window/showMessage` with type Information and message `Project diagnostics are disabled; workspace symbols cover only files open in Zed.` Repeat it after recovery only if Zed must be reminded; otherwise do not repeat it.”
+
+**Phase 4**
+
+7. Quote: State schema has `"owner_pid":N,"owner_start_ticks":N` / “`owner_pid` and `owner_start_ticks` are null only for a detached GUI state.”
+
+Problem: The normative JSON shape rejects the detached state required by phase 4.
+
+Exact fix text: “Change the state schema to `"owner_pid":null|N,"owner_start_ticks":null|N`; both fields must be null together only for a detached GUI state.”
+
+8. Quote: With no socket, `open-editor` launches Godot without recorded ports or state / later `lsp` reconnects only through a recorded `mode: gui` state.
+
+Problem: A standalone GUI cannot be adopted. Opening a `.gd` later starts a second editor, contradicting the one-editor architecture.
+
+Exact fix text: “When no owner socket responds, `open-editor` must take the project lock before launching. Reuse a valid detached GUI state if present; otherwise remove stale state, allocate LSP and DAP ports, launch GUI with both port flags, wait for readiness, and write `mode: gui` state with null owner fields before releasing the lock. If the lock is held, retry owner-socket discovery and fail rather than launching another editor.”
+
+NOT READY
+
+[exited with code 0]

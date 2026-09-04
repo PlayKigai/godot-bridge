@@ -1,0 +1,47 @@
+ok v9
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll compare the full specification and task plan, then verify only ambiguity or contradictions severe enough to alter implementation.
+[0m✱ [0mGlob "SPEC.md"[90m in . · 1 match[0m
+[0m✱ [0mGlob "TASKS.md"[90m in . · 1 match[0m
+[0m✱ [0mGlob "docs/review-9-raw.txt"[90m in . · 1 match[0m
+[0m→ [0mRead SPEC.md[90m [limit=2000][0m
+[0m→ [0mRead TASKS.md[90m [limit=2000][0m
+[0m→ [0mRead docs/review-9-raw.txt[90m [limit=1000][0m
+The core flows are internally consistent overall. I’m checking phase boundaries and lifecycle edge cases where the current wording could still produce different protocol behavior.
+[0m→ [0mRead docs/review-log.md[90m [limit=2000][0m
+[0m→ [0mRead docs/gates.md[90m [limit=1000][0m
+[0m→ [0mRead docs/sample/.zed/tasks.json[90m [limit=1000][0m
+[0m→ [0mRead docs/sample/.zed/debug.json[90m [limit=1000][0m
+Phase 0: ready
+
+Phase 1:
+
+1. Quote: “Active only after Godot's first `initialize` response was returned to Zed.” / Recovery step 4: “send `initialized`.”
+
+Problem: Godot may crash after the initialize response but before Zed sends `initialized`. Recovery then synthesizes `initialized`, and the queued client notification later sends it again, contradicting the phase-3 rule that work starts after Zed’s notification is forwarded.
+
+Exact fix text: “Track whether Zed’s `initialized` notification was forwarded before the crash. During recovery, send `initialized` only when it was previously forwarded. Otherwise, wait for the queued Zed notification. Start diagnostics and symbol work when `initialized` is actually forwarded, once per Godot connection.”
+
+Phase 2:
+
+2. Quote: “`run`, `project-dir`, `open-editor`, `doc`: read ... `<worktree>/.zed/settings.json`.” / “For `dap`, `run`, `project-dir`, `open-editor`: cwd ... canonicalized.”
+
+Problem: The worktree root for `doc` is undefined, so implementations may skip project settings or resolve them from different directories.
+
+Exact fix text: “For `dap`, `run`, `project-dir`, `open-editor`, and `doc`, the worktree root is cwd, canonicalized.”
+
+Phase 3:
+
+3. Quote: “Zed `didClose`: forward `didClose`. If the file exists on disk, `didOpen` again from disk, owner `Bridge`.” / “A response is consumed only when ... [the URI] was not closed or removed.”
+
+Problem: Outstanding responses are invalidated, but the existing symbol cache is not. Workspace search may temporarily or indefinitely return symbols from the closed, unsaved Zed text.
+
+Exact fix text: “On every Zed `didClose`, immediately drop the URI’s cached symbols and invalidate outstanding symbol requests before forwarding `didClose`. If the file is reopened as Bridge-owned, keep its cache empty until a `documentSymbol` response for the new version arrives.”
+
+Phase 4: ready
+
+NOT READY
+
+[exited with code 0]

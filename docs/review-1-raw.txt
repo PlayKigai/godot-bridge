@@ -1,0 +1,82 @@
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll inspect `SPEC.md` and the surrounding extension/native-bridge structure, then return the prioritized review in the response. I will not create `docs/review-1.md` because the explicit planner-only constraint forbids file modifications.
+[0m✱ [0mGlob "**/*"[90m in . · 2 matches[0m
+[0m✱ [0mGrep "language_server_command|get_dap_binary|dap_config_to_scenario|run a process|project.godot|lsp-port|dap-port"[90m in . · 18 matches[0m
+[0m→ [0mRead SPEC.md
+The central protocol conflict is already clear: the proposed bridge cannot wait for `didOpen` to choose a project because an LSP client does not send `didOpen` until `initialize` completes. I’m checking the debug/task assumptions and lifecycle design next, where the current state-file model appears to lack a single-process ownership rule.
+[0m→ [0mRead docs/review-prompt-1.md
+[0m% [0mWebFetch https://zed.dev/docs/extensions/languages
+[0m% [0mWebFetch https://zed.dev/docs/tasks
+[0m✗ [0mWebFetch https://zed.dev/docs/extensions/extension-capabilities failed
+[91m[1mError: [0mStatusCode: non 2xx status code (404 GET https://zed.dev/docs/extensions/extension-capabilities)
+[0m✗ [0mWebFetch https://zed.dev/docs/extensions/debug-adapters failed
+[91m[1mError: [0mStatusCode: non 2xx status code (404 GET https://zed.dev/docs/extensions/debug-adapters)
+[0m% [0mWebFetch https://zed.dev/docs/llms.txt
+[0m% [0mWebFetch https://zed.dev/docs/debugger
+[0m✗ [0mWebFetch https://raw.githubusercontent.com/zed-industries/extensions/main/extensions/dap-adapter-example/src/dap_adapter_example.rs failed
+[91m[1mError: [0mStatusCode: non 2xx status code (404 GET https://raw.githubusercontent.com/zed-industries/extensions/main/extensions/dap-adapter-example/src/dap_adapter_example.rs)
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/trait.Extension.html
+[0m% [0mWebFetch https://zed.dev/docs/extensions/debugger-extensions.md
+[0m% [0mWebFetch https://zed.dev/docs/languages/gdscript.md
+[0m% [0mWebFetch https://zed.dev/docs/extensions/capabilities.md
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/struct.Worktree.html
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/struct.DebugAdapterBinary.html
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/src/zed_extension_api/extension_api.rs.html
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/struct.DebugConfig.html
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/struct.DebugTaskDefinition.html
+[0m% [0mWebFetch https://docs.rs/zed_extension_api/0.7.0/zed_extension_api/settings/struct.LspSettings.html
+`docs/review-1.md` was not created because the planner-only instruction explicitly prohibits modifying files.
+
+1. **“waits for the first `textDocument/didOpen`” (§ Project root detection, lines 63-66).** This deadlocks initialization: Zed sends `didOpen` only after receiving the `initialize` response. Resolve from `project_dir`, `rootUri`/`workspaceFolders`, or an unambiguous scan before forwarding `initialize`; if multiple projects remain, fail and require `project_dir`. Remove `didOpen`-based disambiguation.
+
+2. **“running `godot-bridge dap-port ...` via the extension's `process` API” (§ Debug adapter, lines 231-236).** The stated API has no general process host function. The file fallback is also circular when no LSP has started, and can be stale. Return `godot-bridge dap ...` as `DebugAdapterBinary.command`, making it a stdio-to-TCP DAP proxy, or explicitly require a running LSP and read a validated port file. The command proxy better preserves automatic startup.
+
+3. **“One editor per project” plus “new bridge ... takes over” (§ Port allocation and reuse, lines 79-104).** There is no ownership protocol. Two bridges can reuse one child; the original still owns and may kill it, while both connections contend for `latest_client_id`. Add an exclusive per-project lock and explicit `owner_pid`/control socket. For v1, reject a second live LSP bridge with a clear error instead of “accepting” client stealing.
+
+4. **“pick two free ports ... write state ... spawn” (§ Port allocation, lines 90-93).** This has check-then-bind races and concurrent state corruption. Hold the per-project lock across state validation, allocation, spawn, and readiness. Write state atomically by temporary file plus rename. Detect bind failure from Godot and retry with fresh ports.
+
+5. **“If pid alive and lsp_port accepts” (§ Port allocation, lines 83-88).** PID liveness and an accepting socket do not prove identity or project ownership; PID reuse can target an unrelated process. Store process start identity from `/proc`, owner PID, canonical project path, and bridge protocol version. Connect once and retain that socket rather than opening a disposable probe.
+
+6. **“check the Godot default port 6005 ... verify after initialize” (§ Port allocation, lines 85-89).** Connecting and initializing already makes this bridge Godot’s latest client, disrupting another client before validation. The unmanaged editor’s DAP port is also unspecified. Remove unmanaged-GUI discovery from v1, or require explicit `lsp_port`, `dap_port`, and opt-in adoption.
+
+7. **“Poll ... No timeout” and startup `$/progress` (§ Port allocation/status, lines 94-95 and 158-159).** An import hang, permission prompt, or wrong executable blocks LSP initialization forever. LSP progress cannot safely be assumed before capability negotiation and initialization. Add a generous configurable startup deadline, continuously check child exit, report pre-initialize status on stderr, and use `window/workDoneProgress/create` only after confirming client support.
+
+8. **“settings are available before connecting” (§ Language server, lines 225-227).** Only initialization options are reliably present inside the initial request. `language_server_workspace_configuration` does not guarantee an initial `workspace/didChangeConfiguration`, and later changes to `project_dir` or `godot_path` cannot transparently retarget a running editor. Parse bridge settings from `initialize.initializationOptions`; strip bridge-only fields before forwarding to Godot; document that root/binary changes require LSP restart.
+
+9. **“Launch main scene ... project: `$ZED_WORKTREE_ROOT`” (§ Debug adapter, lines 241-248).** This fails for the verified nested projects because Godot validates `project` against the actual project. Resolve and pass the directory containing `project.godot`, preferably as `res://` context through the DAP proxy. Never default `project` to worktree root.
+
+10. **“Launch current scene ... `$ZED_DIRNAME/$ZED_STEM.tscn`” (§ Debug adapter, lines 246-247).** A script does not imply an adjacent same-stem scene, and this is not Godot’s `"current"` semantic. Remove this template from v1. Keep `scene: "main"` and an explicit `res://...` scene configuration. Verify `${prompt}` is supported by Zed before specifying an interactive template.
+
+11. **“Shipped `debug.json` templates (via `dap_config_to_scenario`)” (§ Debug adapter, line 241).** `dap_config_to_scenario` converts one generic new-session configuration; it does not ship a list of `debug.json` templates. Specify whether defaults come from documented sample configuration, task locators, or scenario conversion. Also implement the required `dap_request_kind` for `launch` versus `attach`.
+
+12. **DAP startup readiness is missing.** Only the LSP port is polled, yet Zed may connect to DAP immediately and its documented TCP timeout defaults to two seconds. Wait for both required endpoints, or let the DAP proxy retry until the shared startup deadline. Define behavior when Godot dies during a debug session; silently changing adapters cannot preserve DAP state, so terminate the session with a clear error.
+
+13. **“Bridge converts [Zed `didOpen`] into a full `didChange`” (§ Project-wide diagnostics, lines 141-147).** Client and synthetic document versions can collide or move backward. Maintain bridge-owned monotonically increasing versions per URI and rewrite every forwarded `didOpen`/`didChange`. Serialize Zed events and watcher events through one state machine so delayed filesystem notifications cannot overwrite unsaved Zed content.
+
+14. **“re-opens it from disk” after Zed `didClose` (§ Project-wide diagnostics, lines 145-150).** Close/save/watcher ordering can reopen stale content, and atomic-save rename events can look like deletion plus creation. Debounce watcher events, reread after settling, confirm the URI is still `bridge_open`, and define handling for non-UTF-8, unreadable, oversized, symlinked, and deleted files.
+
+15. **Project-wide diagnostics are excessive v1 scope (§ Project-wide diagnostics, lines 133-150).** They require synthetic document ownership, version rewriting, scanning, watching, restart replay, and stale-diagnostic cleanup. Open-file diagnostics already satisfy the goal’s basic diagnostics claim. Default `project_diagnostics` to false or defer it until the core proxy, DAP, and lifecycle are stable.
+
+16. **“replays `initialize` ... and `initialized`” (§ Crash recovery, lines 120-129).** Reusing the original initialize request ID would produce a duplicate response to Zed. The bridge must consume the replay response internally, handle server-to-client requests during replay, recreate synthetic/open-document state, and queue or reject traffic during recovery. Define cancellation and late-response handling for every outstanding request ID.
+
+17. **LSP shutdown semantics are incomplete (§ Lifetime, lines 106-114).** On `shutdown`, forward the request and response; terminate only after `exit` or stdin EOF. Define EOF during an in-flight write, malformed framing, oversized messages, half-closed TCP, and Godot closing without an exit status. Use strict `Content-Length` framing tests.
+
+18. **“kills the group with SIGTERM, then SIGKILL” (§ Lifetime, lines 111-114).** The implementation must avoid signaling a reused process group and must reap every direct child, including a GUI child. Record and verify PGID, install `PR_SET_PDEATHSIG` in `pre_exec`, handle the parent-death race, and always `waitpid`. Clarify whether launched games should die with the bridge.
+
+19. **GUI hand-off is a second orchestration system (§ Open editor hand-off, lines 162-175).** Port release/rebind is racy, detached GUI ownership is unclear, replay has the same duplicate-response problem, and GUI exit competes with intentional bridge shutdown. It is not needed for headless LSP/DAP. Defer hand-off and automatic GUI recovery from v1; initially document stopping/restarting the language server when switching editor modes.
+
+20. **“downloads the matching release asset” (§ Language server, lines 199-204).** Asset naming, checksum/signature validation, partial downloads, concurrent installs, update policy, architecture detection, and executable replacement are unspecified. Since v1 is dev-install only and already requires `cargo install --path bridge`, remove auto-download from v1. Resolve configured path, then `worktree.which`, and fail with installation instructions.
+
+21. **Root identity is underspecified (§ Project root detection/state, lines 49-62 and 79-81).** Define canonicalization, symlink policy, depth counting, unreadable directories, case sensitivity, traversal outside the worktree via `project_dir`, and hash algorithm. Require `project_dir` to remain within the worktree unless explicitly absolute, validate that it contains `project.godot`, and key state by canonical path.
+
+22. **Runtime and logging failure modes are missing (§ State/logs, lines 79-81 and 152-160).** `$XDG_RUNTIME_DIR` may be unset; `<project>/.godot` may not exist or be writable; logs can grow indefinitely. Define a secure fallback such as `/tmp/godot-bridge-$UID` with mode `0700`, create files with restrictive permissions, keep operational logs in runtime storage, and rotate or size-limit them.
+
+23. **Task composition is not executable as written (§ Tasks, lines 254-267).** `<project>` cannot be replaced by another task command without shell substitution, quoting becomes fragile, and direct `godot` bypasses `godot_path` resolution. Add bridge subcommands such as `run --file "$ZED_FILE"` and `run-scene --file "$ZED_FILE" --scene ...`; use task `command` plus `args` arrays for paths.
+
+24. **Recommended implementation order.** First revise `SPEC.md` around a minimal single-owner design. Then create `bridge/src/root.rs` for canonical root resolution, `bridge/src/process.rs` for child ownership/readiness, `bridge/src/lsp.rs` for framed proxying and initialization interception, `bridge/src/state.rs` for locking/atomic state, and `bridge/src/dap.rs` for the stdio DAP proxy. Implement `extension/src/lib.rs` with `language_server_command`, initialization options, `get_dap_binary`, `dap_request_kind`, and `dap_config_to_scenario`; register only verified schemas and tasks in `extension.toml`. Add unit tests for roots, locks, framing, versions, and state recovery; integration-test nested projects, startup timeout, duplicate bridges, LSP restart, direct DAP startup, breakpoints, Godot crash, and bridge termination against 4.7.2. Defer synthetic project diagnostics, unmanaged GUI adoption, hand-off, downloads, status, and docs lookup.
+
+25. **Open risks.** Verify headless DAP launch produces the intended game/display behavior; determine whether Godot DAP tolerates reconnects or concurrent sessions; confirm the exact `gdscript_client/changeWorkspace` payload and path normalization; confirm Zed 1.17.2’s actual debug scenario substitution timing and extension API version; measure first-import startup bounds. These are Task 0 gates, not implementation details to guess.
+
+[exited with code 0]

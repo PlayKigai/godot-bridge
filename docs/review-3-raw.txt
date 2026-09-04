@@ -1,0 +1,66 @@
+[0m
+> build · gpt-5.6-sol
+[0m
+I’ll compare the current spec and task breakdown against both prior reviews, then report only unresolved implementation ambiguities, contradictions, ordering gaps, and phase verdicts.
+[0m→ [0mRead SPEC.md
+[0m→ [0mRead TASKS.md
+[0m→ [0mRead docs/review-1-raw.txt
+[0m→ [0mRead docs/review-2-raw.txt
+**Recommended Approach**
+Freeze explicit wire contracts, state transitions, deterministic traversal rules, and extension metadata before implementation. This adds specification detail but avoids incompatible proxy, lifecycle, and query implementations.
+
+**Phase 1**
+1. `initializationOptions` handling is ambiguous. Add: **“`initializationOptions` must be an object containing only bridge settings. Remove the entire field before forwarding `initialize` to Godot. A non-object value returns `-32602 InvalidParams` and exits.”**
+
+2. Worktree URI selection permits different interpretations. Replace `SPEC.md:113-116` with: **“Inspect `workspaceFolders` in array order and use the first `file:` URI; ignore non-file entries, but reject when the array is present and contains no file URI. Otherwise use `rootUri`; reject it if non-file. Otherwise use `rootPath`, then cwd. File URIs may have no host or host `localhost`; reject other hosts. Percent-decode and canonicalize the resulting path.”**
+
+3. The `starting` status cannot satisfy its required numeric fields before spawn (`SPEC.md:157`, `SPEC.md:175`). Add: **“While `status=starting`, `godot_pid`, `godot_pgid`, `lsp_port`, and `dap_port` are nullable. They become integers after spawn. Dead or identity-mismatched state files are removed while holding the project lock. `status` prints one JSON object per valid socket response and ignores stale state after removing it.”**
+
+4. Startup deadline and retry boundaries remain imprecise. Add: **“Compute one monotonic deadline before the first spawn. Every readiness poll checks it. Retry only after child exit, using at most three spawned children total. On deadline or exhaustion, terminate and reap the current child. `startup_timeout_s=0` disables only the deadline, not the three-attempt limit.”**
+
+5. Grammar implementation is not reproducible: repository URLs, commits, language configuration, and query acceptance are absent. Add exact URLs and 40-character commits plus each language’s `scope`, suffixes, comments, tab policy, and required query captures. Move debug-adapter registration from T0.1 to T2.4; otherwise phase 1 advertises an unimplemented adapter, contradicting “ships alone.”
+
+6. TASKS dependency is wrong: T1.3 requires PGID termination logic assigned to later T1.4. Change to: **“T1.3 implements storage, identity checks, locks, and socket only; T1.4 implements process-group termination; T1.6 performs stale orphan cleanup using both.”** Add `docs/dev-setup.md` creation, including GDQuest removal and dev-extension installation, to T1.9.
+
+**Verdict:** No.
+
+**Phase 2**
+7. DAP framing and failure responses are unspecified. Add: **“DAP uses the same strict Content-Length codec and 64 MiB frame cap as LSP. Before any startup failure, read through the first `initialize` request and return a DAP response with a fresh bridge `seq`, matching `request_seq`, `command: initialize`, `success: false`, and the specified `message`; malformed or oversized client input exits 1 without a response.”**
+
+8. Scene resolution is nondeterministic, and `scene=current` without `--file` both passes through and errors (`SPEC.md:245-250`, `SPEC.md:381-383`). Add: **“Normalize candidate paths under the canonical project directory and inspect `.tscn` files in lexicographic relative-path order. Match parsed `ext_resource` path attributes exactly after `res://` normalization. `scene=current` without a usable `--file` always returns ‘scene current requires --file’; never pass it to Godot.”**
+
+9. Adapter configuration can be forwarded two incompatible ways. Add: **“Before forwarding `launch` or `attach`, remove extension-only keys `adapter`, `request`, and `file`. Remove `project` and replace it only for `launch`. Delete unsupported schema keys `port` and user-configurable `project`. Set `additionalProperties: false`. Apply configured `binary.arguments` consistently to both LSP and DAP commands, after the subcommand.”**
+
+10. `run` and settings-file behavior lack executable semantics. Add: **“`run` executes `<godot> [extra_args] --path <project> [scene]`, maps `current` through scene resolution, inherits stdio, waits, and returns the child exit status. `project-dir` prints exactly the canonical path plus newline. JSONC parse or validation errors are reported; only a missing settings file uses defaults.”**
+
+11. SPEC and TASKS disagree on sample paths and process lifetime. Standardize on `docs/sample/.zed/tasks.json` and `docs/sample/.zed/debug.json`. Replace T2.2 verification “Godot gone” with **“the launched game terminates while the owner editor and LSP remain ready.”** Make T2.2 depend explicitly on T2.1 and T1.3–T1.6; T2.3 depends on T1.1, T1.2, and T2.1.
+
+**Verdict:** No.
+
+**Phase 3**
+12. Recovery queue overflow can permanently hang requests. Add: **“Queue requests and notifications separately. When the 1000-message bound is reached, reject the newly arriving request with `-32803`; notifications may be dropped with a log entry. Forward `$/cancelRequest` only for requests already sent to the current Godot connection. A malformed Godot frame first terminates and reaps the still-live child, then enters recovery.”**
+
+13. Diagnostics lifecycle is incomplete. Add: **“Use percent-encoded canonical file URIs. Apply the 2 MiB, UTF-8, hidden-directory, and symlink rules during both initial scan and watcher reads. Initial scans open only URIs absent from `open_docs`. On removal, send `didClose`, delete cached symbols, and publish an empty diagnostics array to Zed. Watcher reads must recheck ownership after debounce before emitting a change.”**
+
+14. Workspace-symbol behavior is not deterministic. Add: **“Bridge requests use string IDs prefixed `godot-bridge/` and their responses are consumed, never forwarded. Associate each request with the URI generation and discard stale responses. For nested `DocumentSymbol`, use `selectionRange`, and join ancestor names with `.` as `containerName`; accept `SymbolInformation` unchanged after URI normalization. Rank by total unmatched gap, then first-match offset, then case-folded name, then URI and range; truncate to 200.”**
+
+15. The phase-3 gate is missing from TASKS and tasks cannot stay inside named files. Add T0.4 before T3.1: document DieQuest timing in `docs/gates.md` and update constants in SPEC if needed. T3.1–T3.3 must explicitly include `bridge/src/lsp.rs` integration and tests; T3.3 depends on T3.2 because project-wide symbol coverage relies on synthetic opens.
+
+**Verdict:** No.
+
+**Phase 4**
+16. `handoff` cannot finish within the socket’s five-second request timeout. Add: **“`handoff` validates state and immediately responds `{\"version\":1,\"accepted\":true}` before asynchronous shutdown/startup. `open-editor` exits 0 after acceptance. Validation failures respond synchronously with `accepted:false` and an error.”**
+
+17. “Run crash recovery steps 2–6” wrongly includes spawning another editor. Replace with: **“Fail pending requests, wait for the already-spawned GUI ports, connect and retain the LSP socket, replay initialization and documents, then resume proxying. Do not execute the normal recovery spawn step.”**
+
+18. Handoff mode behavior is undefined. Add: **“Reject handoff while `starting` or `recovering`; return success without action while already `gui`; reject while the DAP lock is held. Use the resolved binary and sanitized `extra_args`. With no owner, launch `<godot> [extra_args] --editor --path <project>` detached, redirect logs to the runtime log, and return immediately. Owner shutdown never kills a GUI child; GUI exit triggers exactly one headless recovery.”**
+
+**Verdict:** No.
+
+**Implementation Order**
+Apply the quoted SPEC corrections first; update T0.1/T0.4 and task dependencies; pin grammars and metadata; implement T1 root/state/process/framing/LSP; verify phase 1 independently; implement deterministic scene/DAP/CLI/extension handling; then recovery, diagnostics, symbols, and finally the explicit handoff state machine. Run unit tests after each module, Godot integrations after each phase, and the listed Zed manual gate before advancing.
+
+**Open Risks**
+Exact grammar commits and query capture requirements still need selection; `$ZED_FILE` substitution and document-symbol performance remain gated measurements. No other scope decision needs reopening.
+
+[exited with code 0]
