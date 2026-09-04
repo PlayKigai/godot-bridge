@@ -161,14 +161,18 @@ pub fn initialize_dap(client: &mut BridgeClient) -> Value {
     })
 }
 
+fn project_hash(project: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in project.canonicalize().unwrap().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
-    let canonical = project.canonicalize().unwrap();
-    let hash = blake3::hash(canonical.to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
-    let state = runtime
-        .join("godot-bridge")
-        .join(format!("{}.json", &hash[..16]));
+    let hash = project_hash(project);
+    let state = runtime.join("godot-bridge").join(format!("{hash}.json"));
     let value: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     (state, value)
 }
@@ -187,26 +191,20 @@ pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path)
     let _ = client.child.wait();
     assert!(!Path::new(&format!("/proc/{godot_pid}")).exists());
     assert!(!state_path.exists());
-    let hash = blake3::hash(project.canonicalize().unwrap().to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
+    let hash = project_hash(project);
     assert!(runtime
         .join("godot-bridge")
-        .join(format!("{}.lock", &hash[..16]))
+        .join(format!("{hash}.lock"))
         .exists());
     assert!(!runtime
         .join("godot-bridge")
-        .join(format!("{}.sock", &hash[..16]))
+        .join(format!("{hash}.sock"))
         .exists());
 }
 
 pub fn runtime_socket(runtime: &Path, project: &Path) -> PathBuf {
-    let hash = blake3::hash(project.canonicalize().unwrap().to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
-    runtime
-        .join("godot-bridge")
-        .join(format!("{}.sock", &hash[..16]))
+    let hash = project_hash(project);
+    runtime.join("godot-bridge").join(format!("{hash}.sock"))
 }
 
 pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {

@@ -88,11 +88,9 @@ pub struct ProjectFiles {
 
 impl ProjectFiles {
     pub fn new(project: &Path) -> io::Result<Self> {
-        let hash = blake3::hash(project.to_string_lossy().as_bytes())
-            .to_hex()
-            .to_string();
+        let hash = crate::fnv::hash_hex(project.to_string_lossy().as_bytes());
         let mut runtime = runtime_dir()?;
-        let socket = runtime.join(format!("{}.sock", &hash[..16]));
+        let socket = runtime.join(format!("{hash}.sock"));
         if socket.as_os_str().len() > 100 {
             crate::warn!(
                 "socket path {} is too long; using fallback runtime directory",
@@ -100,7 +98,7 @@ impl ProjectFiles {
             );
             runtime = fallback_runtime_dir()?;
         }
-        let prefix = runtime.join(&hash[..16]);
+        let prefix = runtime.join(&hash);
         Ok(Self {
             lock: prefix.with_extension("lock"),
             sock: prefix.with_extension("sock"),

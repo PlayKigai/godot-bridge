@@ -5,6 +5,7 @@ mod clock;
 mod dap;
 mod doc;
 mod docs_state;
+mod fnv;
 mod framing;
 mod godot_bin;
 mod log;
