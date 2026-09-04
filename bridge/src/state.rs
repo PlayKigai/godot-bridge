@@ -10,9 +10,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use nix::fcntl::{Flock, FlockArg};
-use nix::unistd::{geteuid, getpid};
-
 const SOCKET_CLIENT_CAP: usize = 16;
 const SOCKET_LINE_CAP: usize = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +31,7 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
 pub fn fallback_runtime_dir() -> io::Result<PathBuf> {
     ensure_private_dir(&PathBuf::from(format!(
         "/tmp/godot-bridge-{}",
-        geteuid().as_raw()
+        effective_uid()
     )))
 }
 
@@ -73,7 +70,7 @@ fn validate_private_dir(path: &Path) -> io::Result<()> {
             path.display()
         )));
     }
-    if metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
+    if metadata.uid() != effective_uid() || metadata.mode() & 0o777 != 0o700 {
         return Err(io::Error::other(format!(
             "runtime directory {} must be owned by the current user with mode 0700",
             path.display()
@@ -110,8 +107,18 @@ impl ProjectFiles {
     }
 }
 
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
 pub struct LockGuard {
-    _flock: Flock<std::fs::File>,
+    file: std::fs::File,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
@@ -123,10 +130,14 @@ pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(file) => Ok(Some(LockGuard { _flock: file })),
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-        Err((_, error)) => Err(io::Error::from_raw_os_error(error as i32)),
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(LockGuard { file }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(error)
     }
 }
 
@@ -203,7 +214,7 @@ pub fn detached_gui_state(project: &Path, status: Status) -> State {
 }
 
 pub fn set_owner_identity(state: &mut State) {
-    let pid = getpid().as_raw() as u32;
+    let pid = std::process::id();
     state.owner_pid = Some(pid);
     state.owner_start_ticks = start_ticks(pid);
 }
@@ -440,6 +451,8 @@ pub async fn socket_request(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket request timed out"))?
 }
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 

@@ -11,9 +11,6 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::{getpid, getppid, setpgid, setsid, Pid};
-
 const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
 const GROUP_WAIT: Duration = Duration::from_secs(5);
@@ -61,7 +58,7 @@ pub fn spawn_godot(
     dap_port: u16,
     log_path: impl AsRef<Path>,
 ) -> io::Result<GodotChild> {
-    let parent_pid = getpid();
+    let parent_pid = std::process::id();
     let project = project.as_ref();
     let mut command = Command::new(bin.as_ref());
     command
@@ -79,13 +76,13 @@ pub fn spawn_godot(
 
     unsafe {
         command.pre_exec(move || {
-            if setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
+            if libc::setpgid(0, 0) == -1 {
                 libc::_exit(127);
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 libc::_exit(127);
             }
-            if getppid() != parent_pid {
+            if libc::getppid() as u32 != parent_pid {
                 libc::_exit(127);
             }
             Ok(())
@@ -151,7 +148,7 @@ pub fn spawn_gui(
 
     unsafe {
         command.pre_exec(|| {
-            if setsid().is_err() {
+            if libc::setsid() == -1 {
                 libc::_exit(127);
             }
             Ok(())
@@ -204,7 +201,7 @@ pub async fn wait_for_port(
 
 pub async fn kill_group(mut child: GodotChild) -> io::Result<()> {
     validate_ids(child.pid, child.pgid)?;
-    if !signal_group(child.pid, child.pgid, child.start_ticks, Signal::SIGTERM)? {
+    if !signal_group(child.pid, child.pgid, child.start_ticks, libc::SIGTERM)? {
         let _ = child.child.wait().await;
         return Ok(());
     }
@@ -213,7 +210,7 @@ pub async fn kill_group(mut child: GodotChild) -> io::Result<()> {
             status?;
         }
         Err(_) => {
-            if signal_group(child.pid, child.pgid, child.start_ticks, Signal::SIGKILL)? {
+            if signal_group(child.pid, child.pgid, child.start_ticks, libc::SIGKILL)? {
                 child.child.wait().await?;
             } else {
                 let _ = child.child.wait().await;
@@ -229,14 +226,14 @@ pub async fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
         return Ok(());
     }
 
-    if !signal_group(pid, pgid, ticks, Signal::SIGTERM)? {
+    if !signal_group(pid, pgid, ticks, libc::SIGTERM)? {
         return Ok(());
     }
     if wait_for_process_to_disappear(pid, ticks, GROUP_WAIT).await {
         return Ok(());
     }
 
-    if !signal_group(pid, pgid, ticks, Signal::SIGKILL)? {
+    if !signal_group(pid, pgid, ticks, libc::SIGKILL)? {
         return Ok(());
     }
     while process_start_ticks(pid).ok() == Some(ticks) {
@@ -265,14 +262,19 @@ fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: Signal) -> io::Result<bool> {
+fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Result<bool> {
     validate_ids(pid, pgid)?;
     if process_start_ticks(pid).ok() != Some(ticks) {
         return Ok(false);
     }
-    match kill(Pid::from_raw(-pgid), signal) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(true),
-        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    if unsafe { libc::kill(-pgid, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(error)
     }
 }
 

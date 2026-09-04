@@ -13,7 +13,6 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 json5 = "0.4"
 libc = "0.2"
-nix = { version = "0.30", features = ["process", "signal", "fs", "user"] }
 notify = "8"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }

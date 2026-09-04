@@ -1,7 +1,5 @@
 use super::*;
 
-use nix::unistd::getpid;
-
 pub(super) fn connection_from_stream(stream: TcpStream) -> Connection {
     let (read, write) = stream.into_split();
     Connection {
@@ -122,7 +120,7 @@ pub(super) async fn publish(runtime: &Runtime) -> Result<()> {
 }
 
 pub(super) fn new_state(project: &Path, mode: Mode) -> State {
-    let owner_pid = getpid().as_raw() as u32;
+    let owner_pid = std::process::id();
     State {
         version: 1,
         project: project.to_string_lossy().into_owned(),
