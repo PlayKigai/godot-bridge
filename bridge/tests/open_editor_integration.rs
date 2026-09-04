@@ -1,143 +1,10 @@
+mod common;
+use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
-use url::Url;
-
-struct Client {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    messages: Receiver<Value>,
-}
-
-impl Client {
-    fn start(project: &Path, runtime: &Path, config: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
-            .arg("lsp")
-            .current_dir(project)
-            .env("XDG_RUNTIME_DIR", runtime)
-            .env("XDG_CONFIG_HOME", config)
-            .env("GODOT_BRIDGE_LOG", "error")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (sender, messages) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header).unwrap_or(0) == 0 {
-                    break;
-                }
-                let length = header
-                    .strip_prefix("Content-Length:")
-                    .and_then(|length| length.trim().parse::<usize>().ok())
-                    .unwrap();
-                let mut separator = [0; 2];
-                reader.read_exact(&mut separator).unwrap();
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                if sender.send(serde_json::from_slice(&body).unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            stdin: child.stdin.take(),
-            child,
-            messages,
-        }
-    }
-
-    fn send(&mut self, message: Value) {
-        let body = serde_json::to_vec(&message).unwrap();
-        let stdin = self.stdin.as_mut().unwrap();
-        write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
-        stdin.write_all(&body).unwrap();
-        stdin.flush().unwrap();
-    }
-
-    fn receive_until(&self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
-            let message = self.messages.recv_timeout(remaining).unwrap();
-            if predicate(&message) {
-                return message;
-            }
-        }
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/minimal-project")
-}
-
-fn file_uri(path: &Path) -> String {
-    Url::from_file_path(path.canonicalize().unwrap())
-        .unwrap()
-        .to_string()
-}
-
-fn status(runtime: &Path, project: &Path, config: &Path) -> Option<Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
-        .arg("status")
-        .current_dir(project)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_CONFIG_HOME", config)
-        .output()
-        .ok()?;
-    output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .find_map(|line| serde_json::from_slice(line).ok())
-}
-
-fn wait_for_status(
-    runtime: &Path,
-    project: &Path,
-    config: &Path,
-    predicate: impl Fn(&Value) -> bool,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(value) = status(runtime, project, config) {
-            if predicate(&value) {
-                return value;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "status did not reach expected state"
-        );
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn godot_available() -> bool {
-    if Path::new("/usr/bin/godot").is_file() {
-        true
-    } else {
-        println!("skipping open-editor integration test: /usr/bin/godot is missing");
-        false
-    }
-}
 
 #[test]
 fn open_editor_handoff_and_gui_recovery() {
@@ -145,7 +12,7 @@ fn open_editor_handoff_and_gui_recovery() {
         println!("skipping open-editor integration test: DISPLAY and WAYLAND_DISPLAY are unset");
         return;
     }
-    if !godot_available() {
+    if !godot_available("open-editor integration test") {
         return;
     }
 
@@ -158,20 +25,15 @@ fn open_editor_handoff_and_gui_recovery() {
         r#"{"lsp":{"godot":{"settings":{"godot_path":"/usr/bin/godot","startup_timeout_s":60}}}}"#,
     )
     .unwrap();
-    let project = fixture();
-    let mut client = Client::start(&project, runtime.path(), config.path());
-    client.send(json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "workspaceFolders": [{"uri": file_uri(&project), "name": "fixture"}],
-            "initializationOptions": {"godot_path": "/usr/bin/godot", "startup_timeout_s": 60}
-        }
-    }));
-    let initialize = client.receive_until(Duration::from_secs(60), |message| {
-        message.get("id") == Some(&json!(1))
-    });
+    let project = fixture("minimal-project");
+    let mut client = BridgeClient::start(
+        Protocol::Lsp,
+        &project,
+        runtime.path(),
+        Some(config.path()),
+        None,
+    );
+    let initialize = initialize_lsp(&mut client, &project);
     assert!(initialize.get("error").is_none(), "{initialize}");
     client.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
     client.send(json!({

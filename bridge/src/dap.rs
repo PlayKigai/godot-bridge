@@ -1,15 +1,15 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, BufWriter};
 use tokio::net::{tcp::OwnedWriteHalf, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::framing::{write_frame, FrameReader};
+use crate::framing::{parse_json_object, write_json, FrameReader};
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
 use crate::settings_file::{parse_settings, Settings};
@@ -33,21 +33,19 @@ struct Connection {
 }
 
 struct DapLock {
-    path: PathBuf,
     guard: Option<LockGuard>,
 }
 
 impl Drop for DapLock {
     fn drop(&mut self) {
         self.guard.take();
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
 enum InputEvent {
     Frame(Vec<u8>),
     Eof,
-    Error(String),
+    Error,
 }
 
 struct ClientBuffer {
@@ -79,7 +77,11 @@ impl ClientBuffer {
     }
 
     fn pop(&mut self) -> Option<Value> {
-        self.messages.pop_front()
+        let message = self.messages.pop_front()?;
+        self.bytes = self
+            .bytes
+            .saturating_sub(serde_json::to_vec(&message).map_or(0, |bytes| bytes.len()));
+        Some(message)
     }
 }
 
@@ -100,14 +102,9 @@ impl<W: AsyncWrite + Unpin> ClientOutput<W> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         message["seq"] = json!(seq);
-        let body = serde_json::to_vec(&message)?;
-        write_frame(&mut self.writer, &body, FRAME_CAP)
+        write_json(&mut self.writer, &message, FRAME_CAP, true)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .context("cannot flush DAP output")?;
         Ok(())
     }
 
@@ -209,7 +206,7 @@ pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> anyhow::Result
                         stop_reader(reader_task).await;
                         return Ok(ExitCode::SUCCESS);
                     }
-                    Some(InputEvent::Error(_)) => {
+                    Some(InputEvent::Error) => {
                         stop_reader(reader_task).await;
                         return Ok(ExitCode::from(1));
                     }
@@ -243,12 +240,18 @@ async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
     let root = cwd_root().map_err(|error| error.to_string())?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
+    if let Some(file) = file {
+        let normalized = crate::root::canonical_or_normalized(file);
+        if !normalized.starts_with(&root) {
+            return Err(format!(
+                "DAP file {} is outside the worktree",
+                file.display()
+            ));
+        }
+    }
     let files = ProjectFiles::new(&project).map_err(|error| error.to_string())?;
     let lock = match try_lock(&files.dap_lock).map_err(|error| error.to_string())? {
-        Some(guard) => DapLock {
-            path: files.dap_lock.clone(),
-            guard: Some(guard),
-        },
+        Some(guard) => DapLock { guard: Some(guard) },
         None => {
             return Err(format!(
                 "A debug session for {} is already running",
@@ -270,14 +273,15 @@ async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
         },
         lock,
         project,
-        file: file.map(Path::to_path_buf),
+        file: file.map(crate::root::canonical_or_normalized),
     })
 }
 
 fn read_settings() -> std::result::Result<Settings, String> {
     let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
-        Ok(contents) => serde_json::from_str(&contents)
+        Ok(contents) if contents.len() <= 1024 * 1024 => serde_json::from_str(&contents)
             .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
+        Ok(_) => return Err("GODOT_BRIDGE_SETTINGS exceeds 1 MiB".to_owned()),
         Err(std::env::VarError::NotPresent) => Value::Null,
         Err(error) => return Err(format!("cannot read GODOT_BRIDGE_SETTINGS: {error}")),
     };
@@ -443,7 +447,7 @@ async fn run_session_inner(
                         }
                     }
                     Some(InputEvent::Eof) | None => return Ok(ExitCode::SUCCESS),
-                    Some(InputEvent::Error(_)) => return Ok(ExitCode::from(1)),
+                    Some(InputEvent::Error) => return Ok(ExitCode::from(1)),
                 }
             }
             server = connection.reader.read_frame() => {
@@ -503,7 +507,7 @@ async fn wait_for_initialize(
                         }
                     }
                     Some(InputEvent::Eof) | None => return Ok(InitializeWait::ClientEof),
-                    Some(InputEvent::Error(_)) => return Ok(InitializeWait::ClientInvalid),
+                    Some(InputEvent::Error) => return Ok(InitializeWait::ClientInvalid),
                 }
             }
             server = connection.reader.read_frame() => {
@@ -595,7 +599,7 @@ fn rewrite_launch_or_attach(
 ) -> std::result::Result<(), (Value, String)> {
     let request_seq = message.get("seq").cloned().unwrap_or(Value::Null);
     let Some(object) = message.as_object_mut() else {
-        return Ok(());
+        return Err((request_seq, "DAP message must be an object".to_owned()));
     };
     if command != "launch" {
         if let Some(arguments) = object.get_mut("arguments").and_then(Value::as_object_mut) {
@@ -611,7 +615,7 @@ fn rewrite_launch_or_attach(
         .or_insert_with(|| json!({}))
         .as_object_mut()
     else {
-        return Ok(());
+        return Err((request_seq, "DAP arguments must be an object".to_owned()));
     };
     arguments.remove("adapter");
     arguments.remove("request");
@@ -640,11 +644,9 @@ fn rewrite_launch_or_attach(
 }
 
 async fn send_to_godot(writer: &mut OwnedWriteHalf, message: &Value) -> Result<()> {
-    let body = serde_json::to_vec(message)?;
-    write_frame(writer, &body, FRAME_CAP)
+    write_json(writer, message, FRAME_CAP, true)
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    writer.flush().await.context("cannot flush DAP input")?;
     Ok(())
 }
 
@@ -673,8 +675,8 @@ async fn read_client_frames(
                 let _ = sender.send(InputEvent::Eof).await;
                 return;
             }
-            Err(error) => {
-                let _ = sender.send(InputEvent::Error(error.to_string())).await;
+            Err(_error) => {
+                let _ = sender.send(InputEvent::Error).await;
                 return;
             }
         }
@@ -687,11 +689,7 @@ async fn stop_reader(reader: JoinHandle<()>) {
 }
 
 fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
-    if !value.is_object() {
-        return Err("DAP message is not an object".to_owned());
-    }
-    Ok(value)
+    parse_json_object(body, "DAP")
 }
 
 #[cfg(test)]

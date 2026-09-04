@@ -1,10 +1,9 @@
-//! Document symbol caching and workspace symbol search.
-
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
     pub name: String,
+    folded_name: String,
     pub kind: Value,
     pub container: String,
     pub uri: String,
@@ -12,10 +11,10 @@ pub struct Symbol {
 }
 
 #[derive(Clone, Debug)]
-pub struct Match {
-    pub symbol: Symbol,
-    pub gap: usize,
-    pub offset: usize,
+struct Match {
+    symbol: Symbol,
+    gap: usize,
+    offset: usize,
     indices: Vec<usize>,
 }
 
@@ -39,6 +38,11 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                folded_name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase(),
                 kind: item.get("kind").cloned().unwrap_or(Value::Null),
                 container: item
                     .get("containerName")
@@ -64,6 +68,7 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<S
     };
     output.push(Symbol {
         name: name.to_owned(),
+        folded_name: name.to_lowercase(),
         kind: item.get("kind").cloned().unwrap_or(Value::Null),
         container: current_container,
         uri: normalize_uri(item.get("uri").and_then(Value::as_str).unwrap_or(uri)),
@@ -98,7 +103,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
     let mut matches = symbols
         .iter()
         .filter_map(|symbol| {
-            let matched = best_match(&symbol.name, &query)?;
+            let matched = best_match(&symbol.folded_name, &query)?;
             Some(Match {
                 symbol: symbol.clone(),
                 gap: matched.0,
@@ -127,41 +132,42 @@ fn best_match(name: &str, query: &str) -> Option<(usize, usize, Vec<usize>)> {
     if query.is_empty() {
         return Some((0, 0, Vec::new()));
     }
-    let name = name.to_lowercase().chars().collect::<Vec<_>>();
+    let name = name.chars().collect::<Vec<_>>();
     let query = query.chars().collect::<Vec<_>>();
-    let mut best: Option<(usize, usize, Vec<usize>)> = None;
-    fn visit(
-        name: &[char],
-        query: &[char],
-        qi: usize,
-        start: usize,
-        indices: &mut Vec<usize>,
-        best: &mut Option<(usize, usize, Vec<usize>)>,
-    ) {
-        if qi == query.len() {
-            let gap = indices.windows(2).map(|pair| pair[1] - pair[0] - 1).sum();
-            let candidate = (gap, start, indices.clone());
-            if best.as_ref().is_none_or(|current| candidate < *current) {
-                *best = Some(candidate);
+    let mut next = vec![vec![name.len(); name.len() + 1]; query.len()];
+    for query_index in (0..query.len()).rev() {
+        let mut next_index = name.len();
+        for name_index in (0..name.len()).rev() {
+            if name[name_index] == query[query_index] {
+                next_index = name_index;
             }
-            return;
-        }
-        for index in indices.last().map_or(0, |index| index + 1)..name.len() {
-            if name[index] == query[qi] {
-                indices.push(index);
-                visit(
-                    name,
-                    query,
-                    qi + 1,
-                    if qi == 0 { index } else { start },
-                    indices,
-                    best,
-                );
-                indices.pop();
-            }
+            next[query_index][name_index] = next_index;
         }
     }
-    visit(&name, &query, 0, 0, &mut Vec::new(), &mut best);
+    let mut best = None;
+    for start in 0..name.len() {
+        if name[start] != query[0] {
+            continue;
+        }
+        let mut indices = vec![start];
+        let mut position = start + 1;
+        for row in next.iter().skip(1) {
+            let index = row[position.min(name.len())];
+            if index == name.len() {
+                break;
+            }
+            indices.push(index);
+            position = index + 1;
+        }
+        if indices.len() != query.len() {
+            continue;
+        }
+        let gap = indices.last().unwrap() - start + 1 - query.len();
+        let candidate = (gap, start, indices);
+        if best.as_ref().is_none_or(|current| candidate < *current) {
+            best = Some(candidate);
+        }
+    }
     best
 }
 
@@ -184,6 +190,7 @@ mod tests {
     fn symbol(name: &str, uri: &str, line: u64) -> Symbol {
         Symbol {
             name: name.to_owned(),
+            folded_name: name.to_lowercase(),
             kind: json!(12),
             container: String::new(),
             uri: uri.to_owned(),
@@ -226,6 +233,13 @@ mod tests {
             best_match("rreaddy", "ready").unwrap().2,
             vec![1, 2, 3, 4, 6]
         );
+    }
+
+    #[test]
+    fn repeated_characters_match_quickly() {
+        let items = vec![symbol(&"a".repeat(64), "file:///a", 0)];
+        assert_eq!(search(&items, &"a".repeat(32)).len(), 1);
+        assert!(search(&items, &format!("{}b", "a".repeat(32))).is_empty());
     }
 
     #[test]

@@ -1,5 +1,3 @@
-//! Godot process spawning, readiness, output, and termination.
-
 use std::collections::VecDeque;
 use std::io;
 use std::net::TcpListener;
@@ -8,31 +6,27 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
+
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::{getpid, getppid, setpgid, setsid, Pid};
 
 const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
 const GROUP_WAIT: Duration = Duration::from_secs(5);
 
-/// A Godot editor process owned by the bridge.
 pub struct GodotChild {
-    /// The editor process ID.
     pub pid: u32,
-    /// The editor process group ID.
     pub pgid: i32,
-    /// The editor process start time from `/proc/<pid>/stat`.
     pub start_ticks: u64,
-    /// The child handle used to reap the editor.
     pub child: Child,
-    /// The most recent output lines from the editor.
     pub tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl GodotChild {
-    /// Returns the most recent 20 lines written by the editor.
     pub fn last_lines(&self) -> Vec<String> {
         self.tail
             .lock()
@@ -43,7 +37,6 @@ impl GodotChild {
     }
 }
 
-/// Selects an available loopback TCP port from `range`.
 pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
     let mut last_error = None;
     for port in range {
@@ -60,7 +53,6 @@ pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "port range is empty")))
 }
 
-/// Spawns a headless Godot editor and captures its output.
 pub fn spawn_godot(
     bin: impl AsRef<Path>,
     extra_args: &[String],
@@ -69,7 +61,7 @@ pub fn spawn_godot(
     dap_port: u16,
     log_path: impl AsRef<Path>,
 ) -> io::Result<GodotChild> {
-    let parent_pid = unsafe { libc::getpid() };
+    let parent_pid = getpid();
     let project = project.as_ref();
     let mut command = Command::new(bin.as_ref());
     command
@@ -87,14 +79,14 @@ pub fn spawn_godot(
 
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
+            if setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
+                libc::_exit(127);
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                return Err(io::Error::last_os_error());
+                libc::_exit(127);
             }
-            if libc::getppid() != parent_pid {
-                libc::_exit(1);
+            if getppid() != parent_pid {
+                libc::_exit(127);
             }
             Ok(())
         });
@@ -130,7 +122,6 @@ pub fn spawn_godot(
     })
 }
 
-/// Spawns a detached GUI Godot editor and returns its process identity.
 pub fn spawn_gui(
     bin: impl AsRef<Path>,
     extra_args: &[String],
@@ -160,8 +151,8 @@ pub fn spawn_gui(
 
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
+            if setsid().is_err() {
+                libc::_exit(127);
             }
             Ok(())
         });
@@ -175,17 +166,12 @@ pub fn spawn_gui(
     Ok((pid, pid as i32, start_ticks))
 }
 
-/// Reports the result of waiting for a Godot TCP port.
 pub enum Readiness {
-    /// The port accepted a connection.
     Ready(TcpStream),
-    /// The child exited before the port became ready.
     ChildExited(ExitStatus),
-    /// The optional deadline elapsed first.
     Deadline,
 }
 
-/// Polls a Godot port until it accepts a connection, exits, or reaches `deadline`.
 pub async fn wait_for_port(
     child: &mut GodotChild,
     port: u16,
@@ -216,33 +202,43 @@ pub async fn wait_for_port(
     }
 }
 
-/// Terminates and reaps an owned Godot process group.
 pub async fn kill_group(mut child: GodotChild) -> io::Result<()> {
-    signal_group(child.pgid, libc::SIGTERM)?;
+    validate_ids(child.pid, child.pgid)?;
+    if !signal_group(child.pid, child.pgid, child.start_ticks, Signal::SIGTERM)? {
+        let _ = child.child.wait().await;
+        return Ok(());
+    }
     match tokio::time::timeout(GROUP_WAIT, child.child.wait()).await {
         Ok(status) => {
             status?;
         }
         Err(_) => {
-            signal_group(child.pgid, libc::SIGKILL)?;
-            child.child.wait().await?;
+            if signal_group(child.pid, child.pgid, child.start_ticks, Signal::SIGKILL)? {
+                child.child.wait().await?;
+            } else {
+                let _ = child.child.wait().await;
+            }
         }
     }
     Ok(())
 }
 
-/// Terminates a detached process group after verifying its recorded identity.
 pub async fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
+    validate_ids(pid, pgid)?;
     if process_start_ticks(pid).ok() != Some(ticks) {
         return Ok(());
     }
 
-    signal_group(pgid, libc::SIGTERM)?;
+    if !signal_group(pid, pgid, ticks, Signal::SIGTERM)? {
+        return Ok(());
+    }
     if wait_for_process_to_disappear(pid, ticks, GROUP_WAIT).await {
         return Ok(());
     }
 
-    signal_group(pgid, libc::SIGKILL)?;
+    if !signal_group(pid, pgid, ticks, Signal::SIGKILL)? {
+        return Ok(());
+    }
     while process_start_ticks(pid).ok() == Some(ticks) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -250,32 +246,34 @@ pub async fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
 }
 
 fn process_start_ticks(pid: u32) -> io::Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let end = stat
-        .rfind(')')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
-    stat[end + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
+    crate::state::process_start_ticks(pid)
 }
 
-fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
-    if pgid <= 0 {
+fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
+    if pid <= 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "process group id must be positive",
+            "process id must be greater than 1",
         ));
     }
-    if unsafe { libc::kill(-pgid, signal) } == -1 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
+    if pgid <= 1 || pgid != pid as i32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process group id must be greater than 1 and match the leader",
+        ));
     }
     Ok(())
+}
+
+fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: Signal) -> io::Result<bool> {
+    validate_ids(pid, pgid)?;
+    if process_start_ticks(pid).ok() != Some(ticks) {
+        return Ok(false);
+    }
+    match kill(Pid::from_raw(-pgid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(true),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
 }
 
 async fn wait_for_process_to_disappear(pid: u32, ticks: u64, timeout: Duration) -> bool {
@@ -303,7 +301,7 @@ fn spawn_output_task(
             Ok(writer) => Arc::new(AsyncMutex::new(writer)),
             Err(error) => {
                 tracing::warn!(%error, "cannot open Godot log");
-                return;
+                Arc::new(AsyncMutex::new(LogWriter::disabled()))
             }
         };
 
@@ -338,26 +336,45 @@ where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream);
+    let mut bytes = [0u8; 8192];
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line).await?;
+        let bytes_read = reader.read(&mut bytes).await?;
         if bytes_read == 0 {
+            if !line.is_empty() {
+                append_tail(&tail, &line);
+            }
             return Ok(());
         }
-
-        let mut text = String::from_utf8_lossy(&line).into_owned();
-        while text.ends_with('\n') || text.ends_with('\r') {
-            text.pop();
-        }
         {
-            let mut lines = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            lines.push_back(text);
-            while lines.len() > TAIL_LIMIT {
-                lines.pop_front();
+            let mut log = writer.lock().await;
+            if let Err(error) = log.write(&bytes[..bytes_read]).await {
+                tracing::warn!(%error, "cannot write Godot log");
+                log.disable();
             }
         }
-        writer.lock().await.write(&line).await?;
+        for byte in &bytes[..bytes_read] {
+            if *byte == b'\n' {
+                append_tail(&tail, &line);
+                line.clear();
+            } else if line.len() < TAIL_LINE_LIMIT {
+                line.push(*byte);
+            }
+        }
+    }
+}
+
+const TAIL_LINE_LIMIT: usize = 16 * 1024;
+
+fn append_tail(tail: &Arc<Mutex<VecDeque<String>>>, bytes: &[u8]) {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    while text.ends_with('\r') {
+        text.pop();
+    }
+    let mut lines = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    lines.push_back(text);
+    while lines.len() > TAIL_LIMIT {
+        lines.pop_front();
     }
 }
 
@@ -368,6 +385,18 @@ struct LogWriter {
 }
 
 impl LogWriter {
+    fn disabled() -> Self {
+        Self {
+            file: None,
+            path: PathBuf::new(),
+            length: 0,
+        }
+    }
+
+    fn disable(&mut self) {
+        self.file = None;
+    }
+
     async fn open(path: PathBuf) -> io::Result<Self> {
         let length = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
@@ -393,6 +422,9 @@ impl LogWriter {
     }
 
     async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
         let mut offset = 0;
         while offset < bytes.len() {
             if self.length >= LOG_LIMIT {
@@ -442,8 +474,13 @@ mod tests {
 
     #[test]
     fn picked_port_can_be_bound_again() {
-        let port = pick_free_port(41000..=41000).expect("port should be free");
-        TcpListener::bind(("127.0.0.1", port)).expect("picked port should be bindable");
+        for _ in 0..5 {
+            let port = pick_free_port(41000..=41100).expect("port should be free");
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+        }
+        panic!("picked port should be bindable");
     }
 
     #[tokio::test]

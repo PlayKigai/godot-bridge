@@ -1,5 +1,3 @@
-//! Project and scene execution.
-
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -18,11 +16,13 @@ pub fn run(file: &Path, scene: Option<&str>) -> anyhow::Result<ExitCode> {
     )?;
     let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))
         .map_err(anyhow::Error::msg)?;
+    godot_bin::check_version(&godot).map_err(anyhow::Error::msg)?;
 
     let scene = match scene {
         None | Some("main") => None,
         Some("current") => Some(scene::resolve_scene(&project, file)?),
-        Some(passed) => Some(passed.to_owned()),
+        Some(passed) if !passed.starts_with('-') => Some(passed.to_owned()),
+        Some(passed) => anyhow::bail!("scene value cannot start with '-': {passed}"),
     };
 
     let mut command = Command::new(&godot);

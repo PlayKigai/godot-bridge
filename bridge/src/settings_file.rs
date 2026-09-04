@@ -1,11 +1,12 @@
-//! Zed settings file loading and merging.
-
 use std::path::{Path, PathBuf};
+use std::{io, os::unix::fs::OpenOptionsExt};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::godot_bin::validate_extra_args;
+
+const SETTINGS_FILE_CAP: u64 = 1024 * 1024;
 
 const KNOWN_KEYS: [&str; 8] = [
     "godot_path",
@@ -58,10 +59,7 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
             tracing::warn!(key = %key, "ignoring unknown key in lsp.godot.settings");
         }
     }
-    let settings: Settings = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    validate_extra_args(&settings.extra_args)?;
-    Ok(settings)
+    deserialize_settings(value)
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
@@ -84,17 +82,48 @@ pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
 }
 
 fn validate_section(path: &Path, section: &Map<String, Value>) -> Result<(), String> {
-    parse_settings(&Value::Object(section.clone()))
+    deserialize_settings(&Value::Object(section.clone()))
         .map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(())
 }
 
-fn read_settings_section(path: &Path) -> Result<Option<Map<String, Value>>, String> {
-    if !path.is_file() {
-        return Ok(None);
+fn deserialize_settings(value: &Value) -> Result<Settings, String> {
+    let settings: Settings = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    if let Some(path) = settings.godot_path.as_deref() {
+        crate::godot_bin::validate_godot_path(Path::new(path))?;
     }
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    validate_extra_args(&settings.extra_args)?;
+    Ok(settings)
+}
+
+fn read_settings_section(path: &Path) -> Result<Option<Map<String, Value>>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{}: settings file is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > SETTINGS_FILE_CAP {
+        return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut text = String::new();
+    use std::io::Read;
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if text.len() > SETTINGS_FILE_CAP as usize {
+        return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
+    }
     let value: Value =
         json5::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     let Some(settings) = value
@@ -202,7 +231,7 @@ mod tests {
                 "lsp": {
                     "godot": {
                         "settings": {
-                            "godot_path": "user-godot",
+                            "godot_path": "/bin/sh",
                             "project_dir": "user-project",
                             "dap_port": 5555,
                             "diagnose_addons": true
@@ -218,7 +247,7 @@ mod tests {
                 "lsp": {
                     "godot": {
                         "settings": {
-                            "godot_path": "project-godot",
+                            "godot_path": "/bin/true",
                             "project_diagnostics": false,
                             "extra_args": ["--verbose"],
                             "startup_timeout_s": 30
@@ -229,7 +258,7 @@ mod tests {
         );
         with_config_dir(config_dir.path(), || {
             let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("project-godot"));
+            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
             assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
             assert_eq!(settings.lsp_port, None);
             assert_eq!(settings.dap_port, 5555);
@@ -252,7 +281,7 @@ mod tests {
                 "lsp": {
                     "godot": {
                         "settings": {
-                            "godot_path": "godot4", // inline
+                            "godot_path": "/bin/true", // inline
                             "extra_args": ["--verbose",],
                         },
                     },
@@ -261,7 +290,7 @@ mod tests {
         );
         with_config_dir(config_dir.path(), || {
             let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("godot4"));
+            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
             assert_eq!(settings.extra_args, ["--verbose"]);
         });
     }

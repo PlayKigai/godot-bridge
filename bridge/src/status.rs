@@ -1,31 +1,25 @@
-//! The `status` subcommand: prints one status object per responding project.
-
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
 
-use crate::state::{runtime_dir, socket_request};
+use crate::state::{remove_if_stale, runtime_dir, socket_request};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Prints one JSON status object per project with a responding socket,
-/// removing stale state files. Exit 0.
 pub async fn run() -> anyhow::Result<()> {
     let stdout = io::stdout();
     run_in(&runtime_dir()?, &mut stdout.lock()).await
 }
 
-/// Runs against a given runtime dir, writing one line per responding project.
 async fn run_in(dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     for state_path in list_state_files(dir)? {
         let sock_path = state_path.with_extension("sock");
         match socket_request(&sock_path, &json!({"cmd": "status"}), STATUS_TIMEOUT).await {
             Ok(response) => writeln!(out, "{response}")?,
             Err(_) => {
-                let _ = std::fs::remove_file(&state_path);
-                let _ = std::fs::remove_file(&sock_path);
+                let _ = remove_if_stale(&state_path, &sock_path);
             }
         }
     }
@@ -50,13 +44,42 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    use crate::state::serve_socket;
+    use crate::state::{serve_socket, write_state, Mode, State, Status};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn detached_gui_state_without_socket_is_kept() {
+        let dir = tempdir().unwrap();
+        write_state(
+            &dir.path().join("gui.json"),
+            &crate::state::detached_gui_state(Path::new("/project"), Status::Ready),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        run_in(dir.path(), &mut output).await.unwrap();
+        assert!(dir.path().join("gui.json").exists());
+        assert!(output.is_empty());
+    }
 
     #[tokio::test]
     async fn stale_state_is_removed_and_live_status_is_printed() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("stale.json"), b"{}").unwrap();
+        let stale = State {
+            version: 1,
+            project: "/stale".to_owned(),
+            status: Status::Ready,
+            mode: Mode::Headless,
+            godot_pid: None,
+            godot_pgid: None,
+            lsp_port: None,
+            dap_port: None,
+            owner_pid: Some(u32::MAX),
+            owner_start_ticks: Some(1),
+            godot_start_ticks: None,
+            started_at: "2026-09-04T00:00:00Z".to_owned(),
+            bridge_version: "0.1.0".to_owned(),
+        };
+        write_state(&dir.path().join("stale.json"), &stale).unwrap();
         std::fs::write(dir.path().join("stale.sock"), b"dead").unwrap();
         std::fs::write(dir.path().join("live.json"), b"{}").unwrap();
         let _handle = serve_socket(dir.path().join("live.sock"), |_request| async move {

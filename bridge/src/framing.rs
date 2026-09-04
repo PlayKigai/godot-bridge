@@ -1,17 +1,14 @@
-//! Content-Length message framing.
-
 use std::fmt;
 
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Errors returned while decoding or writing a framed message.
+const HEADER_CAP: usize = 16 * 1024;
+
 #[derive(Debug)]
 pub enum FrameError {
-    /// The declared body length is larger than the configured cap.
     Oversized(usize),
-    /// The frame headers are not valid.
     Malformed(String),
-    /// The underlying asynchronous I/O operation failed.
     Io(std::io::Error),
 }
 
@@ -27,14 +24,12 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-/// Incrementally decodes Content-Length framed messages.
 pub struct FrameDecoder {
     cap: usize,
     buf: Vec<u8>,
 }
 
 impl FrameDecoder {
-    /// Creates a decoder which rejects bodies larger than `cap` bytes.
     pub fn new(cap: usize) -> Self {
         Self {
             cap,
@@ -42,12 +37,10 @@ impl FrameDecoder {
         }
     }
 
-    /// Adds bytes to the decoder's input buffer.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Returns the next complete body, if one is available.
     pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
         let (header_end, delimiter_len) = match (
             self.buf.windows(4).position(|window| window == b"\r\n\r\n"),
@@ -56,8 +49,17 @@ impl FrameDecoder {
             (Some(crlf_end), Some(lf_end)) if lf_end < crlf_end => (lf_end, 2),
             (Some(crlf_end), _) => (crlf_end, 4),
             (None, Some(lf_end)) => (lf_end, 2),
-            (None, None) => return Ok(None),
+            (None, None) => {
+                if self.buf.len() > HEADER_CAP {
+                    return Err(FrameError::Malformed("frame header is too long".to_owned()));
+                }
+                return Ok(None);
+            }
         };
+
+        if header_end > HEADER_CAP {
+            return Err(FrameError::Malformed("frame header is too long".to_owned()));
+        }
 
         let header = &self.buf[..header_end];
         let mut content_length = None;
@@ -114,14 +116,12 @@ impl FrameDecoder {
     }
 }
 
-/// Reads Content-Length framed messages from an asynchronous reader.
 pub struct FrameReader<R: AsyncRead> {
     reader: R,
     decoder: FrameDecoder,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    /// Creates a reader which rejects bodies larger than `cap` bytes.
     pub fn new(reader: R, cap: usize) -> Self {
         Self {
             reader,
@@ -149,14 +149,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
-/// Encodes a body using the standard single-header LSP frame format.
 pub fn encode_frame(body: &[u8]) -> Vec<u8> {
     let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     frame.extend_from_slice(body);
     frame
 }
 
-/// Writes one framed body, refusing bodies larger than `cap` bytes.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     body: &[u8],
@@ -169,6 +167,35 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         .write_all(&encode_frame(body))
         .await
         .map_err(FrameError::Io)
+}
+
+pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(body).map_err(|error| {
+        if protocol.is_empty() {
+            format!("invalid JSON: {error}")
+        } else {
+            format!("invalid {protocol} JSON: {error}")
+        }
+    })?;
+    if !value.is_object() {
+        return Err(format!("{protocol} message is not an object"));
+    }
+    Ok(value)
+}
+
+pub async fn write_json<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &Value,
+    cap: usize,
+    flush: bool,
+) -> Result<(), FrameError> {
+    let body = serde_json::to_vec(message)
+        .map_err(|error| FrameError::Malformed(format!("cannot serialize JSON: {error}")))?;
+    write_frame(writer, &body, cap).await?;
+    if flush {
+        writer.flush().await.map_err(FrameError::Io)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,16 +1,21 @@
-//! Runtime state files, locks, and status sockets.
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+
+use nix::fcntl::{Flock, FlockArg};
+use nix::unistd::{geteuid, getpid};
+
+const SOCKET_CLIENT_CAP: usize = 16;
+const SOCKET_LINE_CAP: usize = 64 * 1024;
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn not_found_ok(result: io::Result<()>) -> io::Result<()> {
     match result {
@@ -19,20 +24,64 @@ fn not_found_ok(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Returns the private directory used for bridge runtime files.
 pub fn runtime_dir() -> io::Result<PathBuf> {
-    let path = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir).join("godot-bridge"),
-        None => PathBuf::from(format!("/tmp/godot-bridge-{}", unsafe { libc::geteuid() })),
-    };
-    std::fs::create_dir_all(&path)?;
-    let mut permissions = std::fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&path, permissions)?;
-    Ok(path)
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => ensure_private_dir(&PathBuf::from(dir).join("godot-bridge")),
+        None => fallback_runtime_dir(),
+    }
 }
 
-/// The four runtime files belonging to one project.
+pub fn fallback_runtime_dir() -> io::Result<PathBuf> {
+    ensure_private_dir(&PathBuf::from(format!(
+        "/tmp/godot-bridge-{}",
+        geteuid().as_raw()
+    )))
+}
+
+fn ensure_private_dir(path: &Path) -> io::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => validate_private_dir(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(path)?;
+            validate_private_dir(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let _directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot securely open runtime directory {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    Ok(path.to_path_buf())
+}
+
+fn validate_private_dir(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "runtime directory {} is not a directory without symlinks",
+            path.display()
+        )));
+    }
+    if metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "runtime directory {} must be owned by the current user with mode 0700",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub struct ProjectFiles {
     pub lock: PathBuf,
     pub sock: PathBuf,
@@ -41,12 +90,17 @@ pub struct ProjectFiles {
 }
 
 impl ProjectFiles {
-    /// Builds runtime file paths from a canonical project path.
     pub fn new(project: &Path) -> io::Result<Self> {
         let hash = blake3::hash(project.to_string_lossy().as_bytes())
             .to_hex()
             .to_string();
-        let prefix = runtime_dir()?.join(&hash[..16]);
+        let mut runtime = runtime_dir()?;
+        let socket = runtime.join(format!("{}.sock", &hash[..16]));
+        if socket.as_os_str().len() > 100 {
+            tracing::warn!(path = %socket.display(), "socket path is too long; using fallback runtime directory");
+            runtime = fallback_runtime_dir()?;
+        }
+        let prefix = runtime.join(&hash[..16]);
         Ok(Self {
             lock: prefix.with_extension("lock"),
             sock: prefix.with_extension("sock"),
@@ -56,20 +110,10 @@ impl ProjectFiles {
     }
 }
 
-/// An exclusively held non-blocking runtime lock.
 pub struct LockGuard {
-    file: std::fs::File,
+    _flock: Flock<std::fs::File>,
 }
 
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-/// Tries to take an exclusive lock without waiting.
 pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -77,18 +121,15 @@ pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
         .read(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(Some(LockGuard { file }))
-    } else if io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(None)
-    } else {
-        Err(io::Error::last_os_error())
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(file) => Ok(Some(LockGuard { _flock: file })),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, error)) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
 
-/// The lifecycle state published by a bridge owner.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct State {
     pub version: u32,
@@ -106,7 +147,6 @@ pub struct State {
     pub bridge_version: String,
 }
 
-/// Bridge startup and recovery status.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -115,7 +155,6 @@ pub enum Status {
     Recovering,
 }
 
-/// The editor process mode.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -164,7 +203,7 @@ pub fn detached_gui_state(project: &Path, status: Status) -> State {
 }
 
 pub fn set_owner_identity(state: &mut State) {
-    let pid = std::process::id();
+    let pid = getpid().as_raw() as u32;
     state.owner_pid = Some(pid);
     state.owner_start_ticks = start_ticks(pid);
 }
@@ -182,11 +221,6 @@ pub fn gui_process_alive(state: &State) -> bool {
             .is_some_and(|(pid, ticks)| pid_alive_with_ticks(pid, ticks))
 }
 
-pub fn remove_lock_file(path: &Path) {
-    let _ = std::fs::remove_file(path);
-}
-
-/// Atomically writes state with private file permissions.
 pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
@@ -195,6 +229,7 @@ pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
         .truncate(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)?;
     use std::io::Write;
     file.write_all(&bytes)?;
@@ -202,51 +237,66 @@ pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
     std::fs::rename(temp, path)
 }
 
-/// Reads state, returning `None` when the state file is absent.
 pub fn read_state(path: &Path) -> io::Result<Option<State>> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(io::Error::other),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
+    let bytes = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let mut file = file;
+            file.read_to_end(&mut bytes)?;
+            bytes
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
-/// Reads process start ticks from field 22 of `/proc/<pid>/stat`.
 pub fn start_ticks(pid: u32) -> Option<u64> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_name = text.rsplit_once(')')?.1;
+    process_start_ticks(pid).ok()
+}
+
+pub fn process_start_ticks(pid: u32) -> io::Result<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_name = text
+        .rsplit_once(')')
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
     after_name
         .split_whitespace()
         .nth(19)
-        .and_then(|ticks| ticks.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
 }
 
-/// Checks that a process exists and is the process identified by its start ticks.
 pub fn pid_alive_with_ticks(pid: u32, ticks: u64) -> bool {
     start_ticks(pid) == Some(ticks)
 }
 
-/// Removes state and socket files when the recorded owner is no longer the same process.
-pub fn remove_if_stale(files: &ProjectFiles) -> io::Result<bool> {
-    let Some(state) = read_state(&files.state)? else {
+pub fn remove_if_stale(state_path: &Path, sock_path: &Path) -> io::Result<bool> {
+    let Some(state) = read_state(state_path)? else {
         return Ok(false);
     };
     let stale = match (state.owner_pid, state.owner_start_ticks) {
         (Some(pid), Some(ticks)) => !pid_alive_with_ticks(pid, ticks),
-        (Some(_), None) => true,
+        (Some(_), None) => false,
         (None, _) => false,
     };
     if !stale {
         return Ok(false);
     }
-    not_found_ok(std::fs::remove_file(&files.state))?;
-    not_found_ok(std::fs::remove_file(&files.sock))?;
+    not_found_ok(std::fs::remove_file(state_path))?;
+    not_found_ok(std::fs::remove_file(sock_path))?;
     Ok(true)
 }
 
-/// A running Unix socket server; dropping it stops the server and removes its path.
 pub struct SocketHandle {
     path: PathBuf,
     task: JoinHandle<()>,
@@ -259,7 +309,6 @@ impl Drop for SocketHandle {
     }
 }
 
-/// Serves concurrent newline-delimited JSON requests over a Unix socket.
 pub async fn serve_socket<F, Fut>(path: impl AsRef<Path>, handler: F) -> io::Result<SocketHandle>
 where
     F: Fn(Value) -> Fut + Send + Sync + 'static,
@@ -268,37 +317,49 @@ where
     let path = path.as_ref().to_path_buf();
     not_found_ok(std::fs::remove_file(&path))?;
     let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let handler = Arc::new(handler);
+    let permits = Arc::new(Semaphore::new(SOCKET_CLIENT_CAP));
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                continue;
+            };
             let handler = Arc::clone(&handler);
-            tokio::spawn(handle_client(stream, handler));
+            tokio::spawn(handle_client(stream, handler, permit));
         }
     });
     Ok(SocketHandle { path, task })
 }
 
-/// Returns the standard response for an unsupported socket command.
 pub fn unknown_command() -> Value {
     serde_json::json!({"error": "unknown cmd"})
 }
 
-async fn handle_client<F, Fut>(stream: UnixStream, handler: Arc<F>)
-where
+async fn handle_client<F, Fut>(
+    stream: UnixStream,
+    handler: Arc<F>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) where
     F: Fn(Value) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Value> + Send + 'static,
 {
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) if request.get("cmd").and_then(Value::as_str).is_some() => {
-                let command = request
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if command == "status" || command == "handoff" {
-                    match tokio::time::timeout(Duration::from_secs(5), handler(request)).await {
+    let mut reader = BufReader::new(read);
+    loop {
+        let line = match tokio::time::timeout(SOCKET_TIMEOUT, read_line_limited(&mut reader)).await
+        {
+            Ok(Ok(Some(line))) => line,
+            _ => break,
+        };
+        let response = match serde_json::from_slice::<Value>(&line) {
+            Ok(request) => {
+                let known = matches!(
+                    request.get("cmd").and_then(Value::as_str),
+                    Some("status") | Some("handoff")
+                );
+                if known {
+                    match tokio::time::timeout(SOCKET_TIMEOUT, handler(request)).await {
                         Ok(response) => response,
                         Err(_) => serde_json::json!({"error": "request timed out"}),
                     }
@@ -306,20 +367,58 @@ where
                     unknown_command()
                 }
             }
-            Ok(_) => unknown_command(),
             Err(_) => serde_json::json!({"error": "invalid json"}),
         };
         let Ok(mut bytes) = serde_json::to_vec(&response) else {
             break;
         };
         bytes.push(b'\n');
-        if write.write_all(&bytes).await.is_err() {
+        if !matches!(
+            tokio::time::timeout(SOCKET_TIMEOUT, write.write_all(&bytes)).await,
+            Ok(Ok(()))
+        ) {
             break;
         }
     }
 }
 
-/// Sends one newline-delimited JSON request and waits for its response.
+async fn read_line_limited<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "socket line has no newline",
+                ))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let has_newline = available[..take].contains(&b'\n');
+        if line.len() + take > SOCKET_LINE_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "socket request line is too long",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if has_newline {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
+}
+
 pub async fn socket_request(
     path: impl AsRef<Path>,
     req: &Value,
@@ -331,19 +430,18 @@ pub async fn socket_request(
         let mut bytes = serde_json::to_vec(req).map_err(io::Error::other)?;
         bytes.push(b'\n');
         write.write_all(&bytes).await?;
-        let mut lines = BufReader::new(read).lines();
-        let line = lines
-            .next_line()
+        let mut reader = BufReader::new(read);
+        let line = read_line_limited(&mut reader)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
-        serde_json::from_str(&line).map_err(io::Error::other)
+        serde_json::from_slice(&line).map_err(io::Error::other)
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket request timed out"))?
 }
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(test)]
 mod tests {
@@ -392,7 +490,7 @@ mod tests {
         let project_files = files(dir.path());
         write_state(&project_files.state, &state(Some(u32::MAX), Some(1))).unwrap();
         std::fs::write(&project_files.sock, b"stale").unwrap();
-        assert!(remove_if_stale(&project_files).unwrap());
+        assert!(remove_if_stale(&project_files.state, &project_files.sock).unwrap());
         assert!(!project_files.state.exists());
         assert!(!project_files.sock.exists());
     }
@@ -404,7 +502,7 @@ mod tests {
         let pid = std::process::id();
         let ticks = start_ticks(pid).unwrap();
         write_state(&project_files.state, &state(Some(pid), Some(ticks + 1))).unwrap();
-        assert!(remove_if_stale(&project_files).unwrap());
+        assert!(remove_if_stale(&project_files.state, &project_files.sock).unwrap());
     }
 
     #[test]

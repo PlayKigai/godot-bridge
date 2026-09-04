@@ -1,7 +1,11 @@
-//! Scene resolution from scripts and project scenes.
-
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use crate::root::normalize_absolute;
+
+const MAX_SCENE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SceneError {
@@ -48,7 +52,7 @@ pub fn resolve_scene(project: &Path, file: &Path) -> Result<String, SceneError> 
     scenes.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (relative_scene, scene) in scenes {
-        let Ok(contents) = std::fs::read_to_string(scene) else {
+        let Some(contents) = read_scene(&scene) else {
             continue;
         };
         if contents.lines().any(|line| {
@@ -61,6 +65,19 @@ pub fn resolve_scene(project: &Path, file: &Path) -> Result<String, SceneError> 
     }
 
     Err(SceneError::NoScene(file))
+}
+
+fn read_scene(path: &Path) -> Option<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SCENE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()
+        .and_then(|_| String::from_utf8(bytes).ok())
 }
 
 fn collect_scenes(root: &Path, directory: &Path, scenes: &mut Vec<(PathBuf, PathBuf)>) {
@@ -121,27 +138,6 @@ fn normalize_res_path(path: &str) -> String {
         }
     }
     format!("res://{}", parts.join("/"))
-}
-
-fn normalize_absolute(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]

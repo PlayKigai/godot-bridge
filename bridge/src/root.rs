@@ -1,5 +1,3 @@
-//! Worktree root and project directory resolution.
-
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -194,14 +192,8 @@ pub fn find_project_dir(
     }
 }
 
-pub fn project_hash(project: &Path) -> String {
-    blake3::hash(project.to_string_lossy().as_bytes()).to_hex()[..16].to_owned()
-}
-
 pub fn path_to_uri(path: &Path) -> String {
-    let path = path
-        .canonicalize()
-        .unwrap_or_else(|_| normalize_absolute(path));
+    let path = canonical_or_normalized(path);
     Url::from_file_path(path)
         .expect("absolute paths can be represented as file URIs")
         .to_string()
@@ -219,7 +211,7 @@ pub fn uri_to_path(uri: &str) -> Result<PathBuf, RootError> {
     let decoded = percent_decode_str(parsed.path())
         .decode_utf8()
         .map_err(|_| RootError::CannotDetermineRoot)?;
-    let path = PathBuf::from(decoded.into_owned());
+    let path = normalize_absolute(Path::new(decoded.as_ref()));
     if path.is_absolute() {
         Ok(path)
     } else {
@@ -233,8 +225,7 @@ pub fn doc_key(uri_or_path: &str) -> PathBuf {
     } else {
         PathBuf::from(uri_or_path)
     };
-    path.canonicalize()
-        .unwrap_or_else(|_| normalize_absolute(&path))
+    canonical_or_normalized(&path)
 }
 
 fn has_project_file(path: &Path) -> bool {
@@ -256,7 +247,7 @@ fn should_skip(path: &Path) -> bool {
     ) || name.starts_with('.')
 }
 
-fn normalize_absolute(path: &Path) -> PathBuf {
+pub fn normalize_absolute(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -275,6 +266,11 @@ fn normalize_absolute(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+pub fn canonical_or_normalized(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| normalize_absolute(path))
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 

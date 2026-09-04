@@ -1,9 +1,6 @@
-//! Godot binary resolution and validation.
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_BINARY: &str =
@@ -21,12 +18,10 @@ const FORBIDDEN_ARGS: [&str; 10] = [
     "--quit-after",
 ];
 
-/// Resolves the Godot binary: the `godot_path` setting, then the `GODOT` env
-/// var, then `godot4` and `godot` on PATH. A configured value is returned
-/// without an existence check; `check_version` validates it.
 pub fn resolve_godot(configured: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = configured {
         if !path.as_os_str().is_empty() {
+            validate_godot_path(path)?;
             return Ok(path.to_path_buf());
         }
     }
@@ -50,42 +45,36 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-/// Runs `<bin> --version` with a 5 s timeout and returns its output when it
-/// starts with `4.`; any other output yields the SPEC error message.
 pub fn check_version(bin: &Path) -> Result<String, String> {
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("cannot run {}: {error}", bin.display()))?;
-    let pid = child.id();
-    let (sender, receiver) = mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
-    });
-    let output = match receiver.recv_timeout(VERSION_TIMEOUT) {
-        Ok(output) => output,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-            let _ = waiter.join();
+    let deadline = Instant::now() + VERSION_TIMEOUT;
+    let output = loop {
+        if child
+            .try_wait()
+            .map_err(|error| format!("cannot run {}: {error}", bin.display()))?
+            .is_some()
+        {
+            break child
+                .wait_with_output()
+                .map_err(|error| format!("cannot run {}: {error}", bin.display()))?;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(format!(
                 "Godot at {} did not answer --version within {} s",
                 bin.display(),
                 VERSION_TIMEOUT.as_secs()
             ));
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(format!(
-                "cannot run {}: --version check failed",
-                bin.display()
-            ));
-        }
-    }
-    .map_err(|error| format!("cannot run {}: {error}", bin.display()))?;
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -100,8 +89,6 @@ pub fn check_version(bin: &Path) -> Result<String, String> {
     }
 }
 
-/// Rejects any `extra_args` element equal to a forbidden Godot flag, and any
-/// long forbidden flag in `--flag=value` form.
 pub fn validate_extra_args(args: &[String]) -> Result<(), String> {
     for arg in args {
         for flag in FORBIDDEN_ARGS {
@@ -119,6 +106,22 @@ pub fn validate_extra_args(args: &[String]) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+pub fn validate_godot_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "godot_path must be an absolute path to an executable: {}",
+            path.display()
+        ));
+    }
+    if !is_executable(path) {
+        return Err(format!(
+            "godot_path is not an existing executable: {}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -152,6 +155,17 @@ mod tests {
         path
     }
 
+    fn version_of(bin: &Path) -> Result<String, String> {
+        loop {
+            match check_version(bin) {
+                Err(error) if error.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn touch(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "").unwrap();
@@ -163,7 +177,7 @@ mod tests {
     fn version_4x_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_script(dir.path(), "godot", "#!/bin/sh\necho 4.7.2.stable\n");
-        let version = check_version(&bin).unwrap();
+        let version = version_of(&bin).unwrap();
         assert!(version.starts_with("4."));
         assert_eq!(version, "4.7.2.stable");
     }
@@ -172,7 +186,7 @@ mod tests {
     fn version_3x_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_script(dir.path(), "godot", "#!/bin/sh\necho 3.5\n");
-        let error = check_version(&bin).unwrap_err();
+        let error = version_of(&bin).unwrap_err();
         assert_eq!(error, format!("Godot at {} is not 4.x: 3.5", bin.display()));
     }
 
@@ -190,7 +204,7 @@ mod tests {
             "godot",
             &format!("#!/bin/sh\nexec {sleeper} 10\n"),
         );
-        let error = check_version(&bin).unwrap_err();
+        let error = version_of(&bin).unwrap_err();
         assert!(error.contains("did not answer --version"), "{error}");
     }
 

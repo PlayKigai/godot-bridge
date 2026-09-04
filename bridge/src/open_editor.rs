@@ -10,8 +10,8 @@ use crate::process::{kill_recorded, pick_free_port, spawn_gui};
 use crate::root::{cwd_root, find_project_dir};
 use crate::settings_file::{load_zed_settings, Settings};
 use crate::state::{
-    detached_gui_state, gui_process_alive, read_state, remove_lock_file, socket_request, try_lock,
-    write_state, Mode, ProjectFiles, State, Status,
+    detached_gui_state, gui_process_alive, read_state, socket_request, try_lock, write_state, Mode,
+    ProjectFiles, State, Status,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,7 +45,6 @@ pub async fn run(file: &Path, trailing: Vec<String>) -> Result<ExitCode> {
     };
     let result = launch_or_reuse(&files, &project, &settings).await;
     drop(lock);
-    remove_lock_file(&files.lock);
     result
 }
 
