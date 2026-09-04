@@ -94,7 +94,10 @@ impl ProjectFiles {
         let mut runtime = runtime_dir()?;
         let socket = runtime.join(format!("{}.sock", &hash[..16]));
         if socket.as_os_str().len() > 100 {
-            tracing::warn!(path = %socket.display(), "socket path is too long; using fallback runtime directory");
+            crate::warn!(
+                "socket path {} is too long; using fallback runtime directory",
+                socket.display()
+            );
             runtime = fallback_runtime_dir()?;
         }
         let prefix = runtime.join(&hash[..16]);

@@ -159,7 +159,7 @@ pub fn find_project_dir(
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                tracing::warn!(path = %dir.display(), %error, "skipping unreadable directory");
+                crate::warn!("skipping unreadable directory {}: {error}", dir.display());
                 continue;
             }
         };
@@ -168,7 +168,10 @@ pub fn find_project_dir(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "skipping unreadable directory entry");
+                    crate::warn!(
+                        "skipping unreadable directory entry {}: {error}",
+                        path.display()
+                    );
                     continue;
                 }
             };

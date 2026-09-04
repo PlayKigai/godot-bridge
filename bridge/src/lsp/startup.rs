@@ -20,7 +20,7 @@ pub(super) async fn terminate_editor(mut editor: Editor) {
 
 pub(super) async fn terminate_editor_child(child: GodotChild) {
     if let Err(error) = kill_group(child).await {
-        tracing::warn!(%error, "cannot terminate Godot process group");
+        crate::warn!("cannot terminate Godot process group: {error}");
     }
 }
 
@@ -61,7 +61,7 @@ pub(super) async fn stale_cleanup(files: &ProjectFiles) {
         {
             if crate::state::pid_alive_with_ticks(pid, ticks) {
                 if let Err(error) = kill_recorded(pid, pgid as i32, ticks).await {
-                    tracing::warn!(%error, "cannot terminate stale Godot editor");
+                    crate::warn!("cannot terminate stale Godot editor: {error}");
                 }
             }
         }

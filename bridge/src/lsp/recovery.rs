@@ -142,7 +142,7 @@ pub(super) async fn recover(
                             return Ok(Recovered::ClientClosed);
                         }
                         Err(error) => {
-                            tracing::error!(%error, "malformed client frame during recovery");
+                            crate::error!("malformed client frame during recovery: {error}");
                             return Err(anyhow!("malformed client frame during recovery"));
                         }
                     }
@@ -212,11 +212,11 @@ pub(super) fn absorb_watcher_event(
             if watch.pending.len() > WATCHER_PENDING_CAP {
                 watch.pending = coalesce_watcher_changes(std::mem::take(&mut watch.pending));
                 watch.pending.truncate(WATCHER_PENDING_CAP);
-                tracing::warn!("project diagnostics watcher queue is full");
+                crate::warn!("project diagnostics watcher queue is full");
             }
             watch.deadline = Some(Instant::now() + Duration::from_millis(300));
         }
-        Some(Err(error)) => tracing::warn!(%error, "project diagnostics watcher error"),
+        Some(Err(error)) => crate::warn!("project diagnostics watcher error: {error}"),
         None => watch.watcher = None,
     }
 }
@@ -237,7 +237,7 @@ pub(super) async fn finish_recovery(
                     .get("id")
                     .is_some_and(|id| session.proxy.stale_server_ids.contains(&id.to_string()))
                 {
-                    tracing::debug!("dropping response to stale Godot request");
+                    crate::debug!("dropping response to stale Godot request");
                     continue;
                 }
                 message
@@ -324,9 +324,9 @@ pub(super) async fn queue_recovery_message(
                         queue.bytes = queue.bytes.saturating_sub(serde_json::to_vec(&old)?.len());
                     }
                     queue.notifications -= 1;
-                    tracing::warn!("dropping oldest notification from recovery queue");
+                    crate::warn!("dropping oldest notification from recovery queue");
                 } else {
-                    tracing::warn!("dropping notification from full recovery queue");
+                    crate::warn!("dropping notification from full recovery queue");
                     return Ok(());
                 }
             }
@@ -336,13 +336,13 @@ pub(super) async fn queue_recovery_message(
         }
     } else if message.get("id").is_some() {
         if queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP {
-            tracing::warn!("dropping response from full recovery queue");
+            crate::warn!("dropping response from full recovery queue");
             return Ok(());
         }
         queue.bytes += size;
         queue.items.push_back(RecoveryItem::Response(message));
     } else {
-        tracing::warn!("dropping invalid message from recovery queue");
+        crate::warn!("dropping invalid message from recovery queue");
     }
     Ok(())
 }

@@ -56,7 +56,7 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
     };
     for key in object.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            tracing::warn!(key = %key, "ignoring unknown key in lsp.godot.settings");
+            crate::warn!("ignoring unknown key {key} in lsp.godot.settings");
         }
     }
     deserialize_settings(value)

@@ -41,7 +41,7 @@ pub(super) async fn run_session(mut session: Session, unmanaged: bool) -> Result
                         let message = match parse_message(&body) {
                             Ok(message) => message,
                             Err(error) => {
-                                tracing::error!(%error, "malformed client message");
+                                crate::error!("malformed client message: {error}");
                                 return exit_session(&mut session, 1).await;
                             }
                         };
@@ -57,14 +57,14 @@ pub(super) async fn run_session(mut session: Session, unmanaged: bool) -> Result
                             &session.settings,
                             message,
                         ).await {
-                            tracing::error!(%error, "cannot forward client message");
+                            crate::error!("cannot forward client message: {error}");
                             return exit_session(&mut session, 1).await;
                         }
                         Recovered::Continue
                     }
                     Ok(None) => return exit_session(&mut session, 0).await,
                     Err(error) => {
-                        tracing::error!(%error, "malformed client frame");
+                        crate::error!("malformed client frame: {error}");
                         return exit_session(&mut session, 1).await;
                     }
                 }
@@ -82,7 +82,7 @@ pub(super) async fn run_session(mut session: Session, unmanaged: bool) -> Result
                         match forwarded {
                             Ok(()) => Recovered::Continue,
                             Err(error) => {
-                                tracing::error!(%error, "cannot forward server message");
+                                crate::error!("cannot forward server message: {error}");
                                 if unmanaged {
                                     return exit_session(&mut session, 1).await;
                                 }
@@ -201,7 +201,7 @@ async fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitC
     )
     .await
     {
-        tracing::error!(%error, "cannot forward shutdown");
+        crate::error!("cannot forward shutdown: {error}");
         return exit_session(session, 1).await;
     }
     match session.editor.connection.reader.read_frame().await {
@@ -215,7 +215,7 @@ async fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitC
             )
             .await
             {
-                tracing::error!(%error, "cannot forward shutdown response");
+                crate::error!("cannot forward shutdown response: {error}");
                 return exit_session(session, 1).await;
             }
         }

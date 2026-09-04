@@ -302,7 +302,7 @@ fn spawn_output_task(
         let writer = match LogWriter::open(log_path).await {
             Ok(writer) => Arc::new(AsyncMutex::new(writer)),
             Err(error) => {
-                tracing::warn!(%error, "cannot open Godot log");
+                crate::warn!("cannot open Godot log: {error}");
                 Arc::new(AsyncMutex::new(LogWriter::disabled()))
             }
         };
@@ -351,7 +351,7 @@ where
         {
             let mut log = writer.lock().await;
             if let Err(error) = log.write(&bytes[..bytes_read]).await {
-                tracing::warn!(%error, "cannot write Godot log");
+                crate::warn!("cannot write Godot log: {error}");
                 log.disable();
             }
         }

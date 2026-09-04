@@ -6,6 +6,7 @@ mod doc;
 mod docs_state;
 mod framing;
 mod godot_bin;
+mod log;
 mod lsp;
 mod open_editor;
 mod process;
@@ -67,13 +68,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("GODOT_BRIDGE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    log::init();
 
     match Cli::parse().command {
         Command::Lsp { extra_args } => match lsp::run(extra_args).await {

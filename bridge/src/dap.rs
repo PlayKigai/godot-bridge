@@ -482,7 +482,7 @@ fn should_forward_server_event(message: &Value, process_seen: &mut bool) -> bool
         return true;
     }
     if !*process_seen && (event == Some("exited") || event == Some("terminated")) {
-        tracing::debug!(?event, "dropping stale DAP lifecycle event before process");
+        crate::debug!("dropping stale DAP lifecycle event before process: {event:?}");
         return false;
     }
     true

@@ -365,7 +365,10 @@ fn scan_directory(
     let mut entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries.flatten().collect::<Vec<_>>(),
         Err(error) => {
-            tracing::warn!(path = %directory.display(), %error, "skipping unreadable diagnostics directory");
+            crate::warn!(
+                "skipping unreadable diagnostics directory {}: {error}",
+                directory.display()
+            );
             return;
         }
     };
@@ -375,7 +378,10 @@ fn scan_directory(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "skipping unreadable diagnostics entry");
+                crate::warn!(
+                    "skipping unreadable diagnostics entry {}: {error}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -408,7 +414,10 @@ pub fn read_document(path: &Path) -> Option<String> {
     {
         Ok(file) => file,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "skipping unreadable diagnostics file");
+            crate::warn!(
+                "skipping unreadable diagnostics file {}: {error}",
+                path.display()
+            );
             return None;
         }
     };
@@ -418,17 +427,20 @@ pub fn read_document(path: &Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .is_err()
     {
-        tracing::warn!(path = %path.display(), "skipping unreadable diagnostics file");
+        crate::warn!("skipping unreadable diagnostics file {}", path.display());
         return None;
     }
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        tracing::warn!(path = %path.display(), "skipping diagnostics file over 2 MiB");
+        crate::warn!("skipping diagnostics file over 2 MiB {}", path.display());
         return None;
     }
     match String::from_utf8(bytes) {
         Ok(text) => Some(text),
         Err(_) => {
-            tracing::warn!(path = %path.display(), "skipping diagnostics file with invalid UTF-8");
+            crate::warn!(
+                "skipping diagnostics file with invalid UTF-8 {}",
+                path.display()
+            );
             None
         }
     }

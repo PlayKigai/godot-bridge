@@ -432,7 +432,7 @@ pub async fn run(trailing: Vec<String>) -> Result<ExitCode> {
         Ok(Some(body)) => parse_message(&body).map_err(|error| anyhow!(error))?,
         Ok(None) => return Ok(ExitCode::SUCCESS),
         Err(error) => {
-            tracing::error!(%error, "invalid initialize frame");
+            crate::error!("invalid initialize frame: {error}");
             return Ok(ExitCode::from(1));
         }
     };
@@ -446,7 +446,7 @@ pub async fn run(trailing: Vec<String>) -> Result<ExitCode> {
             Ok(settings) => settings,
             Err(error) => {
                 send_error(&mut output, &initialize_id, -32602, "InvalidParams").await?;
-                tracing::error!(%error, "invalid initialization settings");
+                crate::error!("invalid initialization settings: {error}");
                 return Ok(ExitCode::from(1));
             }
         },
@@ -801,7 +801,7 @@ async fn forward_client_message(
                 .write_all(&crate::framing::encode_frame(&body))
                 .await?;
         } else if proxy.stale_server_ids.remove(&id) {
-            tracing::debug!(%id, "dropping response to stale Godot request");
+            crate::debug!("dropping response to stale Godot request {id}");
         }
         return Ok(());
     }
@@ -954,7 +954,7 @@ async fn forward_server_message(
         send_client(output, &response).await?;
         flush_queued(output, editor, proxy).await?;
     } else if !proxy.stale_server_ids.contains(&id.to_string()) && !shutdown_response {
-        tracing::debug!(id = %id, "dropping unknown Godot response id");
+        crate::debug!("dropping unknown Godot response id {id}");
     }
     Ok(())
 }
@@ -1028,7 +1028,7 @@ fn rewrite_document_messages(
                 .to_owned();
             let planned = proxy.documents.planned_zed_open(&uri, text.clone());
             if serde_json::to_vec(&document_action_message(planned))?.len() > GODOT_WRITE_CAP {
-                tracing::warn!(%uri, "skipping oversized didOpen for Godot");
+                crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
             let action = proxy.documents.zed_open(&uri, text);
@@ -1044,7 +1044,7 @@ fn rewrite_document_messages(
                 .as_ref()
                 .is_some_and(|changes| changes.len() == 1 && changes[0].get("range").is_none());
             if !full_sync {
-                tracing::warn!(%uri, "didChange was not a full synchronization");
+                crate::warn!("didChange was not a full synchronization {uri}");
                 return Ok(vec![message]);
             }
             let text = changes
@@ -1058,12 +1058,12 @@ fn rewrite_document_messages(
                 serde_json::to_vec(&document_action_message(action))
                     .is_ok_and(|body| body.len() > GODOT_WRITE_CAP)
             }) {
-                tracing::warn!(%uri, "skipping oversized didChange for Godot");
+                crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
             }
             let Some(action) = proxy.documents.zed_change(&uri, text) else {
                 if serde_json::to_vec(&message)?.len() > GODOT_WRITE_CAP {
-                    tracing::warn!(%uri, "skipping oversized didChange for Godot");
+                    crate::warn!("skipping oversized didChange for Godot {uri}");
                     return Ok(Vec::new());
                 }
                 return Ok(vec![message]);
@@ -1341,9 +1341,9 @@ async fn send_godot(writer: &mut OwnedWriteHalf, message: &Value, request: bool)
         if request {
             return Err(anyhow!("message too large for Godot"));
         }
-        tracing::warn!(
-            size = body.len(),
-            "dropping oversized notification to Godot"
+        crate::warn!(
+            "dropping oversized notification to Godot, {} bytes",
+            body.len()
         );
         return Ok(());
     }
