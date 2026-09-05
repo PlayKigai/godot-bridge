@@ -48,22 +48,36 @@ impl Default for Settings {
 
 impl Settings {
     fn from_object(object: &Map) -> Result<Self, String> {
-        let settings = Self {
+        let mut settings = Self {
             godot_path: optional_string(object, "godot_path")?,
             project_dir: optional_string(object, "project_dir")?,
-            lsp_port: optional_u64(object, "lsp_port")?
-                .map(|value| u16::try_from(value).map_err(|_| "lsp_port must be a 16-bit integer"))
-                .transpose()?,
-            dap_port: default_u64(object, "dap_port", 6006)?
-                .try_into()
-                .map_err(|_| "dap_port must be a 16-bit integer")?,
-            startup_timeout_s: default_u64(object, "startup_timeout_s", 600)?
-                .try_into()
-                .map_err(|_| "startup_timeout_s must be a 32-bit integer")?,
-            project_diagnostics: bool_value(object, "project_diagnostics", true)?,
-            diagnose_addons: bool_value(object, "diagnose_addons", false)?,
-            extra_args: string_array(object, "extra_args")?.unwrap_or_default(),
+            ..Self::default()
         };
+        if object.contains_key("lsp_port") {
+            settings.lsp_port = optional_u64(object, "lsp_port")?
+                .map(|value| u16::try_from(value).map_err(|_| "lsp_port must be a 16-bit integer"))
+                .transpose()?;
+        }
+        if object.contains_key("dap_port") {
+            settings.dap_port = default_u64(object, "dap_port", u64::from(settings.dap_port))?
+                .try_into()
+                .map_err(|_| "dap_port must be a 16-bit integer")?;
+        }
+        if object.contains_key("startup_timeout_s") {
+            settings.startup_timeout_s = default_u64(
+                object,
+                "startup_timeout_s",
+                u64::from(settings.startup_timeout_s),
+            )?
+            .try_into()
+            .map_err(|_| "startup_timeout_s must be a 32-bit integer")?;
+        }
+        settings.project_diagnostics =
+            bool_value(object, "project_diagnostics", settings.project_diagnostics)?;
+        settings.diagnose_addons = bool_value(object, "diagnose_addons", settings.diagnose_addons)?;
+        if let Some(extra_args) = string_array(object, "extra_args")? {
+            settings.extra_args = extra_args;
+        }
         Ok(settings)
     }
 }

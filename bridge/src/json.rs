@@ -206,9 +206,7 @@ impl<'a> IntoIterator for &'a Map {
 
 impl FromIterator<(String, Value)> for Map {
     fn from_iter<T: IntoIterator<Item = (String, Value)>>(entries: T) -> Self {
-        let mut map = Self::new();
-        map.extend(entries);
-        map
+        Self(entries.into_iter().collect())
     }
 }
 

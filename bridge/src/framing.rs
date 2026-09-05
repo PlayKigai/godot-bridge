@@ -197,7 +197,7 @@ impl Drop for Connection {
     }
 }
 
-pub(crate) fn connection_without_reader<T, F>(
+pub(crate) fn connect_with_reader<T, F>(
     stream: std::net::TcpStream,
     name: &str,
     sender: SyncSender<T>,
@@ -210,11 +210,11 @@ where
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let reader_stream = stream.try_clone()?;
     let writer = stream.try_clone()?;
-    let reader_thread = spawn_frame_reader_with(name, reader_stream, sender, map)?;
+    let reader_thread = spawn_frame_reader(name, reader_stream, sender, map)?;
     Ok(Connection::with_parts(stream, Some(reader_thread), writer))
 }
 
-pub(crate) fn spawn_frame_reader_with<R, T, F>(
+pub(crate) fn spawn_frame_reader<R, T, F>(
     name: &str,
     mut reader: R,
     sender: SyncSender<T>,

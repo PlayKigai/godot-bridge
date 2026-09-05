@@ -1,11 +1,11 @@
 use super::*;
-use crate::framing::connection_without_reader;
+use crate::framing::connect_with_reader;
 
 pub(super) fn connection_from_stream(
     stream: TcpStream,
     sender: mpsc::SyncSender<ProxyEvent>,
 ) -> Connection {
-    connection_without_reader(stream, "godot-bridge-lsp-reader", sender, ProxyEvent::Godot)
+    connect_with_reader(stream, "godot-bridge-lsp-reader", sender, ProxyEvent::Godot)
         .expect("Godot reader thread should spawn")
 }
 

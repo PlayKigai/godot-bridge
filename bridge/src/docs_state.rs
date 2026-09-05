@@ -67,14 +67,11 @@ impl DocumentState {
             doc.text_hash = text_hash(&text);
             doc.version += 1;
             doc.owner = DocumentOwner::Zed;
-            let uri = doc.uri.clone();
-            let version = doc.version;
-            let action = DocumentAction::Change {
-                uri: uri.clone(),
-                version,
+            return DocumentAction::Change {
+                uri: doc.uri.clone(),
+                version: doc.version,
                 text,
             };
-            return action;
         }
 
         let uri = path_to_uri(&key);
@@ -223,16 +220,6 @@ pub struct ScannedDocument {
     pub path: PathBuf,
     pub key: PathBuf,
     pub text: Option<String>,
-}
-
-pub fn scan_project(project: &Path, diagnose_addons: bool) -> Vec<ScannedDocument> {
-    let mut documents = Vec::new();
-    scan_project_stream(project, diagnose_addons, |document| {
-        documents.push(document);
-        true
-    });
-    documents.sort_by(|left, right| left.path.cmp(&right.path));
-    documents
 }
 
 pub fn scan_project_stream(
@@ -409,7 +396,12 @@ mod tests {
         .unwrap();
         fs::write(directory.path().join("invalid.gd"), [0xff, 0xfe]).unwrap();
 
-        let normal = scan_project(directory.path(), false);
+        let mut normal = Vec::new();
+        scan_project_stream(directory.path(), false, |document| {
+            normal.push(document);
+            true
+        });
+        normal.sort_by(|left, right| left.path.cmp(&right.path));
         assert_eq!(
             normal
                 .iter()
@@ -417,7 +409,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![directory.path().join("valid.gd")]
         );
-        let with_addons = scan_project(directory.path(), true);
+        let mut with_addons = Vec::new();
+        scan_project_stream(directory.path(), true, |document| {
+            with_addons.push(document);
+            true
+        });
         assert!(with_addons
             .iter()
             .any(|doc| doc.path.ends_with("addons/addon.gd")));

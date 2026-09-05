@@ -387,9 +387,8 @@ pub fn search_with_uris<'a>(
         } else {
             if symbol.name.len() > 256 {
                 continue;
-            } else {
-                best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
             }
+            best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
         }) else {
             continue;
         };

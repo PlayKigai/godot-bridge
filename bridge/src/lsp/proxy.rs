@@ -528,9 +528,8 @@ pub(super) fn forward_initialize(
             let mut response = message;
             response["id"] = original_id;
             patch_initialize_response(&mut response);
-            if let Err(error) = send_client(output, &response) {
-                return Err(error.to_string());
-            }
+            send_client(output, &response)
+                .map_err(|_| "cannot forward Godot notification".to_owned())?;
             if !project_diagnostics && !proxy.workspace_symbols_notice_sent {
                 if let Err(error) = send_info_message(
                     output,
@@ -549,8 +548,7 @@ pub(super) fn forward_initialize(
             };
             proxy.server_requests.insert(id);
         }
-        if send_client(output, &message).is_err() {
-            return Err("cannot forward Godot notification".to_owned());
-        }
+        send_client(output, &message)
+            .map_err(|_| "cannot forward Godot notification".to_owned())?;
     }
 }

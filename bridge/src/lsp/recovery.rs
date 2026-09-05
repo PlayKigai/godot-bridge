@@ -190,14 +190,6 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
             }
             RecoveryItem::Response(message, size) => {
                 queue.bytes = queue.bytes.saturating_sub(size);
-                if message
-                    .get("id")
-                    .and_then(crate::json::value_request_key)
-                    .is_some_and(|id| session.proxy.stale_server_ids.contains(&id))
-                {
-                    crate::debug!("dropping response to stale Godot request");
-                    continue;
-                }
                 message
             }
         };

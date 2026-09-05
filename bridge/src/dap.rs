@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::framing::{
-    connection_without_reader, parse_json_object, spawn_frame_reader_with, write_frame, write_json,
+    connect_with_reader, parse_json_object, spawn_frame_reader, write_frame, write_json,
     Connection, FrameDecoder, FrameError, ReadEvent,
 };
 use crate::root::{cwd_root, find_project_dir};
@@ -197,7 +197,7 @@ impl ServerRequests {
                     .is_none()
                 {
                     self.order.push_back(key);
-                    while self.order.len() > 4096 {
+                    while self.order.len() > crate::SERVER_REQUEST_CAP {
                         if let Some(old) = self.order.pop_front() {
                             self.original_sequences.remove(&old);
                         }
@@ -237,7 +237,7 @@ enum InitializeWait {
 
 pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    let _input_thread = spawn_frame_reader_with(
+    let _input_thread = spawn_frame_reader(
         "godot-bridge-dap-client-reader",
         std::io::stdin(),
         sender.clone(),
@@ -361,7 +361,7 @@ fn prepare(
     } else {
         discover_owner(&files, &project, &settings, cancel)?
     };
-    let connection = connection_without_reader(
+    let connection = connect_with_reader(
         stream,
         "godot-bridge-dap-reader",
         sender,
@@ -596,7 +596,8 @@ fn forward_client_body(
             file,
         );
     }
-    send_to_godot_body(&mut connection.writer, body)
+    send_to_godot_body(&mut connection.writer, body)?;
+    Ok(None)
 }
 
 fn forward_client(

@@ -17,7 +17,7 @@ use crate::docs_state::{
     BULK_DOCUMENTS,
 };
 use crate::framing::{
-    parse_json_object, spawn_frame_reader_with, write_frame, write_json, Connection, FrameDecoder,
+    parse_json_object, spawn_frame_reader, write_frame, write_json, Connection, FrameDecoder,
     ReadEvent,
 };
 use crate::godot_bin::{check_version, resolve_godot};
@@ -74,8 +74,6 @@ struct PendingRequest {
     symbol: Option<(String, u64, i64)>,
 }
 
-const SERVER_REQUEST_CAP: usize = 4096;
-
 #[derive(Default)]
 struct RequestKeys {
     values: HashSet<crate::json::RequestKey>,
@@ -86,7 +84,7 @@ impl RequestKeys {
     fn insert(&mut self, key: crate::json::RequestKey) {
         if self.values.insert(key.clone()) {
             self.order.push_back(key);
-            if self.values.len() > SERVER_REQUEST_CAP {
+            if self.values.len() > crate::SERVER_REQUEST_CAP {
                 if let Some(old) = self.order.pop_front() {
                     if !self.order.iter().any(|key| key == &old) {
                         self.values.remove(&old);
@@ -146,6 +144,47 @@ struct ProxyState {
     rescan_generation: u64,
     rescan_keys: HashSet<PathBuf>,
     rescan_active: bool,
+}
+
+impl ProxyState {
+    fn new(
+        initialize: Value,
+        project: PathBuf,
+        internal_sender: mpsc::SyncSender<ProxyEvent>,
+        bulk_sender: mpsc::SyncSender<InternalEvent>,
+    ) -> Self {
+        Self {
+            documents: DocumentState::new(),
+            pending: HashMap::new(),
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            server_requests: RequestKeys::default(),
+            stale_server_ids: RequestKeys::default(),
+            next_id: 1,
+            initialized_forwarded: false,
+            zed_initialized: false,
+            initialize,
+            project,
+            recovery_times: VecDeque::new(),
+            project_diagnostics_started: false,
+            workspace_symbols_notice_sent: false,
+            internal_sender,
+            bulk_sender,
+            symbol_cache: HashMap::new(),
+            symbol_containers: symbols::ContainerTable::default(),
+            symbol_scheduled: HashMap::new(),
+            bulk_generation: 0,
+            bulk_documents: VecDeque::new(),
+            bulk_batch_uris: HashSet::new(),
+            bulk_complete: false,
+            bulk_active: false,
+            bulk_replay: false,
+            bulk_deadline: None,
+            rescan_generation: 0,
+            rescan_keys: HashSet::new(),
+            rescan_active: false,
+        }
+    }
 }
 
 enum InternalEvent {
@@ -574,7 +613,7 @@ fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> 
 pub fn run() -> Result<ExitCode> {
     let (event_sender, event_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
     let (bulk_sender, bulk_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
-    let _input_thread = spawn_frame_reader_with(
+    let _input_thread = spawn_frame_reader(
         "godot-bridge-lsp-client-reader",
         std::io::stdin(),
         event_sender.clone(),
@@ -628,39 +667,13 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-    let documents = DocumentState::new();
     let internal_sender = event_sender.clone();
-    let mut proxy = ProxyState {
-        documents,
-        pending: HashMap::new(),
-        queued: VecDeque::new(),
-        queued_bytes: 0,
-        server_requests: RequestKeys::default(),
-        stale_server_ids: RequestKeys::default(),
-        next_id: 1,
-        initialized_forwarded: false,
-        zed_initialized: false,
-        initialize: initialize.clone(),
-        project: project.clone(),
-        recovery_times: VecDeque::new(),
-        project_diagnostics_started: false,
-        workspace_symbols_notice_sent: false,
+    let mut proxy = ProxyState::new(
+        initialize.clone(),
+        project.clone(),
         internal_sender,
         bulk_sender,
-        symbol_cache: HashMap::new(),
-        symbol_containers: symbols::ContainerTable::default(),
-        symbol_scheduled: HashMap::new(),
-        bulk_generation: 0,
-        bulk_documents: VecDeque::new(),
-        bulk_batch_uris: HashSet::new(),
-        bulk_complete: false,
-        bulk_active: false,
-        bulk_replay: false,
-        bulk_deadline: None,
-        rescan_generation: 0,
-        rescan_keys: HashSet::new(),
-        rescan_active: false,
-    };
+    );
 
     if let Some(lsp_port) = settings.lsp_port {
         let dap_port = settings.dap_port;
@@ -933,11 +946,7 @@ fn forward_client_body(
             let Some(id) = raw_id.request_key() else {
                 return Ok(());
             };
-            if proxy.server_requests.remove(&id) {
-                send_godot_body(&mut editor.connection.writer, body, false)?;
-            } else if proxy.stale_server_ids.remove(&id) {
-                crate::debug!("dropping response to stale Godot request {id:?}");
-            }
+            route_client_response(&mut editor.connection.writer, proxy, id, body)?;
             return Ok(());
         }
     }
@@ -1015,11 +1024,7 @@ fn forward_client_message(
         let Some(id) = message.get("id").and_then(crate::json::value_request_key) else {
             return Ok(());
         };
-        if proxy.server_requests.remove(&id) {
-            send_godot_body(&mut editor.connection.writer, &body, false)?;
-        } else if proxy.stale_server_ids.remove(&id) {
-            crate::debug!("dropping response to stale Godot request {id:?}");
-        }
+        route_client_response(&mut editor.connection.writer, proxy, id, &body)?;
         return Ok(());
     }
     if method.is_some() && message.get("id").is_some() {
@@ -1068,6 +1073,20 @@ fn forward_client_request<W: Write>(
         return Err(error);
     }
     Ok(is_shutdown.then_some(bridge_id))
+}
+
+fn route_client_response(
+    writer: &mut TcpStream,
+    proxy: &mut ProxyState,
+    id: crate::json::RequestKey,
+    body: &[u8],
+) -> Result<()> {
+    if proxy.server_requests.remove(&id) {
+        send_godot_body(writer, body, false)?;
+    } else if proxy.stale_server_ids.remove(&id) {
+        crate::debug!("dropping response to stale Godot request {id:?}");
+    }
+    Ok(())
 }
 
 fn cancel_request<W: Write>(
@@ -1200,7 +1219,7 @@ fn forward_server_message<W: Write>(
                         &mut proxy.symbol_containers,
                     )
                     .into_iter()
-                    .filter(|(symbol_uri, _)| symbol_uri == &uri)
+                    .filter(|symbol| symbol_uri_matches(symbol, &uri))
                     {
                         proxy
                             .symbol_cache
@@ -1879,6 +1898,10 @@ fn patch_initialize_response(response: &mut Value) {
     }
 }
 
+fn symbol_uri_matches(symbol: &(String, symbols::Symbol), uri: &str) -> bool {
+    symbol.0 == uri
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,7 +1919,7 @@ mod tests {
         keys.insert(key.clone());
         assert!(keys.remove(&key));
         keys.insert(key.clone());
-        for index in 0..SERVER_REQUEST_CAP {
+        for index in 0..crate::SERVER_REQUEST_CAP {
             keys.insert(crate::json::RequestKey::Number(index as i64));
         }
         assert!(keys.contains(&key));
@@ -1906,37 +1929,12 @@ mod tests {
     fn document_uri_is_canonicalized() {
         let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
         let bulk_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
-        let mut proxy = ProxyState {
-            documents: DocumentState::new(),
-            pending: HashMap::new(),
-            queued: VecDeque::new(),
-            queued_bytes: 0,
-            server_requests: RequestKeys::default(),
-            stale_server_ids: RequestKeys::default(),
-            next_id: 1,
-            initialized_forwarded: false,
-            zed_initialized: false,
-            initialize: crate::json!({}),
-            project: PathBuf::from("/tmp"),
-            recovery_times: VecDeque::new(),
-            project_diagnostics_started: false,
-            workspace_symbols_notice_sent: false,
+        let mut proxy = ProxyState::new(
+            crate::json!({}),
+            PathBuf::from("/tmp"),
             internal_sender,
             bulk_sender,
-            symbol_cache: HashMap::new(),
-            symbol_containers: symbols::ContainerTable::default(),
-            symbol_scheduled: HashMap::new(),
-            bulk_generation: 0,
-            bulk_documents: VecDeque::new(),
-            bulk_batch_uris: HashSet::new(),
-            bulk_complete: false,
-            bulk_active: false,
-            bulk_replay: false,
-            bulk_deadline: None,
-            rescan_generation: 0,
-            rescan_keys: HashSet::new(),
-            rescan_active: false,
-        };
+        );
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =
             rewrite_document_messages(&mut proxy, message, "textDocument/didOpen", true).unwrap();
@@ -1960,48 +1958,25 @@ mod tests {
         };
         let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
         let bulk_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
-        let mut proxy = ProxyState {
-            documents: DocumentState::new(),
-            pending: (1..=IN_FLIGHT_CAP as i64)
-                .map(|id| {
-                    (
-                        id,
-                        PendingRequest {
-                            zed_id: crate::json!(id),
-                            internal: false,
-                            symbol: None,
-                        },
-                    )
-                })
-                .collect(),
-            queued: VecDeque::new(),
-            queued_bytes: 0,
-            server_requests: RequestKeys::default(),
-            stale_server_ids: RequestKeys::default(),
-            next_id: IN_FLIGHT_CAP as i64 + 1,
-            initialized_forwarded: false,
-            zed_initialized: false,
-            initialize: crate::json!({}),
-            project: PathBuf::from("/tmp"),
-            recovery_times: VecDeque::new(),
-            project_diagnostics_started: false,
-            workspace_symbols_notice_sent: false,
+        let mut proxy = ProxyState::new(
+            crate::json!({}),
+            PathBuf::from("/tmp"),
             internal_sender,
             bulk_sender,
-            symbol_cache: HashMap::new(),
-            symbol_containers: symbols::ContainerTable::default(),
-            symbol_scheduled: HashMap::new(),
-            bulk_generation: 0,
-            bulk_documents: VecDeque::new(),
-            bulk_batch_uris: HashSet::new(),
-            bulk_complete: false,
-            bulk_active: false,
-            bulk_replay: false,
-            bulk_deadline: None,
-            rescan_generation: 0,
-            rescan_keys: HashSet::new(),
-            rescan_active: false,
-        };
+        );
+        proxy.pending = (1..=IN_FLIGHT_CAP as i64)
+            .map(|id| {
+                (
+                    id,
+                    PendingRequest {
+                        zed_id: crate::json!(id),
+                        internal: false,
+                        symbol: None,
+                    },
+                )
+            })
+            .collect();
+        proxy.next_id = IN_FLIGHT_CAP as i64 + 1;
         let mut output = Vec::new();
         forward_client_request(
             &mut editor,
