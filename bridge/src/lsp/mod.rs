@@ -930,7 +930,9 @@ fn forward_client_body(
     });
     if fields.method.is_none() {
         if let Some(raw_id) = fields.id {
-            let id = raw_id.request_key();
+            let Some(id) = raw_id.request_key() else {
+                return Ok(());
+            };
             if proxy.server_requests.remove(&id) {
                 send_godot_body(&mut editor.connection.writer, body, false)?;
             } else if proxy.stale_server_ids.remove(&id) {
@@ -1010,10 +1012,9 @@ fn forward_client_message(
         if body.len() > GODOT_WRITE_CAP {
             crate::bail!("Zed response is too large for Godot");
         }
-        let id = message
-            .get("id")
-            .map(crate::json::value_request_key)
-            .expect("response has an id");
+        let Some(id) = message.get("id").and_then(crate::json::value_request_key) else {
+            return Ok(());
+        };
         if proxy.server_requests.remove(&id) {
             send_godot_body(&mut editor.connection.writer, &body, false)?;
         } else if proxy.stale_server_ids.remove(&id) {
@@ -1158,9 +1159,10 @@ fn forward_server_message<W: Write>(
             send_client_body(output, body)?;
             return Ok(());
         }
-        if let Some(id) = fields.id {
-            proxy.server_requests.insert(id.request_key());
-        }
+        let Some(id) = fields.id.and_then(|id| id.request_key()) else {
+            return Ok(());
+        };
+        proxy.server_requests.insert(id);
         send_client(output, &message)?;
         return Ok(());
     }
@@ -1172,7 +1174,8 @@ fn forward_server_message<W: Write>(
         if !shutdown_response {
             let stale = fields
                 .id
-                .is_some_and(|id| proxy.stale_server_ids.contains(&id.request_key()));
+                .and_then(|id| id.request_key())
+                .is_some_and(|id| proxy.stale_server_ids.contains(&id));
             if !stale {
                 crate::debug!("dropping unknown Godot response id {id}");
             }
@@ -1214,9 +1217,10 @@ fn forward_server_message<W: Write>(
         response["id"] = pending.zed_id;
         send_client(output, &response)?;
         flush_queued(output, writer, proxy)?;
-    } else if !proxy
-        .stale_server_ids
-        .contains(&fields.id.expect("response has an id").request_key())
+    } else if !fields
+        .id
+        .and_then(|id| id.request_key())
+        .is_some_and(|id| proxy.stale_server_ids.contains(&id))
         && !shutdown_response
     {
         crate::debug!("dropping unknown Godot response id {id}");
@@ -1455,6 +1459,9 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
 }
 
 fn start_project_rescan(proxy: &mut ProxyState, settings: &Settings) {
+    if proxy.rescan_active {
+        return;
+    }
     proxy.rescan_generation += 1;
     let generation = proxy.rescan_generation;
     proxy.rescan_keys.clear();

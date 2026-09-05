@@ -19,7 +19,8 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_IGNORED
     | libc::IN_MOVED_FROM
     | libc::IN_MOVED_TO
-    | libc::IN_MOVE_SELF;
+    | libc::IN_MOVE_SELF
+    | libc::IN_DONT_FOLLOW;
 const EVENT_BUFFER_SIZE: usize = 64 * 1024;
 
 pub struct ProjectWatcher {

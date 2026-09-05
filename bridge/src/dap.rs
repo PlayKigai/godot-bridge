@@ -214,11 +214,10 @@ impl ServerRequests {
         let Some(request_seq) = message.get("request_seq") else {
             return;
         };
-        if let Some(original) = self
-            .original_sequences
-            .remove(&crate::json::value_request_key(request_seq))
-        {
-            message["request_seq"] = original;
+        if let Some(key) = crate::json::value_request_key(request_seq) {
+            if let Some(original) = self.original_sequences.remove(&key) {
+                message["request_seq"] = original;
+            }
         }
     }
 }

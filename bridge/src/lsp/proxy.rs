@@ -545,13 +545,12 @@ pub(super) fn forward_initialize(
             return Ok(());
         }
         if message.get("method").is_some() && message.get("id").is_some() {
-            if let Some(id) = fields.id {
-                proxy.server_requests.insert(id.request_key());
-            }
-            if send_client(output, &message).is_err() {
-                return Err("cannot forward Godot request".to_owned());
-            }
-        } else if send_client(output, &message).is_err() {
+            let Some(id) = fields.id.and_then(|id| id.request_key()) else {
+                continue;
+            };
+            proxy.server_requests.insert(id);
+        }
+        if send_client(output, &message).is_err() {
             return Err("cannot forward Godot notification".to_owned());
         }
     }

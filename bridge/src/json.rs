@@ -415,14 +415,20 @@ impl RawJson<'_> {
         String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8")
     }
 
-    pub(crate) fn request_key(self) -> RequestKey {
+    pub(crate) fn request_key(self) -> Option<RequestKey> {
         if self.0.first() == Some(&b'"') {
             if let Ok(Value::String(value)) = from_slice(self.0) {
-                return RequestKey::String(value);
+                if value.len() > 256 {
+                    crate::warn!("dropping request id longer than 256 bytes");
+                    return None;
+                }
+                return Some(RequestKey::String(value));
             }
         }
-        self.as_i64()
-            .map_or_else(|| RequestKey::Lexical(self.lexical()), RequestKey::Number)
+        Some(
+            self.as_i64()
+                .map_or_else(|| RequestKey::Lexical(self.lexical()), RequestKey::Number),
+        )
     }
 
     pub(crate) fn string_eq(self, expected: &str) -> bool {
@@ -445,14 +451,21 @@ impl RawJson<'_> {
     }
 }
 
-pub(crate) fn value_request_key(value: &Value) -> RequestKey {
+pub(crate) fn value_request_key(value: &Value) -> Option<RequestKey> {
     match value {
-        Value::String(value) => RequestKey::String(value.clone()),
-        Value::Number(number) => number.as_i64().map_or_else(
+        Value::String(value) => {
+            if value.len() > 256 {
+                crate::warn!("dropping request id longer than 256 bytes");
+                None
+            } else {
+                Some(RequestKey::String(value.clone()))
+            }
+        }
+        Value::Number(number) => Some(number.as_i64().map_or_else(
             || RequestKey::Lexical(number.to_string()),
             RequestKey::Number,
-        ),
-        _ => RequestKey::Lexical(to_string(value)),
+        )),
+        _ => Some(RequestKey::Lexical(to_string(value))),
     }
 }
 
@@ -1309,7 +1322,8 @@ break"}"#,
                 .unwrap()
                 .id
                 .unwrap()
-                .request_key(),
+                .request_key()
+                .unwrap(),
             RequestKey::Number(1)
         );
         assert_eq!(
@@ -1317,7 +1331,8 @@ break"}"#,
                 .unwrap()
                 .id
                 .unwrap()
-                .request_key(),
+                .request_key()
+                .unwrap(),
             RequestKey::String("1".to_owned())
         );
         assert_eq!(
@@ -1325,7 +1340,8 @@ break"}"#,
                 .unwrap()
                 .id
                 .unwrap()
-                .request_key(),
+                .request_key()
+                .unwrap(),
             RequestKey::Lexical("1.0".to_owned())
         );
         assert_eq!(
@@ -1333,7 +1349,8 @@ break"}"#,
                 .unwrap()
                 .id
                 .unwrap()
-                .request_key(),
+                .request_key()
+                .unwrap(),
             RequestKey::Lexical("18446744073709551615".to_owned())
         );
     }
@@ -1344,8 +1361,9 @@ break"}"#,
             .unwrap()
             .id
             .unwrap()
-            .request_key();
-        let parsed = value_request_key(&from_str(r#""a/b""#).unwrap());
+            .request_key()
+            .unwrap();
+        let parsed = value_request_key(&from_str(r#""a/b""#).unwrap()).unwrap();
         assert_eq!(wire, parsed);
     }
 
@@ -1355,14 +1373,35 @@ break"}"#,
             .unwrap()
             .id
             .unwrap()
-            .request_key();
+            .request_key()
+            .unwrap();
         let string = scan_top_level(br#"{"id":"1.0"}"#)
             .unwrap()
             .id
             .unwrap()
-            .request_key();
+            .request_key()
+            .unwrap();
         assert_ne!(number, string);
-        assert_eq!(value_request_key(&from_str(r#"1.0"#).unwrap()), number);
-        assert_eq!(value_request_key(&from_str(r#""1.0""#).unwrap()), string);
+        assert_eq!(
+            value_request_key(&from_str(r#"1.0"#).unwrap()).unwrap(),
+            number
+        );
+        assert_eq!(
+            value_request_key(&from_str(r#""1.0""#).unwrap()).unwrap(),
+            string
+        );
+    }
+
+    #[test]
+    fn request_keys_reject_oversized_string_ids() {
+        let value = Value::String("x".repeat(257));
+        assert!(value_request_key(&value).is_none());
+        let wire = format!(r#"{{"id":"{}"}}"#, "x".repeat(257));
+        assert!(scan_top_level(wire.as_bytes())
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key()
+            .is_none());
     }
 }
