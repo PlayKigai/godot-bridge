@@ -6,7 +6,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,7 +29,7 @@ pub struct GodotChild {
     pub start_ticks: u64,
     pub child: Child,
     pub tail: Arc<Mutex<VecDeque<String>>>,
-    output_thread: Option<JoinHandle<()>>,
+    output_threads: Vec<JoinHandle<()>>,
 }
 
 impl GodotChild {
@@ -44,7 +43,7 @@ impl GodotChild {
     }
 
     pub fn wait_output(&mut self) {
-        if let Some(thread) = self.output_thread.take() {
+        for thread in self.output_threads.drain(..) {
             let _ = thread.join();
         }
     }
@@ -118,7 +117,7 @@ pub fn spawn_godot(
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LIMIT)));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let output_thread = spawn_output_task(
+    let output_threads = spawn_output_task(
         stdout,
         stderr,
         log_path.as_ref().to_owned(),
@@ -131,7 +130,7 @@ pub fn spawn_godot(
         start_ticks,
         child,
         tail,
-        output_thread,
+        output_threads,
     })
 }
 
@@ -322,43 +321,32 @@ fn spawn_output_task(
     stderr: Option<std::process::ChildStderr>,
     log_path: PathBuf,
     tail: Arc<Mutex<VecDeque<String>>>,
-) -> Option<JoinHandle<()>> {
-    thread::Builder::new()
-        .name("godot-bridge-output".to_owned())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let mut writer = match LogWriter::open(log_path) {
-                Ok(writer) => writer,
-                Err(error) => {
-                    crate::warn!("cannot open Godot log: {error}");
-                    LogWriter::disabled()
-                }
-            };
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let mut readers = Vec::new();
-            if let Some(stream) = stdout {
-                readers.push(spawn_output_reader(stream, 0, sender.clone()));
-            }
-            if let Some(stream) = stderr {
-                readers.push(spawn_output_reader(stream, 1, sender));
-            }
-            copy_output(receiver, &mut writer, tail, readers.len());
-            for reader in readers {
-                let _ = reader.join();
-            }
-        })
-        .ok()
-}
-
-enum OutputEvent {
-    Bytes(usize, Vec<u8>),
-    End,
+) -> Vec<JoinHandle<()>> {
+    let writer = Arc::new(Mutex::new(match LogWriter::open(log_path) {
+        Ok(writer) => writer,
+        Err(error) => {
+            crate::warn!("cannot open Godot log: {error}");
+            LogWriter::disabled()
+        }
+    }));
+    let mut readers = Vec::new();
+    if let Some(stream) = stdout {
+        readers.push(spawn_output_reader(
+            stream,
+            Arc::clone(&writer),
+            Arc::clone(&tail),
+        ));
+    }
+    if let Some(stream) = stderr {
+        readers.push(spawn_output_reader(stream, writer, tail));
+    }
+    readers
 }
 
 fn spawn_output_reader<R: Read + Send + 'static>(
     stream: R,
-    index: usize,
-    sender: SyncSender<OutputEvent>,
+    writer: Arc<Mutex<LogWriter>>,
+    tail: Arc<Mutex<VecDeque<String>>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("godot-bridge-output-reader".to_owned())
@@ -366,66 +354,38 @@ fn spawn_output_reader<R: Read + Send + 'static>(
         .spawn(move || {
             let mut reader = stream;
             let mut bytes = [0u8; 8192];
+            let mut line = Vec::new();
             loop {
                 match reader.read(&mut bytes) {
-                    Ok(0) => {
-                        let _ = sender.send(OutputEvent::End);
-                        return;
-                    }
+                    Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if sender
-                            .send(OutputEvent::Bytes(index, bytes[..count].to_vec()))
-                            .is_err()
+                        if let Err(error) = writer
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .write(&bytes[..count])
                         {
-                            return;
+                            crate::warn!("cannot write Godot log: {error}");
+                            writer
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .disable();
+                        }
+                        for &byte in &bytes[..count] {
+                            if byte == b'\n' {
+                                append_tail(&tail, &line);
+                                line.clear();
+                            } else if line.len() < TAIL_LINE_LIMIT {
+                                line.push(byte);
+                            }
                         }
                     }
-                    Err(_) => {
-                        let _ = sender.send(OutputEvent::End);
-                        return;
-                    }
                 }
+            }
+            if !line.is_empty() {
+                append_tail(&tail, &line);
             }
         })
         .expect("output reader thread should spawn")
-}
-
-fn copy_output(
-    receiver: Receiver<OutputEvent>,
-    writer: &mut LogWriter,
-    tail: Arc<Mutex<VecDeque<String>>>,
-    reader_count: usize,
-) {
-    let mut lines = [Vec::new(), Vec::new()];
-    let mut ended = 0;
-    while ended < reader_count {
-        let event = match receiver.recv() {
-            Ok(event) => event,
-            Err(_) => break,
-        };
-        match event {
-            OutputEvent::End => ended += 1,
-            OutputEvent::Bytes(index, bytes) => {
-                if let Err(error) = writer.write(&bytes) {
-                    crate::warn!("cannot write Godot log: {error}");
-                    writer.disable();
-                }
-                for byte in bytes {
-                    if byte == b'\n' {
-                        append_tail(&tail, &lines[index]);
-                        lines[index].clear();
-                    } else if lines[index].len() < TAIL_LINE_LIMIT {
-                        lines[index].push(byte);
-                    }
-                }
-            }
-        }
-    }
-    for line in lines {
-        if !line.is_empty() {
-            append_tail(&tail, &line);
-        }
-    }
 }
 
 const TAIL_LINE_LIMIT: usize = 16 * 1024;
