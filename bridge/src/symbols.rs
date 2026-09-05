@@ -16,6 +16,7 @@ struct Match<'a> {
     gap: usize,
     offset: usize,
     indices: Vec<usize>,
+    range_start: (u64, u64),
 }
 
 pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
@@ -109,6 +110,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
                 gap: matched.0,
                 offset: matched.1,
                 indices: matched.2,
+                range_start: range_start(&symbol.range),
             })
         })
         .collect::<Vec<_>>();
@@ -118,7 +120,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
             .then(left.offset.cmp(&right.offset))
             .then(left.symbol.name.cmp(&right.symbol.name))
             .then(left.symbol.uri.cmp(&right.symbol.uri))
-            .then(range_start(&left.symbol.range).cmp(&range_start(&right.symbol.range)))
+            .then(left.range_start.cmp(&right.range_start))
             .then(left.indices.cmp(&right.indices))
     });
     matches
@@ -270,6 +272,28 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_search_benchmark_matches_reference() {
+        let items = (0..32_000)
+            .map(|index| symbol(&format!("symbol_{index:05}_ready"), "file:///a", index))
+            .collect::<Vec<_>>();
+        for query in ["ready", "", "zzz"] {
+            let start = std::time::Instant::now();
+            let actual = search(&items, query);
+            let elapsed = start.elapsed();
+            match query {
+                "ready" => assert_eq!(actual.len(), 200),
+                "" => {
+                    assert_eq!(actual.len(), 200);
+                    assert_eq!(actual[0].name, "symbol_00000_ready");
+                }
+                "zzz" => assert!(actual.is_empty()),
+                _ => unreachable!(),
+            }
+            println!("search {query:?}: {elapsed:?}");
+        }
+    }
+
+    #[test]
     fn flattens_nested_document_symbols() {
         let result = crate::json!([{"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[{"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}}]}]);
         let flattened = flatten(&result, "file:///tmp/main.gd");
@@ -278,4 +302,5 @@ mod tests {
         assert_eq!(flattened[1].container, "Root");
         assert_eq!(flattened[0].range["start"]["line"], 1);
     }
+
 }
