@@ -188,7 +188,7 @@ pub fn find_project_dir(
     }
 }
 
-pub fn path_to_uri(path: &Path) -> String {
+pub fn canonical_path_to_uri(path: &Path) -> String {
     crate::file_uri::path_to_uri(&canonical_or_normalized(path))
 }
 
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn encodes_and_decodes_spaces() {
         let path = PathBuf::from("/tmp/a space/project.godot");
-        let uri = path_to_uri(&path);
+        let uri = canonical_path_to_uri(&path);
         assert!(uri.contains("a%20space"));
         assert_eq!(uri_to_path(&uri).unwrap(), path);
     }

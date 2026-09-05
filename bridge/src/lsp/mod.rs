@@ -74,6 +74,13 @@ struct PendingRequest {
     symbol: Option<(String, u64, i64)>,
 }
 
+struct ScheduledSymbol {
+    generation: u64,
+    version: i64,
+    deadline: Instant,
+    bridge_owned: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct RequestKeys {
     values: HashSet<crate::json::RequestKey>,
@@ -139,7 +146,7 @@ struct ProxyState {
     bulk_sender: mpsc::SyncSender<InternalEvent>,
     symbol_cache: HashMap<String, Vec<Symbol>>,
     symbol_containers: symbols::ContainerTable,
-    symbol_scheduled: HashMap<String, (u64, i64, Instant, bool)>,
+    symbol_scheduled: HashMap<String, ScheduledSymbol>,
     bulk_generation: u64,
     bulk_documents: VecDeque<docs_state::ScannedDocument>,
     bulk_batch_uris: HashSet<String>,
@@ -254,7 +261,7 @@ enum RecoveryItem {
 
 const MERGED_EVENT_CAP: usize = 64;
 
-enum ProxyEvent {
+pub(crate) enum ProxyEvent {
     Client(ReadEvent),
     Godot(ReadEvent),
     Watcher(std::io::Result<WatcherChange>),
@@ -493,7 +500,8 @@ fn gui_process_is_alive(runtime: &Runtime) -> bool {
 
 fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
     let _dap_lock = dap_lock;
-    start_recovery(session)?;
+    reset_for_recovery(session)?;
+    fail_in_flight(session)?;
     let mut recovery_queue = RecoveryQueue::default();
     let old_lsp_port = session.editor.lsp_port;
     let old_dap_port = session.editor.dap_port;
@@ -1252,7 +1260,7 @@ fn forward_server_message<W: Write>(
                         &mut proxy.symbol_containers,
                     )
                     .into_iter()
-                    .filter(|symbol| symbol_uri_matches(symbol, &uri))
+                    .filter(|(symbol_uri, _)| symbol_uri == &uri)
                     {
                         proxy
                             .symbol_cache
@@ -1339,16 +1347,13 @@ fn rewrite_document_messages(
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if text.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didOpen for Godot {uri}");
+            if !check_document_size(&uri, "didOpen", text.len()) {
                 return Ok(Vec::new());
             }
-            let planned = planned_zed_open(&proxy.documents, &uri, text);
-            let body = crate::json::to_vec(&document_action_message(&planned));
-            if body.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didOpen for Godot {uri}");
+            let planned = proxy.documents.plan_zed_open(&uri, text);
+            let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
-            }
+            };
             let action_text = match planned {
                 DocumentAction::Open { text, .. } | DocumentAction::Change { text, .. } => text,
             };
@@ -1368,23 +1373,19 @@ fn rewrite_document_messages(
                 .and_then(|changes| changes.first().and_then(|change| change.get("text")))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if text.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didChange for Godot {uri}");
+            if !check_document_size(&uri, "didChange", text.len()) {
                 return Ok(Vec::new());
             }
-            let Some(planned) = planned_zed_change(&proxy.documents, &uri, text) else {
+            let Some(planned) = proxy.documents.plan_zed_change(&uri, text) else {
                 let body = crate::json::to_vec(&message);
-                if body.len() > GODOT_WRITE_CAP {
-                    crate::warn!("skipping oversized didChange for Godot {uri}");
+                if !check_document_size(&uri, "didChange", body.len()) {
                     return Ok(Vec::new());
                 }
                 return Ok(vec![body]);
             };
-            let body = crate::json::to_vec(&document_action_message(&planned));
-            if body.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didChange for Godot {uri}");
+            let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
-            }
+            };
             let action_text = match planned {
                 DocumentAction::Change { text, .. } => text,
                 DocumentAction::Open { .. } => unreachable!(),
@@ -1420,31 +1421,22 @@ fn rewrite_document_messages(
     Ok(vec![crate::json::to_vec(&message)])
 }
 
-fn planned_zed_open(documents: &DocumentState, uri: &str, text: &str) -> DocumentAction {
-    let key = documents.key_for_uri(uri);
-    if let Some(doc) = documents.open_docs.get(&key) {
-        DocumentAction::Change {
-            uri: doc.uri.clone(),
-            version: doc.version + 1,
-            text: text.to_owned(),
-        }
+fn check_document_size(uri: &str, method: &str, size: usize) -> bool {
+    if size > GODOT_WRITE_CAP {
+        crate::warn!("skipping oversized {method} for Godot {uri}");
+        false
     } else {
-        DocumentAction::Open {
-            uri: crate::file_uri::path_to_uri(&key),
-            version: 1,
-            text: text.to_owned(),
-        }
+        true
     }
 }
 
-fn planned_zed_change(documents: &DocumentState, uri: &str, text: &str) -> Option<DocumentAction> {
-    let key = documents.key_for_uri(uri);
-    let doc = documents.open_docs.get(&key)?;
-    Some(DocumentAction::Change {
-        uri: doc.uri.clone(),
-        version: doc.version + 1,
-        text: text.to_owned(),
-    })
+fn encode_document_action(action: &DocumentAction, uri: &str) -> Option<Vec<u8>> {
+    let body = crate::json::to_vec(&document_action_message(action));
+    let method = match action {
+        DocumentAction::Open { .. } => "didOpen",
+        DocumentAction::Change { .. } => "didChange",
+    };
+    check_document_size(uri, method, body.len()).then_some(body)
 }
 
 fn document_action_message(action: &DocumentAction) -> Value {
@@ -1494,20 +1486,18 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
     let project = proxy.project.clone();
     let diagnose_addons = settings.diagnose_addons;
     let sender = proxy.bulk_sender.clone();
-    let _ = thread::Builder::new()
-        .name("godot-bridge-project-scan".to_owned())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            docs_state::scan_project_stream(&project, diagnose_addons, |document| {
-                sender
-                    .send(InternalEvent::Bulk {
-                        generation,
-                        document,
-                    })
-                    .is_ok()
-            });
-            let _ = sender.send(InternalEvent::BulkComplete { generation });
-        });
+    start_project_scan(
+        project,
+        diagnose_addons,
+        sender,
+        generation,
+        "godot-bridge-project-scan",
+        |generation, document| InternalEvent::Bulk {
+            generation,
+            document,
+        },
+        |generation| InternalEvent::BulkComplete { generation },
+    );
 }
 
 fn start_project_rescan(proxy: &mut ProxyState, settings: &Settings) {
@@ -1521,19 +1511,37 @@ fn start_project_rescan(proxy: &mut ProxyState, settings: &Settings) {
     let project = proxy.project.clone();
     let diagnose_addons = settings.diagnose_addons;
     let sender = proxy.bulk_sender.clone();
+    start_project_scan(
+        project,
+        diagnose_addons,
+        sender,
+        generation,
+        "godot-bridge-project-rescan",
+        |generation, document| InternalEvent::Rescan {
+            generation,
+            document,
+        },
+        |generation| InternalEvent::RescanComplete { generation },
+    );
+}
+
+fn start_project_scan(
+    project: PathBuf,
+    diagnose_addons: bool,
+    sender: mpsc::SyncSender<InternalEvent>,
+    generation: u64,
+    name: &str,
+    document_event: fn(u64, docs_state::ScannedDocument) -> InternalEvent,
+    complete_event: fn(u64) -> InternalEvent,
+) {
     let _ = thread::Builder::new()
-        .name("godot-bridge-project-rescan".to_owned())
+        .name(name.to_owned())
         .stack_size(256 * 1024)
         .spawn(move || {
             docs_state::scan_project_stream(&project, diagnose_addons, |document| {
-                sender
-                    .send(InternalEvent::Rescan {
-                        generation,
-                        document,
-                    })
-                    .is_ok()
+                sender.send(document_event(generation, document)).is_ok()
             });
-            let _ = sender.send(InternalEvent::RescanComplete { generation });
+            let _ = sender.send(complete_event(generation));
         });
 }
 
@@ -1637,7 +1645,7 @@ fn process_watcher_changes(
         changes.retain(|change| change.kind != WatcherChangeKind::Rescan);
     }
     for change in changes {
-        let path = docs_state::normalize_path(&change.path);
+        let path = crate::root::normalize_absolute(&change.path);
         match change.kind {
             WatcherChangeKind::Created | WatcherChangeKind::Modified => {
                 if !docs_state::eligible_path(&proxy.project, &path, settings.diagnose_addons)
@@ -1656,10 +1664,10 @@ fn process_watcher_changes(
                     continue;
                 };
                 proxy.documents.register_watcher_path(&path, key.clone());
-                let action = match owner {
-                    Some(DocumentOwner::Zed) => None,
-                    Some(DocumentOwner::Bridge) => proxy.documents.bridge_change_path(&path, text),
-                    None => proxy.documents.bridge_open_path(&path, text),
+                let action = if owner == Some(DocumentOwner::Bridge) {
+                    proxy.documents.bridge_change_path(&path, text)
+                } else {
+                    proxy.documents.bridge_open_path(&path, text)
                 };
                 if let Some(action) = action.as_ref() {
                     schedule_document_action(proxy, action);
@@ -1818,12 +1826,12 @@ fn schedule_symbols(proxy: &mut ProxyState, uri: &str, generation: u64, version:
         proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge);
     proxy.symbol_scheduled.insert(
         uri.to_owned(),
-        (
+        ScheduledSymbol {
             generation,
             version,
-            Instant::now() + Duration::from_millis(300),
+            deadline: Instant::now() + Duration::from_millis(300),
             bridge_owned,
-        ),
+        },
     );
 }
 
@@ -1868,8 +1876,8 @@ fn next_symbol_deadline(proxy: &ProxyState) -> Option<Instant> {
     proxy
         .symbol_scheduled
         .iter()
-        .filter(|(_, (_, _, _, bridge_owned))| !(proxy.bulk_active && *bridge_owned))
-        .map(|(_, (_, _, deadline, _))| *deadline)
+        .filter(|(_, scheduled)| !(proxy.bulk_active && scheduled.bridge_owned))
+        .map(|(_, scheduled)| scheduled.deadline)
         .min()
 }
 
@@ -1888,10 +1896,10 @@ fn send_due_symbol_requests(
     let due = proxy
         .symbol_scheduled
         .iter()
-        .filter(|(_, (_, _, deadline, bridge_owned))| {
-            *deadline <= now && !(proxy.bulk_active && *bridge_owned)
+        .filter(|(_, scheduled)| {
+            scheduled.deadline <= now && !(proxy.bulk_active && scheduled.bridge_owned)
         })
-        .map(|(uri, (generation, version, _, _))| (uri.clone(), *generation, *version))
+        .map(|(uri, scheduled)| (uri.clone(), scheduled.generation, scheduled.version))
         .take(available)
         .collect::<Vec<_>>();
     for (uri, generation, version) in due {
@@ -1929,10 +1937,6 @@ fn patch_initialize_response(response: &mut Value) {
     {
         result.insert("workspaceSymbolProvider".to_owned(), Value::Bool(true));
     }
-}
-
-fn symbol_uri_matches(symbol: &(String, symbols::Symbol), uri: &str) -> bool {
-    symbol.0 == uri
 }
 
 #[cfg(test)]

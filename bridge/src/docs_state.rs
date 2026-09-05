@@ -1,12 +1,10 @@
 use crate::file_uri::path_to_uri;
-use crate::root::{canonical_or_normalized, doc_key};
+use crate::root::{canonical_or_normalized, doc_key, normalize_absolute};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
-
-pub use crate::root::normalize_absolute as normalize_path;
 
 pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 pub const BULK_DOCUMENTS: usize = 100;
@@ -62,44 +60,58 @@ impl DocumentState {
         let key = self.key_for_uri(incoming_uri);
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
         self.register_watcher_path(&key, key.clone());
-        if let Some(doc) = self.open_docs.get_mut(&key) {
-            doc.text = Some(text.clone());
-            doc.version += 1;
-            doc.owner = DocumentOwner::Zed;
-            return DocumentAction::Change {
-                uri: doc.uri.clone(),
-                version: doc.version,
-                text,
-            };
+        let action = self.plan_zed_open_key(&key, &text);
+        match action {
+            DocumentAction::Change { uri, version, .. } => {
+                let doc = self
+                    .open_docs
+                    .get_mut(&key)
+                    .expect("planned document exists");
+                doc.text = Some(text.clone());
+                doc.version = version;
+                doc.owner = DocumentOwner::Zed;
+                DocumentAction::Change { uri, version, text }
+            }
+            DocumentAction::Open { uri, version, .. } => {
+                let generation = self.next_generation();
+                self.open_docs.insert(
+                    key.clone(),
+                    OpenDoc {
+                        uri: uri.clone(),
+                        version,
+                        generation,
+                        text: Some(text.clone()),
+                        text_hash: 0,
+                        owner: DocumentOwner::Zed,
+                    },
+                );
+                self.uri_keys.insert(uri.clone(), key.clone());
+                DocumentAction::Open { uri, version, text }
+            }
         }
-
-        let uri = path_to_uri(&key);
-        let generation = self.next_generation();
-        let version = 1;
-        self.open_docs.insert(
-            key.clone(),
-            OpenDoc {
-                uri: uri.clone(),
-                version,
-                generation,
-                text: Some(text.clone()),
-                text_hash: 0,
-                owner: DocumentOwner::Zed,
-            },
-        );
-        self.uri_keys.insert(uri.clone(), key.clone());
-        DocumentAction::Open { uri, version, text }
     }
 
     pub fn zed_change(&mut self, incoming_uri: &str, text: String) -> Option<DocumentAction> {
         let key = self.key_for_uri(incoming_uri);
+        let action = self.plan_zed_change_key(&key, &text)?;
+        let DocumentAction::Change { uri, version, .. } = action else {
+            unreachable!();
+        };
         let doc = self.open_docs.get_mut(&key)?;
         doc.text = Some(text.clone());
-        doc.version += 1;
+        doc.version = version;
         doc.owner = DocumentOwner::Zed;
-        let uri = doc.uri.clone();
-        let version = doc.version;
         Some(DocumentAction::Change { uri, version, text })
+    }
+
+    pub(crate) fn plan_zed_open(&self, incoming_uri: &str, text: &str) -> DocumentAction {
+        let key = self.key_for_uri(incoming_uri);
+        self.plan_zed_open_key(&key, text)
+    }
+
+    pub(crate) fn plan_zed_change(&self, incoming_uri: &str, text: &str) -> Option<DocumentAction> {
+        let key = self.key_for_uri(incoming_uri);
+        self.plan_zed_change_key(&key, text)
     }
 
     pub fn zed_close(&mut self, incoming_uri: &str) -> Option<(PathBuf, String)> {
@@ -130,7 +142,7 @@ impl DocumentState {
                 version,
                 generation,
                 text: None,
-                text_hash: text_hash(&text),
+                text_hash: crate::fnv::hash(text.as_bytes()),
                 owner: DocumentOwner::Bridge,
             },
         );
@@ -141,7 +153,7 @@ impl DocumentState {
     pub fn bridge_change_path(&mut self, path: &Path, text: String) -> Option<DocumentAction> {
         let key = canonical_or_normalized(path);
         self.register_watcher_path(path, key.clone());
-        let hash = text_hash(&text);
+        let hash = crate::fnv::hash(text.as_bytes());
         let doc = self.open_docs.get_mut(&key)?;
         if doc.owner != DocumentOwner::Bridge || doc.text_hash == hash {
             return None;
@@ -172,7 +184,7 @@ impl DocumentState {
     }
 
     pub fn register_watcher_path(&mut self, path: &Path, key: PathBuf) {
-        let path = normalize_path(path);
+        let path = normalize_absolute(path);
         if path == key {
             self.watcher_keys.remove(&path);
         } else {
@@ -181,7 +193,7 @@ impl DocumentState {
     }
 
     pub fn watcher_key(&self, path: &Path) -> Option<PathBuf> {
-        let path = normalize_path(path);
+        let path = normalize_absolute(path);
         self.open_docs
             .contains_key(&path)
             .then_some(path.clone())
@@ -212,6 +224,31 @@ impl DocumentState {
     fn next_generation(&mut self) -> u64 {
         self.generation += 1;
         self.generation
+    }
+
+    fn plan_zed_open_key(&self, key: &Path, text: &str) -> DocumentAction {
+        if let Some(doc) = self.open_docs.get(key) {
+            DocumentAction::Change {
+                uri: doc.uri.clone(),
+                version: doc.version + 1,
+                text: text.to_owned(),
+            }
+        } else {
+            DocumentAction::Open {
+                uri: path_to_uri(key),
+                version: 1,
+                text: text.to_owned(),
+            }
+        }
+    }
+
+    fn plan_zed_change_key(&self, key: &Path, text: &str) -> Option<DocumentAction> {
+        let doc = self.open_docs.get(key)?;
+        Some(DocumentAction::Change {
+            uri: doc.uri.clone(),
+            version: doc.version + 1,
+            text: text.to_owned(),
+        })
     }
 }
 
@@ -284,15 +321,6 @@ pub fn scan_project_stream(
             }
         }
     }
-}
-
-fn text_hash(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
 }
 
 pub fn read_document(path: &Path) -> Option<String> {

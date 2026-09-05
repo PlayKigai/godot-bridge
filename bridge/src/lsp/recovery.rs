@@ -1,12 +1,6 @@
 use super::*;
 
-pub(super) fn start_recovery(session: &mut Session) -> Result<()> {
-    reset_for_recovery(session)?;
-    fail_in_flight(session)?;
-    Ok(())
-}
-
-fn reset_for_recovery(session: &mut Session) -> Result<()> {
+pub(super) fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.symbol_cache.clear();
     session.proxy.symbol_containers.clear();
     session.proxy.symbol_scheduled.clear();
@@ -25,7 +19,7 @@ fn reset_for_recovery(session: &mut Session) -> Result<()> {
     set_recovering(&session.runtime)
 }
 
-fn fail_in_flight(session: &mut Session) -> Result<()> {
+pub(super) fn fail_in_flight(session: &mut Session) -> Result<()> {
     for pending in session.proxy.pending.drain().map(|(_, pending)| pending) {
         if !pending.internal {
             send_error(
@@ -184,11 +178,9 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
     set_ready(&session.runtime, &session.editor)?;
     while let Some(item) = queue.items.pop_front() {
         let message = match item {
-            RecoveryItem::Request(message, size) | RecoveryItem::Notification(message, size) => {
-                queue.bytes = queue.bytes.saturating_sub(size);
-                message
-            }
-            RecoveryItem::Response(message, size) => {
+            RecoveryItem::Request(message, size)
+            | RecoveryItem::Notification(message, size)
+            | RecoveryItem::Response(message, size) => {
                 queue.bytes = queue.bytes.saturating_sub(size);
                 message
             }

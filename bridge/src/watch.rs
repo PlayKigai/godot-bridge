@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::sync::mpsc::SyncSender;
 
 use crate::docs_state::{directory_is_skipped, WatcherChange, WatcherChangeKind};
+use crate::lsp::ProxyEvent;
 use crate::root::canonical_or_normalized;
 
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
@@ -36,16 +37,11 @@ struct WatcherState {
     watch_limit_reached: bool,
 }
 
-pub(crate) fn watch_project_into<T, F>(
+pub(crate) fn watch_project_into(
     project: &Path,
     diagnose_addons: bool,
-    sender: SyncSender<T>,
-    map: F,
-) -> io::Result<ProjectWatcher>
-where
-    T: Send + 'static,
-    F: Fn(io::Result<WatcherChange>) -> T + Send + 'static,
-{
+    sender: SyncSender<ProxyEvent>,
+) -> io::Result<ProjectWatcher> {
     let project = canonical_or_normalized(project);
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if fd == -1 {
@@ -77,7 +73,7 @@ where
     let thread = match thread::Builder::new()
         .name("godot-bridge-watch".to_owned())
         .stack_size(256 * 1024)
-        .spawn(move || watch_events(state, stop_pipe[0], sender, map))
+        .spawn(move || watch_events(state, stop_pipe[0], sender))
     {
         Ok(thread) => thread,
         Err(error) => {
@@ -162,11 +158,7 @@ impl WatcherState {
         Ok(true)
     }
 
-    fn read_events<T, F>(&mut self, sender: &SyncSender<T>, map: &F) -> io::Result<bool>
-    where
-        T: Send + 'static,
-        F: Fn(io::Result<WatcherChange>) -> T,
-    {
+    fn read_events(&mut self, sender: &SyncSender<ProxyEvent>) -> io::Result<bool> {
         let mut buffer = [0u8; EVENT_BUFFER_SIZE];
         let size = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if size == -1 {
@@ -205,7 +197,6 @@ impl WatcherState {
                 &event,
                 &bytes[offset + header_size..offset + event_size],
                 sender,
-                map,
             ) {
                 return Ok(false);
             }
@@ -214,20 +205,15 @@ impl WatcherState {
         Ok(true)
     }
 
-    fn emit_event<T, F>(
+    fn emit_event(
         &mut self,
         event: &libc::inotify_event,
         name_bytes: &[u8],
-        sender: &SyncSender<T>,
-        map: &F,
-    ) -> bool
-    where
-        T: Send + 'static,
-        F: Fn(io::Result<WatcherChange>) -> T,
-    {
+        sender: &SyncSender<ProxyEvent>,
+    ) -> bool {
         if event.mask & libc::IN_Q_OVERFLOW != 0 {
             return sender
-                .send(map(Ok(WatcherChange {
+                .send(ProxyEvent::Watcher(Ok(WatcherChange {
                     kind: WatcherChangeKind::Rescan,
                     path: self.project.clone(),
                 })))
@@ -254,7 +240,7 @@ impl WatcherState {
         if event.mask & libc::IN_DELETE_SELF != 0 {
             self.watch_paths.remove(&event.wd);
             return sender
-                .send(map(Ok(WatcherChange {
+                .send(ProxyEvent::Watcher(Ok(WatcherChange {
                     kind: WatcherChangeKind::Removed,
                     path,
                 })))
@@ -283,15 +269,13 @@ impl WatcherState {
         } else {
             return true;
         };
-        sender.send(map(Ok(WatcherChange { kind, path }))).is_ok()
+        sender
+            .send(ProxyEvent::Watcher(Ok(WatcherChange { kind, path })))
+            .is_ok()
     }
 }
 
-fn watch_events<T, F>(mut state: WatcherState, stop_read: RawFd, sender: SyncSender<T>, map: F)
-where
-    T: Send + 'static,
-    F: Fn(io::Result<WatcherChange>) -> T,
-{
+fn watch_events(mut state: WatcherState, stop_read: RawFd, sender: SyncSender<ProxyEvent>) {
     loop {
         let mut pollfds = [
             libc::pollfd {
@@ -310,21 +294,23 @@ where
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            let _ = sender.send(map(Err(io::Error::last_os_error())));
+            let _ = sender.send(ProxyEvent::Watcher(Err(io::Error::last_os_error())));
             break;
         }
         if pollfds[1].revents != 0 {
             break;
         }
         if pollfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            let _ = sender.send(map(Err(io::Error::other("inotify watch closed"))));
+            let _ = sender.send(ProxyEvent::Watcher(Err(io::Error::other(
+                "inotify watch closed",
+            ))));
             break;
         }
-        match state.read_events(&sender, &map) {
+        match state.read_events(&sender) {
             Ok(true) => {}
             Ok(false) => break,
             Err(error) => {
-                let _ = sender.send(map(Err(error)));
+                let _ = sender.send(ProxyEvent::Watcher(Err(error)));
                 break;
             }
         }
@@ -343,21 +329,23 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn receive_change(receiver: &mpsc::Receiver<ProxyEvent>) -> WatcherChange {
+        let Ok(ProxyEvent::Watcher(change)) = receiver.recv_timeout(Duration::from_secs(2)) else {
+            panic!();
+        };
+        change.unwrap()
+    }
+
     #[test]
     fn watches_file_lifecycle() {
         let directory = TempDir::new().unwrap();
         let (sender, receiver) = mpsc::sync_channel(4096);
-        let _watcher = watch_project_into(directory.path(), false, sender, |event| event).unwrap();
+        let _watcher = watch_project_into(directory.path(), false, sender).unwrap();
         let path = directory.path().join("file.gd");
         fs::write(&path, "one").unwrap();
         let mut changes = Vec::new();
         while changes.len() < 2 {
-            changes.push(
-                receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap()
-                    .unwrap(),
-            );
+            changes.push(receive_change(&receiver));
         }
         assert!(changes
             .iter()
@@ -367,10 +355,7 @@ mod tests {
             .any(|change| { change.kind == WatcherChangeKind::Modified && change.path == path }));
 
         fs::write(&path, "two").unwrap();
-        let modified = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        let modified = receive_change(&receiver);
         assert_eq!(modified.kind, WatcherChangeKind::Modified);
         assert_eq!(modified.path, path);
 
@@ -378,12 +363,7 @@ mod tests {
         fs::rename(&path, &renamed).unwrap();
         let mut rename_changes = Vec::new();
         while rename_changes.len() < 2 {
-            rename_changes.push(
-                receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap()
-                    .unwrap(),
-            );
+            rename_changes.push(receive_change(&receiver));
         }
         assert!(rename_changes
             .iter()
@@ -393,10 +373,7 @@ mod tests {
             .any(|change| { change.kind == WatcherChangeKind::Created && change.path == renamed }));
 
         fs::remove_file(&renamed).unwrap();
-        let removed = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        let removed = receive_change(&receiver);
         assert_eq!(removed.kind, WatcherChangeKind::Removed);
         assert_eq!(removed.path, renamed);
     }
@@ -405,14 +382,11 @@ mod tests {
     fn watches_directories_created_after_start() {
         let directory = TempDir::new().unwrap();
         let (sender, receiver) = mpsc::sync_channel(4096);
-        let _watcher = watch_project_into(directory.path(), false, sender, |event| event).unwrap();
+        let _watcher = watch_project_into(directory.path(), false, sender).unwrap();
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
         loop {
-            let change = receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap();
+            let change = receive_change(&receiver);
             if change.kind == WatcherChangeKind::Created && change.path == nested {
                 break;
             }
@@ -420,10 +394,7 @@ mod tests {
         let path = nested.join("file.gd");
         fs::write(&path, "one").unwrap();
         loop {
-            let change = receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap();
+            let change = receive_change(&receiver);
             if change.kind == WatcherChangeKind::Created && change.path == path {
                 break;
             }

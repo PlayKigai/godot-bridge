@@ -38,7 +38,6 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                 &session.proxy.project,
                 session.settings.diagnose_addons,
                 session.proxy.internal_sender.clone(),
-                ProxyEvent::Watcher,
             )
             .context("cannot watch project")?,
         );
@@ -114,32 +113,16 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         }
         let now = Instant::now();
         if let Some(deadline) = symbol_deadline {
-            wait = wait.min(
-                deadline
-                    .checked_duration_since(now)
-                    .unwrap_or(Duration::ZERO),
-            );
+            wait = wait.min(until(now, deadline));
         }
         if session.runtime.mode == Mode::Gui {
-            wait = wait.min(
-                gui_deadline
-                    .checked_duration_since(now)
-                    .unwrap_or(Duration::ZERO),
-            );
+            wait = wait.min(until(now, gui_deadline));
         }
         if let Some(deadline) = session.watch.deadline {
-            wait = wait.min(
-                deadline
-                    .checked_duration_since(now)
-                    .unwrap_or(Duration::ZERO),
-            );
+            wait = wait.min(until(now, deadline));
         }
         if let Some(deadline) = session.proxy.bulk_deadline {
-            wait = wait.min(
-                deadline
-                    .checked_duration_since(now)
-                    .unwrap_or(Duration::ZERO),
-            );
+            wait = wait.min(until(now, deadline));
         }
         let event = session
             .deferred
@@ -156,6 +139,12 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             Err(mpsc::RecvTimeoutError::Disconnected) => return exit_session(&mut session, 1),
         }
     }
+}
+
+fn until(now: Instant, deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(now)
+        .unwrap_or(Duration::ZERO)
 }
 
 fn handle_event(

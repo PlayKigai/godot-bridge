@@ -185,7 +185,7 @@ fn flatten_document(
 
 fn normalize_uri(uri: &str) -> String {
     if uri.starts_with("file:") {
-        crate::root::path_to_uri(&crate::root::doc_key(uri))
+        crate::root::canonical_path_to_uri(&crate::root::doc_key(uri))
     } else {
         uri.to_owned()
     }
@@ -358,7 +358,12 @@ pub fn search_with_uris<'a>(
                 }
                 best_match_into(target, &query, &mut scratch, &mut candidate)
             } else {
-                let container = containers.get(symbol.container).as_bytes();
+                let container = symbol
+                    .folded
+                    .as_ref()
+                    .and_then(|folded| folded.inline_container.as_deref())
+                    .unwrap_or_else(|| containers.get(symbol.container))
+                    .as_bytes();
                 if container.is_empty() {
                     if symbol.name.len() > 256 {
                         continue;
@@ -717,6 +722,19 @@ mod tests {
         assert_eq!(search("player jump")[0].1.name.as_ref(), "jump");
         assert_eq!(search("Player.jump")[0].1.name.as_ref(), "jump");
         assert!(search("player").is_empty());
+    }
+
+    #[test]
+    fn overflow_container_names_are_searchable() {
+        let mut containers = ContainerTable::default();
+        for index in 0..MAX_CONTAINER_ENTRIES {
+            let name = format!("Container{index}");
+            symbol_with_container("other", &name, index as u64, &mut containers);
+        }
+        let symbol = symbol_with_container("jump", "Overflow", 0, &mut containers);
+        let matches = search_with_uris([("", &symbol)], "overflow jump", &containers);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name.as_ref(), "jump");
     }
 
     #[test]
