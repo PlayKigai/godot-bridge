@@ -14,7 +14,9 @@ use crate::docs_state::{
     self, DocumentAction, DocumentEvent, DocumentOwner, DocumentState, WatcherChange,
     WatcherChangeKind, BULK_DOCUMENTS, BULK_INTERVAL_MS,
 };
-use crate::framing::{parse_json_object, spawn_frame_reader, write_json, FrameEvent, FrameReader};
+use crate::framing::{
+    parse_json_object, spawn_frame_reader, write_frame, write_json, FrameEvent, FrameReader,
+};
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{
     kill_group, kill_recorded, pick_free_port, spawn_godot, spawn_gui, wait_for_port, GodotChild,
@@ -988,6 +990,11 @@ fn forward_server_message(
                 proxy.bulk_deadline = None;
                 pump_bulk_documents(proxy, editor)?;
             }
+        }
+        if message.get("id").is_none() {
+            write_frame(output, body, CLIENT_FRAME_CAP)?;
+            output.flush()?;
+            return Ok(());
         }
         if let Some(id) = message.get("id") {
             proxy.server_requests.insert(id.to_string());
