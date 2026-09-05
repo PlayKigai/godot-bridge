@@ -4,7 +4,7 @@ use crate::framing::connection_without_reader;
 pub(super) fn connection_from_stream(
     stream: TcpStream,
     sender: mpsc::SyncSender<ProxyEvent>,
-) -> Connection<()> {
+) -> Connection {
     connection_without_reader(stream, "godot-bridge-lsp-reader", sender, ProxyEvent::Godot)
         .expect("Godot reader thread should spawn")
 }
@@ -186,6 +186,7 @@ pub(super) fn spawn_one(
     settings: &Settings,
     project: &Path,
     runtime: &Runtime,
+    event_sender: &mpsc::SyncSender<ProxyEvent>,
     deadline: Option<Instant>,
 ) -> std::result::Result<Editor, StartupError> {
     let lsp_port =
@@ -210,7 +211,7 @@ pub(super) fn spawn_one(
     let (child, _) = await_port(child, dap_port, deadline, "DAP")?;
     Ok(Editor {
         child: Some(child),
-        connection: connection_from_stream(stream, runtime.event_sender.clone()),
+        connection: connection_from_stream(stream, event_sender.clone()),
         lsp_port,
         dap_port,
     })

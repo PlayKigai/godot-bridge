@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
@@ -107,14 +106,6 @@ impl fmt::Display for Number {
 impl Map {
     pub fn new() -> Self {
         Self(Vec::new())
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -300,17 +291,6 @@ impl Index<usize> for Value {
     }
 }
 
-impl IndexMut<usize> for Value {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        match self {
-            Self::Array(array) => array
-                .get_mut(index)
-                .expect("array index is outside the array"),
-            _ => panic!("cannot index a non-array with a number"),
-        }
-    }
-}
-
 impl From<Number> for Value {
     fn from(value: Number) -> Self {
         Self::Number(value)
@@ -338,12 +318,6 @@ impl From<&str> for Value {
 impl From<&String> for Value {
     fn from(value: &String) -> Self {
         Self::String(value.clone())
-    }
-}
-
-impl<'a> From<Cow<'a, str>> for Value {
-    fn from(value: Cow<'a, str>) -> Self {
-        Self::String(value.into_owned())
     }
 }
 
@@ -528,21 +502,6 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
         }
         parser.skip_space()?;
     }
-}
-
-fn hex_code(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() != 4 {
-        return None;
-    }
-    bytes.iter().try_fold(0u16, |value, byte| {
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => return None,
-        };
-        Some(value * 16 + u16::from(digit))
-    })
 }
 
 macro_rules! value_number_eq {
@@ -753,45 +712,7 @@ impl<'a> Parser<'a> {
                 }
                 b'\\' => {
                     self.index += 1;
-                    let Some(escape) = self.input.get(self.index).copied() else {
-                        return self.error("unterminated escape");
-                    };
-                    self.index += 1;
-                    if escape == b'u' {
-                        let start = self.index;
-                        self.index += 4;
-                        let Some(hex) = self.input.get(start..self.index) else {
-                            return self.error("invalid Unicode escape");
-                        };
-                        let Some(code) = hex_code(hex) else {
-                            return self.error("invalid Unicode escape");
-                        };
-                        if (0xd800..=0xdbff).contains(&code) {
-                            if self.input.get(self.index..self.index + 2) != Some(b"\\u") {
-                                return self
-                                    .error("high surrogate is not followed by a low surrogate");
-                            }
-                            let low_start = self.index + 2;
-                            self.index += 6;
-                            let Some(hex) = self.input.get(low_start..self.index) else {
-                                return self.error("invalid Unicode escape");
-                            };
-                            let Some(low) = hex_code(hex) else {
-                                return self.error("invalid Unicode escape");
-                            };
-                            if !(0xdc00..=0xdfff).contains(&low) {
-                                return self
-                                    .error("high surrogate is not followed by a low surrogate");
-                            }
-                        } else if (0xdc00..=0xdfff).contains(&code) {
-                            return self.error("unexpected low surrogate");
-                        }
-                    } else if !matches!(
-                        escape,
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
-                    ) {
-                        return self.error("invalid escape sequence");
-                    }
+                    self.parse_escape(None)?;
                 }
                 byte if byte < 0x20 => return self.error("control character in string"),
                 _ => self.index += 1,
@@ -871,6 +792,11 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_number(&mut self) -> Result<(), Error> {
+        self.scan_number().map(|_| ())
+    }
+
+    fn scan_number(&mut self) -> Result<(usize, usize), Error> {
+        let start = self.index;
         self.take(b'-');
         match self.input.get(self.index).copied() {
             Some(b'0') => {
@@ -917,7 +843,7 @@ impl<'a> Parser<'a> {
                 return self.error("exponent has no digits");
             }
         }
-        Ok(())
+        Ok((start, self.index))
     }
 
     fn parse_array(&mut self, depth: usize) -> Result<Value, Error> {
@@ -988,54 +914,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_number(&mut self) -> Result<Number, Error> {
-        let start = self.index;
-        self.take(b'-');
-        match self.input.get(self.index).copied() {
-            Some(b'0') => {
-                self.index += 1;
-                if self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    return self.error("leading zero in number");
-                }
-            }
-            Some(b'1'..=b'9') => {
-                self.index += 1;
-                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    self.index += 1;
-                }
-            }
-            _ => return self.error("invalid number"),
-        }
-        if self.take(b'.') {
-            let fraction = self.index;
-            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                self.index += 1;
-            }
-            if self.index == fraction {
-                return self.error("fraction has no digits");
-            }
-        }
-        if self
-            .input
-            .get(self.index)
-            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
-        {
-            self.index += 1;
-            if self
-                .input
-                .get(self.index)
-                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-            {
-                self.index += 1;
-            }
-            let exponent = self.index;
-            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                self.index += 1;
-            }
-            if self.index == exponent {
-                return self.error("exponent has no digits");
-            }
-        }
-        Ok(Number::from_bytes(&self.input[start..self.index]))
+        let (start, end) = self.scan_number()?;
+        Ok(Number::from_bytes(&self.input[start..end]))
     }
 
     fn parse_string(&mut self) -> Result<String, Error> {
@@ -1064,7 +944,7 @@ impl<'a> Parser<'a> {
                     let current = output.get_or_insert_with(String::new);
                     append_utf8(current, &self.input[run_start..self.index], self.index)?;
                     self.index += 1;
-                    self.parse_escape(current)?;
+                    self.parse_escape(Some(current))?;
                     run_start = self.index;
                 }
                 byte if byte < 0x20 => return self.error("control character in string"),
@@ -1073,20 +953,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_escape(&mut self, output: &mut String) -> Result<(), Error> {
+    fn parse_escape(&mut self, output: Option<&mut String>) -> Result<(), Error> {
         let Some(escape) = self.input.get(self.index).copied() else {
             return self.error("unterminated escape");
         };
         self.index += 1;
-        match escape {
-            b'"' => output.push('"'),
-            b'\\' => output.push('\\'),
-            b'/' => output.push('/'),
-            b'b' => output.push('\u{08}'),
-            b'f' => output.push('\u{0c}'),
-            b'n' => output.push('\n'),
-            b'r' => output.push('\r'),
-            b't' => output.push('\t'),
+        let character = match escape {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'/' => '/',
+            b'b' => '\u{08}',
+            b'f' => '\u{0c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
             b'u' => {
                 let high = self.parse_hex()?;
                 let code = match high {
@@ -1104,11 +984,13 @@ impl<'a> Parser<'a> {
                     0xdc00..=0xdfff => return self.error("unexpected low surrogate"),
                     value => u32::from(value),
                 };
-                let character = char::from_u32(code)
-                    .ok_or_else(|| Error::new(self.index, "invalid Unicode escape"))?;
-                output.push(character);
+                char::from_u32(code)
+                    .ok_or_else(|| Error::new(self.index, "invalid Unicode escape"))?
             }
             _ => return self.error("invalid escape sequence"),
+        };
+        if let Some(output) = output {
+            output.push(character);
         }
         Ok(())
     }
@@ -1150,10 +1032,21 @@ impl<'a> Parser<'a> {
             {
                 self.index += 1;
             }
-            if !self.relaxed || self.input.get(self.index..self.index + 2) != Some(b"//") {
-                if !self.relaxed || self.input.get(self.index..self.index + 2) != Some(b"/*") {
-                    return Ok(());
+            if !self.relaxed {
+                return Ok(());
+            }
+            if self.input.get(self.index..self.index + 2) == Some(b"//") {
+                self.index += 2;
+                while self
+                    .input
+                    .get(self.index)
+                    .is_some_and(|byte| *byte != b'\n')
+                {
+                    self.index += 1;
                 }
+                continue;
+            }
+            if self.input.get(self.index..self.index + 2) == Some(b"/*") {
                 self.index += 2;
                 let Some(rest) = self.input.get(self.index..) else {
                     return self.error("unterminated comment");
@@ -1164,14 +1057,7 @@ impl<'a> Parser<'a> {
                 self.index += end + 2;
                 continue;
             }
-            self.index += 2;
-            while self
-                .input
-                .get(self.index)
-                .is_some_and(|byte| *byte != b'\n')
-            {
-                self.index += 1;
-            }
+            return Ok(());
         }
     }
 

@@ -200,67 +200,25 @@ fn normalize_uri(uri: &str) -> String {
 }
 
 fn boundary_positions(value: &str) -> BoundaryPositions {
-    if value.is_ascii() && value.len() <= 64 {
-        let mut mask = 0;
-        let bytes = value.as_bytes();
-        for (index, &character) in bytes.iter().enumerate() {
-            if index == 0
-                || bytes[index - 1] == b'_'
-                || (character.is_ascii_uppercase() && bytes[index - 1].is_ascii_lowercase())
-            {
-                mask |= 1 << index;
-            }
-        }
-        BoundaryPositions::Mask(mask)
-    } else {
-        let mut positions = Vec::new();
-        let mut previous = None;
-        for (index, character) in value.chars().enumerate() {
-            if index == 0
-                || previous == Some('_')
-                || (character.is_uppercase() && previous.is_some_and(char::is_lowercase))
-            {
-                positions.push(index as u64);
-            }
-            previous = Some(character);
-        }
-        BoundaryPositions::List(positions.into_boxed_slice())
-    }
+    boundary_positions_iter(value.chars())
 }
 
 fn boundary_positions_parts(container: &str, name: &str) -> BoundaryPositions {
     if container.is_empty() {
         return boundary_positions(name);
     }
-    if container.is_ascii() && name.is_ascii() && container.len() + 1 + name.len() <= 64 {
-        let mut mask = 0;
-        let mut previous = None;
-        for (index, &character) in container
-            .as_bytes()
-            .iter()
-            .chain(std::iter::once(&b'.'))
-            .chain(name.as_bytes())
-            .enumerate()
-        {
-            if index == 0
-                || previous == Some(b'_')
-                || (character.is_ascii_uppercase()
-                    && previous.is_some_and(|value| value.is_ascii_lowercase()))
-            {
-                mask |= 1 << index;
-            }
-            previous = Some(character);
-        }
-        return BoundaryPositions::Mask(mask);
-    }
+    boundary_positions_iter(
+        container
+            .chars()
+            .chain(std::iter::once('.'))
+            .chain(name.chars()),
+    )
+}
+
+fn boundary_positions_iter(characters: impl Iterator<Item = char>) -> BoundaryPositions {
     let mut positions = Vec::new();
     let mut previous = None;
-    for (index, character) in container
-        .chars()
-        .chain(std::iter::once('.'))
-        .chain(name.chars())
-        .enumerate()
-    {
+    for (index, character) in characters.enumerate() {
         if index == 0
             || previous == Some('_')
             || (character.is_uppercase() && previous.is_some_and(char::is_lowercase))
@@ -269,7 +227,7 @@ fn boundary_positions_parts(container: &str, name: &str) -> BoundaryPositions {
         }
         previous = Some(character);
     }
-    if positions.len() <= 64 {
+    if positions.len() <= 64 && positions.last().is_none_or(|position| *position < 64) {
         let mask = positions
             .into_iter()
             .fold(0, |mask, position| mask | (1 << position));

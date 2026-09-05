@@ -216,7 +216,7 @@ fn handle_event(
             }
         }
         ProxyEvent::Watcher(result) => {
-            absorb_watcher_event(&mut session.watch, Some(result));
+            absorb_watcher_event(&mut session.watch, result);
         }
         ProxyEvent::Internal(event) => match event {
             InternalEvent::Bulk {

@@ -7,7 +7,6 @@ pub(super) fn start_recovery(session: &mut Session) -> Result<()> {
 }
 
 fn reset_for_recovery(session: &mut Session) -> Result<()> {
-    session.proxy.documents.set_open_change_events(false);
     session.proxy.symbol_cache.clear();
     session.proxy.symbol_scheduled.clear();
     session.proxy.bulk_documents.clear();
@@ -102,6 +101,7 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
             &session.settings,
             &project,
             &session.runtime,
+            &session.proxy.internal_sender,
             deadline,
         ) {
             Ok(editor) => {
@@ -147,12 +147,9 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     Ok(())
 }
 
-pub(super) fn absorb_watcher_event(
-    watch: &mut Watch,
-    result: Option<std::io::Result<WatcherChange>>,
-) {
+pub(super) fn absorb_watcher_event(watch: &mut Watch, result: std::io::Result<WatcherChange>) {
     match result {
-        Some(Ok(change)) => {
+        Ok(change) => {
             watch.pending.push(change);
             if watch.pending.len() > WATCHER_PENDING_CAP {
                 watch.pending = coalesce_watcher_changes(std::mem::take(&mut watch.pending));
@@ -171,14 +168,12 @@ pub(super) fn absorb_watcher_event(
             }
             watch.deadline = Some(Instant::now() + Duration::from_millis(300));
         }
-        Some(Err(error)) => crate::warn!("project diagnostics watcher error: {error}"),
-        None => watch.watcher = None,
+        Err(error) => crate::warn!("project diagnostics watcher error: {error}"),
     }
 }
 
 pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) -> Result<()> {
     replay_open_documents(session)?;
-    session.proxy.documents.set_open_change_events(true);
     if !session.proxy.bulk_replay {
         start_project_diagnostics(&mut session.proxy, &session.settings);
     }
@@ -242,14 +237,10 @@ fn replay_open_documents(session: &mut Session) -> Result<()> {
         .documents
         .open_docs
         .values()
-        .map(|doc| DocumentEvent::Open {
-            uri: doc.uri.clone(),
-            generation: doc.generation,
-            version: doc.version,
-        })
+        .map(|doc| (doc.uri.clone(), doc.generation, doc.version))
         .collect::<Vec<_>>();
-    for event in replayed {
-        schedule_symbol_event(&mut session.proxy, event);
+    for (uri, generation, version) in replayed {
+        schedule_symbols(&mut session.proxy, &uri, generation, version);
     }
     pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
 }

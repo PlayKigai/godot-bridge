@@ -67,7 +67,7 @@ fn try_handoff_with_timeout(
 ) -> Option<Value> {
     socket_request(
         &files.sock,
-        &crate::json!({"cmd": "handoff", "project": (project.to_string_lossy())}),
+        &crate::json!({"cmd": "handoff", "project": (project.to_string_lossy().into_owned())}),
         timeout,
     )
     .ok()

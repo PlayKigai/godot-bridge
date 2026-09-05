@@ -1,11 +1,9 @@
+use crate::root::{canonical_or_normalized, doc_key, path_to_uri};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-
-use crate::root::{canonical_or_normalized, doc_key, path_to_uri};
 
 pub use crate::root::normalize_absolute as normalize_path;
 
@@ -29,30 +27,6 @@ pub struct OpenDoc {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DocumentEvent {
-    Open {
-        uri: String,
-        generation: u64,
-        version: i64,
-    },
-    Change {
-        uri: String,
-        generation: u64,
-        version: i64,
-    },
-    Close {
-        uri: String,
-        generation: u64,
-    },
-    Remove {
-        uri: String,
-        generation: u64,
-    },
-}
-
-pub type DocumentEventHook = Arc<dyn Fn(DocumentEvent) + Send + Sync>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentAction {
     Open {
         uri: String,
@@ -71,8 +45,6 @@ pub struct DocumentState {
     pub(crate) uri_keys: HashMap<String, PathBuf>,
     pub(crate) watcher_keys: HashMap<PathBuf, PathBuf>,
     generations: HashMap<PathBuf, u64>,
-    event_hook: Option<DocumentEventHook>,
-    emit_open_change_events: bool,
 }
 
 impl DocumentState {
@@ -82,17 +54,7 @@ impl DocumentState {
             uri_keys: HashMap::new(),
             watcher_keys: HashMap::new(),
             generations: HashMap::new(),
-            event_hook: None,
-            emit_open_change_events: true,
         }
-    }
-
-    pub fn set_event_hook(&mut self, hook: DocumentEventHook) {
-        self.event_hook = Some(hook);
-    }
-
-    pub fn set_open_change_events(&mut self, enabled: bool) {
-        self.emit_open_change_events = enabled;
     }
 
     pub fn zed_open(&mut self, incoming_uri: &str, text: String) -> DocumentAction {
@@ -105,19 +67,11 @@ impl DocumentState {
             doc.owner = DocumentOwner::Zed;
             let uri = doc.uri.clone();
             let version = doc.version;
-            let generation = doc.generation;
             let action = DocumentAction::Change {
                 uri: uri.clone(),
                 version,
                 text,
             };
-            if self.emit_open_change_events {
-                self.emit(DocumentEvent::Change {
-                    uri,
-                    generation,
-                    version,
-                });
-            }
             return action;
         }
 
@@ -135,13 +89,6 @@ impl DocumentState {
             },
         );
         self.uri_keys.insert(uri.clone(), key.clone());
-        if self.emit_open_change_events {
-            self.emit(DocumentEvent::Open {
-                uri: uri.clone(),
-                generation,
-                version,
-            });
-        }
         DocumentAction::Open { uri, version, text }
     }
 
@@ -153,14 +100,6 @@ impl DocumentState {
         doc.owner = DocumentOwner::Zed;
         let uri = doc.uri.clone();
         let version = doc.version;
-        let generation = doc.generation;
-        if self.emit_open_change_events {
-            self.emit(DocumentEvent::Change {
-                uri: uri.clone(),
-                generation,
-                version,
-            });
-        }
         Some(DocumentAction::Change { uri, version, text })
     }
 
@@ -168,10 +107,6 @@ impl DocumentState {
         let key = self.key_for_uri(incoming_uri);
         let doc = self.open_docs.remove(&key)?;
         self.remove_mappings(&key);
-        self.emit(DocumentEvent::Close {
-            uri: doc.uri.clone(),
-            generation: doc.generation,
-        });
         Some((key, doc.uri))
     }
 
@@ -197,13 +132,6 @@ impl DocumentState {
         );
         self.uri_keys.insert(uri.clone(), key.clone());
         self.register_watcher_path(path, key.clone());
-        if self.emit_open_change_events {
-            self.emit(DocumentEvent::Open {
-                uri: uri.clone(),
-                generation,
-                version,
-            });
-        }
         Some(DocumentAction::Open { uri, version, text })
     }
 
@@ -218,14 +146,6 @@ impl DocumentState {
         doc.version += 1;
         let uri = doc.uri.clone();
         let version = doc.version;
-        let generation = doc.generation;
-        if self.emit_open_change_events {
-            self.emit(DocumentEvent::Change {
-                uri: uri.clone(),
-                generation,
-                version,
-            });
-        }
         Some(DocumentAction::Change { uri, version, text })
     }
 
@@ -240,23 +160,11 @@ impl DocumentState {
         }
         let doc = self.open_docs.remove(&key)?;
         self.remove_mappings(&key);
-        self.emit(DocumentEvent::Close {
-            uri: doc.uri.clone(),
-            generation: doc.generation,
-        });
-        self.emit(DocumentEvent::Remove {
-            uri: doc.uri.clone(),
-            generation: doc.generation,
-        });
         Some(doc.uri)
     }
 
-    pub fn forget_closed(&mut self, key: &Path, uri: &str) {
+    pub fn forget_closed(&mut self, key: &Path) {
         self.remove_mappings(key);
-        self.emit(DocumentEvent::Remove {
-            uri: uri.to_owned(),
-            generation: self.generation_for_key(key),
-        });
     }
 
     pub fn register_watcher_path(&mut self, path: &Path, key: PathBuf) {
@@ -292,16 +200,6 @@ impl DocumentState {
         let generation = self.generations.entry(key.to_path_buf()).or_insert(0);
         *generation += 1;
         *generation
-    }
-
-    fn generation_for_key(&self, key: &Path) -> u64 {
-        self.generations.get(key).copied().unwrap_or_default()
-    }
-
-    fn emit(&self, event: DocumentEvent) {
-        if let Some(hook) = &self.event_hook {
-            hook(event);
-        }
     }
 }
 
@@ -474,7 +372,6 @@ mod tests {
     use super::*;
     use crate::temp::TempDir;
     use std::fs;
-    use std::sync::Mutex;
 
     #[test]
     fn scan_filters_project_diagnostics_files() {
@@ -505,51 +402,5 @@ mod tests {
         assert!(with_addons
             .iter()
             .any(|doc| doc.path.ends_with("addons/addon.gd")));
-    }
-
-    #[test]
-    fn ownership_transitions_emit_document_events() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("document.gd");
-        fs::write(&path, "disk").unwrap();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let events_for_hook = Arc::clone(&events);
-        let mut state = DocumentState::new();
-        state.set_event_hook(Arc::new(move |event| {
-            events_for_hook.lock().unwrap().push(event);
-        }));
-
-        let opened = state.bridge_open_path(&path, "disk".to_owned()).unwrap();
-        let key = crate::root::canonical_or_normalized(&path);
-        assert_eq!(state.owner(&key), Some(DocumentOwner::Bridge));
-        let uri = match opened {
-            DocumentAction::Open { uri, .. } => uri,
-            _ => unreachable!(),
-        };
-        assert!(matches!(
-            state.zed_open(&uri, "zed".to_owned()),
-            DocumentAction::Change { .. }
-        ));
-        assert_eq!(state.owner(&key), Some(DocumentOwner::Zed));
-        assert!(state.zed_close(&uri).is_some());
-        assert!(matches!(
-            state.bridge_open_path(&path, "disk".to_owned()),
-            Some(DocumentAction::Open { .. })
-        ));
-        assert!(state.bridge_remove_key(&key).is_some());
-        assert!(state.open_docs.is_empty());
-        let events = events.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, DocumentEvent::Open { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, DocumentEvent::Change { version: 2, .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, DocumentEvent::Close { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, DocumentEvent::Remove { .. })));
     }
 }

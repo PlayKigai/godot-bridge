@@ -26,7 +26,7 @@ const SOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 struct Prepared {
-    connection: Connection<()>,
+    connection: Connection,
     lock: LockGuard,
     project: PathBuf,
     file: Option<PathBuf>,
@@ -431,7 +431,7 @@ fn discover_owner(
         }
         let status = socket_request(
             &files.sock,
-            &crate::json!({"cmd": "status", "project": (project.to_string_lossy())}),
+            &crate::json!({"cmd": "status", "project": (project.to_string_lossy().into_owned())}),
             timeout,
         )
         .map_err(|_| no_owner.clone())?;
@@ -466,7 +466,7 @@ fn discover_owner(
 
 fn run_session_inner(
     initialize: &Value,
-    connection: &mut Connection<()>,
+    connection: &mut Connection,
     output: &mut ClientOutput<std::io::Stdout>,
     input: &mut DapInput,
     buffer: &mut ClientBuffer,
@@ -572,7 +572,7 @@ fn wait_for_initialize(
 fn forward_client_body(
     body: &[u8],
     server_requests: &mut ServerRequests,
-    connection: &mut Connection<()>,
+    connection: &mut Connection,
     project: &Path,
     file: Option<&Path>,
 ) -> Result<Option<RequestFailure>> {
@@ -599,7 +599,7 @@ fn forward_client_body(
 fn forward_client(
     mut message: Value,
     server_requests: &mut ServerRequests,
-    connection: &mut Connection<()>,
+    connection: &mut Connection,
     project: &Path,
     file: Option<&Path>,
 ) -> Result<Option<RequestFailure>> {

@@ -13,8 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::docs_state::{
-    self, DocumentAction, DocumentEvent, DocumentOwner, DocumentState, WatcherChange,
-    WatcherChangeKind, BULK_DOCUMENTS,
+    self, DocumentAction, DocumentOwner, DocumentState, WatcherChange, WatcherChangeKind,
+    BULK_DOCUMENTS,
 };
 use crate::framing::{
     parse_json_object, spawn_frame_reader_with, write_frame, write_json, Connection, FrameDecoder,
@@ -154,7 +154,7 @@ enum InternalEvent {
 
 struct Editor {
     child: Option<GodotChild>,
-    connection: Connection<()>,
+    connection: Connection,
     lsp_port: u16,
     dap_port: u16,
 }
@@ -164,13 +164,12 @@ struct Runtime {
     state: Arc<RwLock<State>>,
     socket: Option<crate::state::SocketHandle>,
     lock: Option<crate::state::LockGuard>,
-    event_sender: mpsc::SyncSender<ProxyEvent>,
     mode: Mode,
 }
 
 #[derive(Default)]
 struct Watch {
-    watcher: Option<ProjectWatcher<ProxyEvent>>,
+    watcher: Option<ProjectWatcher>,
     pending: Vec<WatcherChange>,
     deadline: Option<Instant>,
 }
@@ -308,7 +307,7 @@ impl StartupError {
 enum GuiReconnect {
     Ready {
         state: State,
-        connection: Connection<()>,
+        connection: Connection,
     },
     Dead,
     Deadline {
@@ -345,7 +344,11 @@ fn reconnect_gui(
         lsp_port,
         dap_port,
         startup_deadline(timeout_seconds),
-    ) {
+        |sleep_for| {
+            thread::sleep(sleep_for);
+            Ok(())
+        },
+    )? {
         DetachedPorts::Ready(stream) => {
             state.status = Status::Ready;
             state.mode = Mode::Gui;
@@ -379,54 +382,8 @@ fn wait_for_detached_ports(
     lsp_port: u16,
     dap_port: u16,
     deadline: Option<Instant>,
-) -> DetachedPorts {
-    loop {
-        if !crate::state::pid_alive_with_ticks(pid, ticks) {
-            return DetachedPorts::Dead;
-        }
-        let lsp_address = SocketAddr::from(([127, 0, 0, 1], lsp_port));
-        let dap_address = SocketAddr::from(([127, 0, 0, 1], dap_port));
-        if let Ok(lsp) = TcpStream::connect_timeout(&lsp_address, Duration::from_millis(50)) {
-            if TcpStream::connect_timeout(&dap_address, Duration::from_millis(50)).is_ok() {
-                return DetachedPorts::Ready(lsp);
-            }
-        }
-        if deadline.is_some_and(|limit| Instant::now() >= limit) {
-            return DetachedPorts::Deadline;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn wait_for_ports_closed(lsp_port: u16, dap_port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let lsp_closed = TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], lsp_port)),
-            Duration::from_millis(50),
-        )
-        .is_err();
-        let dap_closed = TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], dap_port)),
-            Duration::from_millis(50),
-        )
-        .is_err();
-        if lsp_closed && dap_closed || Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_detached_ports_during_handoff(
-    session: &mut Session,
-    pid: u32,
-    ticks: u64,
-    deadline: Option<Instant>,
-    queue: &mut RecoveryQueue,
+    mut wait: impl FnMut(Duration) -> Result<()>,
 ) -> Result<DetachedPorts> {
-    let lsp_port = session.editor.lsp_port;
-    let dap_port = session.editor.dap_port;
     loop {
         if !crate::state::pid_alive_with_ticks(pid, ticks) {
             return Ok(DetachedPorts::Dead);
@@ -447,23 +404,27 @@ fn wait_for_detached_ports_during_handoff(
                 .unwrap_or(Duration::ZERO)
                 .min(Duration::from_millis(200))
         });
-        match session.events.recv_timeout(sleep_for) {
-            Ok(ProxyEvent::Client(event)) => {
-                session.client.feed(event)?;
-                while let Some(body) = session.client.frames.pop_front() {
-                    queue_recovery_message(queue, &mut session.output, &body)?;
-                }
-                if session.client.eof && session.client.frames.is_empty() {
-                    crate::bail!("Zed closed during GUI handoff");
-                }
-            }
-            Ok(ProxyEvent::Godot(_)) => {}
-            Ok(event) => session.deferred.push_back(event)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                crate::bail!("Zed closed during GUI handoff")
-            }
+        wait(sleep_for)?;
+    }
+}
+
+fn wait_for_ports_closed(lsp_port: u16, dap_port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lsp_closed = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], lsp_port)),
+            Duration::from_millis(50),
+        )
+        .is_err();
+        let dap_closed = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], dap_port)),
+            Duration::from_millis(50),
+        )
+        .is_err();
+        if lsp_closed && dap_closed || Instant::now() >= deadline {
+            return;
         }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -516,21 +477,41 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
         }
         publish(&session.runtime)?;
         let deadline = startup_deadline(session.settings.startup_timeout_s);
-        let connection = match wait_for_detached_ports_during_handoff(
-            session,
-            pid,
-            ticks,
-            deadline,
-            &mut recovery_queue,
-        )? {
-            DetachedPorts::Ready(stream) => {
-                connection_from_stream(stream, session.proxy.internal_sender.clone())
-            }
-            DetachedPorts::Dead => crate::bail!("GUI editor exited during handoff"),
-            DetachedPorts::Deadline => {
-                crate::bail!("GUI editor {pid} is not answering on its ports")
-            }
-        };
+        let lsp_port = session.editor.lsp_port;
+        let dap_port = session.editor.dap_port;
+        let connection =
+            match wait_for_detached_ports(pid, ticks, lsp_port, dap_port, deadline, |sleep_for| {
+                match session.events.recv_timeout(sleep_for) {
+                    Ok(ProxyEvent::Client(event)) => {
+                        session.client.feed(event)?;
+                        while let Some(body) = session.client.frames.pop_front() {
+                            queue_recovery_message(
+                                &mut recovery_queue,
+                                &mut session.output,
+                                &body,
+                            )?;
+                        }
+                        if session.client.eof && session.client.frames.is_empty() {
+                            crate::bail!("Zed closed during GUI handoff");
+                        }
+                    }
+                    Ok(ProxyEvent::Godot(_)) => {}
+                    Ok(event) => session.deferred.push_back(event)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::bail!("Zed closed during GUI handoff")
+                    }
+                }
+                Ok(())
+            })? {
+                DetachedPorts::Ready(stream) => {
+                    connection_from_stream(stream, session.proxy.internal_sender.clone())
+                }
+                DetachedPorts::Dead => crate::bail!("GUI editor exited during handoff"),
+                DetachedPorts::Deadline => {
+                    crate::bail!("GUI editor {pid} is not answering on its ports")
+                }
+            };
         let mut replacement = Editor {
             child: None,
             connection,
@@ -701,7 +682,6 @@ pub fn run() -> Result<ExitCode> {
                 state: Arc::new(RwLock::new(new_state(&project, Mode::Unmanaged))),
                 socket: None,
                 lock: None,
-                event_sender: event_sender.clone(),
                 mode: Mode::Unmanaged,
             },
             editor: Editor {
@@ -750,7 +730,6 @@ pub fn run() -> Result<ExitCode> {
                             state,
                             socket: Some(socket),
                             lock: Some(lock),
-                            event_sender: event_sender.clone(),
                             mode: Mode::Gui,
                         };
                         publish(&runtime)?;
@@ -843,7 +822,6 @@ pub fn run() -> Result<ExitCode> {
         state,
         socket: Some(socket),
         lock: Some(lock),
-        event_sender: event_sender.clone(),
         mode: Mode::Headless,
     };
     publish(&runtime)?;
@@ -851,7 +829,14 @@ pub fn run() -> Result<ExitCode> {
     let mut editor = None;
     let mut startup_error: Option<StartupError> = None;
     for _ in 0..STARTUP_ATTEMPTS {
-        match spawn_one(&binary, &settings, &project, &runtime, deadline) {
+        match spawn_one(
+            &binary,
+            &settings,
+            &project,
+            &runtime,
+            &event_sender,
+            deadline,
+        ) {
             Ok(mut candidate) => {
                 match forward_initialize(
                     &mut candidate,
@@ -1337,10 +1322,10 @@ fn rewrite_document_messages(
                         messages.push(crate::json::to_vec(&document_action_message(&open)));
                     }
                 } else {
-                    proxy.documents.forget_closed(&key, &close_uri);
+                    proxy.documents.forget_closed(&key);
                 }
             } else {
-                proxy.documents.forget_closed(&key, &close_uri);
+                proxy.documents.forget_closed(&key);
             }
             return Ok(messages);
         }
@@ -1712,67 +1697,41 @@ fn check_workspace(message: &Value, project: &Path, port: Option<u16>) -> Result
     Ok(())
 }
 
-fn schedule_symbol_event(proxy: &mut ProxyState, event: DocumentEvent) {
-    match event {
-        DocumentEvent::Open {
-            uri,
+fn schedule_symbols(proxy: &mut ProxyState, uri: &str, generation: u64, version: i64) {
+    proxy.symbol_cache.remove(uri);
+    proxy.symbol_scheduled.insert(
+        uri.to_owned(),
+        (
             generation,
             version,
-        }
-        | DocumentEvent::Change {
-            uri,
-            generation,
-            version,
-        } => {
-            proxy.symbol_cache.remove(&uri);
-            proxy.symbol_scheduled.insert(
-                uri,
-                (
-                    generation,
-                    version,
-                    Instant::now() + Duration::from_millis(300),
-                ),
-            );
-        }
-        DocumentEvent::Close { uri, generation: _ }
-        | DocumentEvent::Remove { uri, generation: _ } => {
-            proxy.symbol_scheduled.remove(&uri);
-            proxy.symbol_cache.remove(&uri);
-            proxy.pending.retain(|_, pending| {
-                pending
-                    .symbol
-                    .as_ref()
-                    .is_none_or(|(pending_uri, _, _)| pending_uri != &uri)
-            });
-        }
-    }
+            Instant::now() + Duration::from_millis(300),
+        ),
+    );
+}
+
+fn forget_symbols(proxy: &mut ProxyState, uri: &str) {
+    proxy.symbol_scheduled.remove(uri);
+    proxy.symbol_cache.remove(uri);
+    proxy.pending.retain(|_, pending| {
+        pending
+            .symbol
+            .as_ref()
+            .is_none_or(|(pending_uri, _, _)| pending_uri != uri)
+    });
 }
 
 fn schedule_document_action(proxy: &mut ProxyState, action: &DocumentAction) {
     match action {
         DocumentAction::Open { uri, version, .. } | DocumentAction::Change { uri, version, .. } => {
             if let Some(generation) = proxy.documents.generation_for_uri(uri) {
-                schedule_symbol_event(
-                    proxy,
-                    DocumentEvent::Change {
-                        uri: uri.clone(),
-                        generation,
-                        version: *version,
-                    },
-                );
+                schedule_symbols(proxy, uri, generation, *version);
             }
         }
     }
 }
 
 fn schedule_close(proxy: &mut ProxyState, uri: &str) {
-    schedule_symbol_event(
-        proxy,
-        DocumentEvent::Close {
-            uri: uri.to_owned(),
-            generation: 0,
-        },
-    );
+    forget_symbols(proxy, uri);
 }
 
 fn coalesce_watcher_changes(changes: Vec<WatcherChange>) -> Vec<WatcherChange> {
@@ -1918,7 +1877,7 @@ mod tests {
         let socket = writer.try_clone().unwrap();
         let mut editor = Editor {
             child: None,
-            connection: Connection::with_parts(socket, None, None, writer),
+            connection: Connection::with_parts(socket, None, writer),
             lsp_port: 0,
             dap_port: 0,
         };

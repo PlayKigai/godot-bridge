@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::json::Value;
 use std::io::{self, IoSlice, Read, Write};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -164,23 +164,20 @@ impl FrameDecoder {
 
 pub(crate) type ReadEvent = Result<Option<Vec<u8>>, std::io::Error>;
 
-pub(crate) struct Connection<R = FrameInput> {
+pub(crate) struct Connection {
     pub(crate) socket: std::net::TcpStream,
-    pub(crate) reader: Option<R>,
     pub(crate) reader_thread: Option<JoinHandle<()>>,
     pub(crate) writer: std::net::TcpStream,
 }
 
-impl<R> Connection<R> {
+impl Connection {
     pub(crate) fn with_parts(
         socket: std::net::TcpStream,
-        reader: Option<R>,
         reader_thread: Option<JoinHandle<()>>,
         writer: std::net::TcpStream,
     ) -> Self {
         Self {
             socket,
-            reader,
             reader_thread,
             writer,
         }
@@ -188,14 +185,13 @@ impl<R> Connection<R> {
 
     pub(crate) fn close(&mut self) {
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
-        drop(self.reader.take());
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
         }
     }
 }
 
-impl<R> Drop for Connection<R> {
+impl Drop for Connection {
     fn drop(&mut self) {
         self.close();
     }
@@ -206,7 +202,7 @@ pub(crate) fn connection_without_reader<T, F>(
     name: &str,
     sender: SyncSender<T>,
     map: F,
-) -> std::io::Result<Connection<()>>
+) -> std::io::Result<Connection>
 where
     T: Send + 'static,
     F: Fn(ReadEvent) -> T + Send + 'static,
@@ -215,20 +211,7 @@ where
     let reader_stream = stream.try_clone()?;
     let writer = stream.try_clone()?;
     let reader_thread = spawn_frame_reader_with(name, reader_stream, sender, map)?;
-    Ok(Connection::with_parts(
-        stream,
-        None,
-        Some(reader_thread),
-        writer,
-    ))
-}
-
-pub fn spawn_frame_reader<R: Read + Send + 'static>(
-    name: &str,
-    reader: R,
-    sender: SyncSender<ReadEvent>,
-) -> std::io::Result<JoinHandle<()>> {
-    spawn_frame_reader_with(name, reader, sender, |event| event)
+    Ok(Connection::with_parts(stream, Some(reader_thread), writer))
 }
 
 pub(crate) fn spawn_frame_reader_with<R, T, F>(
@@ -264,111 +247,6 @@ where
                 return;
             }
         })
-}
-
-pub enum FramePoll<T> {
-    Frame(T),
-    Empty,
-    End,
-}
-
-pub struct FrameInput {
-    receiver: Receiver<ReadEvent>,
-    decoder: FrameDecoder,
-    eof: bool,
-}
-
-enum ReceivePoll {
-    Event(ReadEvent),
-    Empty,
-    Closed,
-}
-
-impl FrameInput {
-    pub fn new(receiver: Receiver<ReadEvent>, cap: usize) -> Self {
-        Self {
-            receiver,
-            decoder: FrameDecoder::new(cap),
-            eof: false,
-        }
-    }
-
-    pub fn with_next_frame<T>(
-        &mut self,
-        callback: impl FnOnce(&[u8]) -> T,
-    ) -> Result<Option<T>, FrameError> {
-        match self.next_frame(
-            |receiver| {
-                receiver
-                    .recv()
-                    .map_or(ReceivePoll::Closed, ReceivePoll::Event)
-            },
-            callback,
-        )? {
-            FramePoll::Frame(frame) => Ok(Some(frame)),
-            FramePoll::End => Ok(None),
-            FramePoll::Empty => unreachable!(),
-        }
-    }
-
-    pub fn try_with_next_frame<T>(
-        &mut self,
-        callback: impl FnOnce(&[u8]) -> T,
-    ) -> Result<FramePoll<T>, FrameError> {
-        self.next_frame(
-            |receiver| match receiver.try_recv() {
-                Ok(event) => ReceivePoll::Event(event),
-                Err(TryRecvError::Empty) => ReceivePoll::Empty,
-                Err(TryRecvError::Disconnected) => ReceivePoll::Closed,
-            },
-            callback,
-        )
-    }
-
-    pub fn recv_timeout_with_frame<T>(
-        &mut self,
-        timeout: Duration,
-        callback: impl FnOnce(&[u8]) -> T,
-    ) -> Result<FramePoll<T>, FrameError> {
-        self.next_frame(
-            |receiver| match receiver.recv_timeout(timeout) {
-                Ok(event) => ReceivePoll::Event(event),
-                Err(RecvTimeoutError::Timeout) => ReceivePoll::Empty,
-                Err(RecvTimeoutError::Disconnected) => ReceivePoll::Closed,
-            },
-            callback,
-        )
-    }
-
-    fn next_frame<T, R>(
-        &mut self,
-        mut receive: R,
-        callback: impl FnOnce(&[u8]) -> T,
-    ) -> Result<FramePoll<T>, FrameError>
-    where
-        R: FnMut(&Receiver<ReadEvent>) -> ReceivePoll,
-    {
-        loop {
-            if let Some(body) = self.decoder.next_frame()? {
-                return Ok(FramePoll::Frame(callback(body)));
-            }
-            if self.eof {
-                if self.decoder.has_pending_bytes() {
-                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
-                }
-                return Ok(FramePoll::End);
-            }
-            match receive(&self.receiver) {
-                ReceivePoll::Event(Ok(Some(chunk))) => self.decoder.push(&chunk),
-                ReceivePoll::Event(Ok(None)) => self.eof = true,
-                ReceivePoll::Event(Err(error)) => return Err(FrameError::Io(error)),
-                ReceivePoll::Empty => return Ok(FramePoll::Empty),
-                ReceivePoll::Closed => {
-                    return Err(FrameError::Io(std::io::Error::other("reader is closed")))
-                }
-            }
-        }
-    }
 }
 
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<(), FrameError> {
@@ -487,19 +365,6 @@ mod tests {
         decoder.push(b"Content-Type: application/json\r\n\r\nbody");
         assert!(matches!(
             decoder.next_frame(),
-            Err(FrameError::Malformed(_))
-        ));
-    }
-
-    #[test]
-    fn input_eof_mid_frame() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
-        let body = b"Content-Length: 4\r\n\r\nabc";
-        sender.send(Ok(Some(body.to_vec()))).unwrap();
-        sender.send(Ok(None)).unwrap();
-        let mut input = FrameInput::new(receiver, 64);
-        assert!(matches!(
-            input.with_next_frame(|body| body.len()),
             Err(FrameError::Malformed(_))
         ));
     }

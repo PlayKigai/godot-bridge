@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread::{self, JoinHandle};
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::SyncSender;
 
 use crate::docs_state::{directory_is_skipped, WatcherChange, WatcherChangeKind};
 use crate::root::canonical_or_normalized;
@@ -22,8 +22,7 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MOVE_SELF;
 const EVENT_BUFFER_SIZE: usize = 64 * 1024;
 
-pub struct ProjectWatcher<T = io::Result<WatcherChange>> {
-    pub(crate) receiver: Option<Receiver<T>>,
+pub struct ProjectWatcher {
     stop_write: RawFd,
     thread: Option<JoinHandle<()>>,
 }
@@ -36,19 +35,12 @@ struct WatcherState {
     watch_limit_reached: bool,
 }
 
-pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<ProjectWatcher> {
-    let (sender, receiver) = mpsc::sync_channel(4096);
-    let mut watcher = watch_project_into(project, diagnose_addons, sender, |event| event)?;
-    watcher.receiver = Some(receiver);
-    Ok(watcher)
-}
-
 pub(crate) fn watch_project_into<T, F>(
     project: &Path,
     diagnose_addons: bool,
     sender: SyncSender<T>,
     map: F,
-) -> io::Result<ProjectWatcher<T>>
+) -> io::Result<ProjectWatcher>
 where
     T: Send + 'static,
     F: Fn(io::Result<WatcherChange>) -> T + Send + 'static,
@@ -97,20 +89,12 @@ where
         }
     };
     Ok(ProjectWatcher {
-        receiver: None,
         stop_write,
         thread: Some(thread),
     })
 }
 
-impl<T> ProjectWatcher<T> {
-    #[cfg(test)]
-    pub(crate) fn receiver(&self) -> &Receiver<T> {
-        self.receiver.as_ref().expect("watcher has no receiver")
-    }
-}
-
-impl<T> Drop for ProjectWatcher<T> {
+impl Drop for ProjectWatcher {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.stop_write);
@@ -310,7 +294,7 @@ where
     T: Send + 'static,
     F: Fn(io::Result<WatcherChange>) -> T,
 {
-    while let Some(result) = (|| {
+    loop {
         let mut pollfds = [
             libc::pollfd {
                 fd: state.fd,
@@ -326,30 +310,25 @@ where
         let result = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) };
         if result == -1 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                return Some(true);
+                continue;
             }
             let _ = sender.send(map(Err(io::Error::last_os_error())));
-            return Some(false);
+            break;
         }
         if pollfds[1].revents != 0 {
-            return Some(false);
+            break;
         }
         if pollfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             let _ = sender.send(map(Err(io::Error::other("inotify watch closed"))));
-            return Some(false);
+            break;
         }
         match state.read_events(&sender, &map) {
-            Ok(true) => Some(true),
-            Ok(false) => Some(false),
+            Ok(true) => {}
+            Ok(false) => break,
             Err(error) => {
                 let _ = sender.send(map(Err(error)));
-                Some(false)
+                break;
             }
-        }
-    })() {
-        match result {
-            true => {}
-            false => break,
         }
     }
     unsafe {
@@ -363,19 +342,20 @@ mod tests {
     use super::*;
     use crate::temp::TempDir;
     use std::fs;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     #[test]
     fn watches_file_lifecycle() {
         let directory = TempDir::new().unwrap();
-        let watcher = watch_project(directory.path(), false).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4096);
+        let _watcher = watch_project_into(directory.path(), false, sender, |event| event).unwrap();
         let path = directory.path().join("file.gd");
         fs::write(&path, "one").unwrap();
         let mut changes = Vec::new();
         while changes.len() < 2 {
             changes.push(
-                watcher
-                    .receiver()
+                receiver
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap(),
@@ -389,8 +369,7 @@ mod tests {
             .any(|change| { change.kind == WatcherChangeKind::Modified && change.path == path }));
 
         fs::write(&path, "two").unwrap();
-        let modified = watcher
-            .receiver()
+        let modified = receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
@@ -402,8 +381,7 @@ mod tests {
         let mut rename_changes = Vec::new();
         while rename_changes.len() < 2 {
             rename_changes.push(
-                watcher
-                    .receiver()
+                receiver
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap(),
@@ -417,8 +395,7 @@ mod tests {
             .any(|change| { change.kind == WatcherChangeKind::Created && change.path == renamed }));
 
         fs::remove_file(&renamed).unwrap();
-        let removed = watcher
-            .receiver()
+        let removed = receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
@@ -429,12 +406,12 @@ mod tests {
     #[test]
     fn watches_directories_created_after_start() {
         let directory = TempDir::new().unwrap();
-        let watcher = watch_project(directory.path(), false).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4096);
+        let _watcher = watch_project_into(directory.path(), false, sender, |event| event).unwrap();
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
         loop {
-            let change = watcher
-                .receiver()
+            let change = receiver
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
                 .unwrap();
@@ -445,8 +422,7 @@ mod tests {
         let path = nested.join("file.gd");
         fs::write(&path, "one").unwrap();
         loop {
-            let change = watcher
-                .receiver()
+            let change = receiver
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
                 .unwrap();
