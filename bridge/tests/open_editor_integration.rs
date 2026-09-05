@@ -2,9 +2,31 @@ mod common;
 use common::*;
 use godot_bridge::temp::TempDir;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+struct GuiEditorGuard<'a> {
+    runtime: &'a Path,
+    project: &'a Path,
+    config: &'a Path,
+}
+
+impl Drop for GuiEditorGuard<'_> {
+    fn drop(&mut self) {
+        let Some(value) = status(self.runtime, self.project, self.config) else {
+            return;
+        };
+        if value["mode"] != "gui" {
+            return;
+        }
+        if let Some(pid) = value["godot_pid"].as_i64() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
 
 #[test]
 fn open_editor_handoff_and_gui_recovery() {
@@ -43,6 +65,11 @@ fn open_editor_handoff_and_gui_recovery() {
         "params":{"textDocument":{"uri":file_uri(&project.join("main.gd")),"languageId":"gdscript","version":1,"text":std::fs::read_to_string(project.join("main.gd")).unwrap()}}
     }));
 
+    let _gui_editor = GuiEditorGuard {
+        runtime: runtime.path(),
+        project: &project,
+        config: config.path(),
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
         .args(["open-editor", "--file", "fixtures/minimal-project/main.gd"])
         .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
