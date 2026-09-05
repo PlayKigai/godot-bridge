@@ -1,6 +1,6 @@
 # Handoff
 
-State as of 2026-09-05, commit b6eeaac.
+State as of 2026-09-05, after 20b2ae3.
 
 ## Done
 
@@ -35,16 +35,32 @@ cargo test -p godot-bridge
 All green at b6eeaac: 98 unit tests, 6 integration binaries. Five
 concurrent full-suite runs pass.
 
+## Supply chain gates (2026-09-05)
+
+- `deny.toml`: yanked deny, wildcards deny, multiple versions warn, license
+  allowlist, crates.io only. Own crates are `publish = false` and skipped
+  by the license check because the repo has no license yet.
+- `supply-chain/`: cargo vet with six imports (bytecode-alliance, embark,
+  google, isrg, mozilla, zcash). Baseline: 26 audited, 1 partial,
+  61 exempted of 88 crates. New crates fail `cargo vet` until audited or
+  exempted on purpose.
+- `scripts/check_build_scripts.py`: fails when a crate with a build script
+  or proc macro is missing from `scripts/build_scripts.allow` (24 today).
+- CI: `cargo fetch --locked` then every cargo step `--locked --offline`,
+  cargo-deny, cargo-audit, cargo-vet on each push, cargo-geiger weekly
+  (informational, its output is not asserted). Actions pinned to commit
+  SHAs, Dependabot bumps them. Token is read-only except the audit report.
+- The build-script allowlist is name only. A version bump of an allowed
+  crate is caught by cargo vet, which pins exact versions.
+- Local run: `cargo deny check`, `cargo audit`, `cargo vet`,
+  `python3 scripts/check_build_scripts.py`.
+
 ## Next, in order
 
-1. Reinstall the bridge (`cargo install --path bridge --locked`), rebuild
-   the extension wasm, restart Zed, re-verify on DieQuest.
-2. Supply chain gates: `deny.toml` (yanked deny, wildcards deny,
-   multiple-versions warn, license allowlist, crates.io only),
-   `cargo vet init` with imports, CI running cargo-deny, cargo-audit,
-   weekly cargo-geiger, build-script and proc-macro allowlist via
-   `cargo metadata`, `cargo build --locked --offline`.
-   The tree is `libc` only, so this guards against future additions.
+1. Restart Zed and re-verify on DieQuest with the reinstalled bridge and
+   the rebuilt extension wasm (both from HEAD, 2026-09-05).
+2. Pick a license and add `LICENSE`, then drop `private.ignore` in
+   `deny.toml`.
 3. Deferred perf item, opt-in only: the didChange rewrite re-escapes the
    text (about 20 us of the 80 us). Not worth the code at typing rates.
 

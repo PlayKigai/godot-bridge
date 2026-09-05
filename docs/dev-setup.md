@@ -14,7 +14,7 @@ Bridge:
 
 ```sh
 cargo install --path bridge
-godot-bridge --version
+godot-bridge --help
 ```
 
 Extension:

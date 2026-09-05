@@ -1,6 +1,7 @@
 [package]
 name = "godot-zed-extension"
 version.workspace = true
+publish = false
 edition.workspace = true
 
 [lib]
