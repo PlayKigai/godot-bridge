@@ -213,6 +213,9 @@ impl FrameInput {
                 return Ok(Some(callback(body)));
             }
             if self.eof {
+                if self.decoder.has_pending_bytes() {
+                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
+                }
                 return Ok(None);
             }
             match self.receiver.recv() {
@@ -233,6 +236,9 @@ impl FrameInput {
                 return Ok(FramePoll::Frame(callback(body)));
             }
             if self.eof {
+                if self.decoder.has_pending_bytes() {
+                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
+                }
                 return Ok(FramePoll::End);
             }
             match self.receiver.try_recv() {
@@ -257,6 +263,9 @@ impl FrameInput {
                 return Ok(FramePoll::Frame(callback(body)));
             }
             if self.eof {
+                if self.decoder.has_pending_bytes() {
+                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
+                }
                 return Ok(FramePoll::End);
             }
             match self.receiver.recv_timeout(timeout) {
@@ -415,6 +424,25 @@ mod tests {
     fn eof_mid_frame() {
         let mut reader = FrameReader::new(Cursor::new(b"Content-Length: 4\r\n\r\nabc"), 64);
         assert!(matches!(reader.read_frame(), Err(FrameError::Malformed(_))));
+    }
+
+    #[test]
+    fn input_eof_mid_frame() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let mut chunk = ReadChunk {
+            bytes: [0; READ_CHUNK_SIZE],
+            len: 0,
+        };
+        let body = b"Content-Length: 4\r\n\r\nabc";
+        chunk.bytes[..body.len()].copy_from_slice(body);
+        chunk.len = body.len();
+        sender.send(Ok(Some(chunk))).unwrap();
+        sender.send(Ok(None)).unwrap();
+        let mut input = FrameInput::new(receiver, 64);
+        assert!(matches!(
+            input.with_next_frame(|body| body.len()),
+            Err(FrameError::Malformed(_))
+        ));
     }
 
     #[test]
