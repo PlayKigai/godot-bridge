@@ -3,7 +3,7 @@ use super::*;
 pub(super) struct InitializeInput<'a> {
     pub(super) events: &'a Receiver<ProxyEvent>,
     pub(super) godot: &'a mut FrameState,
-    pub(super) deferred: &'a mut VecDeque<ProxyEvent>,
+    pub(super) deferred: &'a mut DeferredQueue,
 }
 
 pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitCode> {
@@ -254,7 +254,7 @@ fn handle_event(
 pub(super) fn receive_godot_frame(
     events: &Receiver<ProxyEvent>,
     godot: &mut FrameState,
-    deferred: &mut VecDeque<ProxyEvent>,
+    deferred: &mut DeferredQueue,
 ) -> Result<Option<Vec<u8>>> {
     if let Some(body) = godot.frames.pop_front() {
         return Ok(Some(body));
@@ -267,7 +267,7 @@ pub(super) fn receive_godot_frame(
             .recv()
             .map_err(|_| io::Error::other("event channel is closed"))?;
         match event {
-            ProxyEvent::Client(event) => deferred.push_back(ProxyEvent::Client(event)),
+            ProxyEvent::Client(event) => deferred.push_back(ProxyEvent::Client(event))?,
             ProxyEvent::Godot(event) => {
                 godot.feed(event)?;
                 if let Some(body) = godot.frames.pop_front() {
@@ -277,7 +277,7 @@ pub(super) fn receive_godot_frame(
                     return Ok(None);
                 }
             }
-            event => deferred.push_back(event),
+            event => deferred.push_back(event)?,
         }
     }
 }

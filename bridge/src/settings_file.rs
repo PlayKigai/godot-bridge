@@ -386,6 +386,20 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_project_untrusted_setting_is_removed() {
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+        write_project_settings(
+            worktree.path(),
+            r#"{"lsp":{"godot":{"settings":{"godot_path":"/bin/true","godot_path":"/bin/sh"}}}}"#,
+        );
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path, None);
+    }
+
+    #[test]
     fn comment_bearing_settings_file_parses() {
         let config_dir = TempDir::new().unwrap();
         let worktree = TempDir::new().unwrap();

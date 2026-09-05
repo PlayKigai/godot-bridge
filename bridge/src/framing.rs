@@ -211,6 +211,7 @@ where
     T: Send + 'static,
     F: Fn(ReadEvent) -> T + Send + 'static,
 {
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let reader_stream = stream.try_clone()?;
     let writer = stream.try_clone()?;
     let reader_thread = spawn_frame_reader_with(name, reader_stream, sender, map)?;

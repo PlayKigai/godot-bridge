@@ -179,7 +179,7 @@ struct Session {
     events: Receiver<ProxyEvent>,
     client: FrameState,
     godot: FrameState,
-    deferred: VecDeque<ProxyEvent>,
+    deferred: DeferredQueue,
     output: ClientWriter,
     proxy: ProxyState,
     runtime: Runtime,
@@ -202,6 +202,52 @@ enum ProxyEvent {
     Watcher(std::io::Result<WatcherChange>),
     Internal(InternalEvent),
     Handoff(LockGuard),
+}
+
+#[derive(Default)]
+struct DeferredQueue {
+    events: VecDeque<ProxyEvent>,
+    bytes: usize,
+}
+
+impl DeferredQueue {
+    fn push_back(&mut self, event: ProxyEvent) -> Result<()> {
+        let size = deferred_event_size(&event);
+        if self
+            .bytes
+            .checked_add(size)
+            .is_none_or(|total| total > QUEUE_BYTES_CAP)
+        {
+            crate::bail!("deferred event queue is too large");
+        }
+        self.bytes += size;
+        self.events.push_back(event);
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<ProxyEvent> {
+        let event = self.events.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(deferred_event_size(&event));
+        Some(event)
+    }
+}
+
+fn deferred_event_size(event: &ProxyEvent) -> usize {
+    std::mem::size_of::<ProxyEvent>()
+        + match event {
+            ProxyEvent::Client(event) | ProxyEvent::Godot(event) => event
+                .as_ref()
+                .ok()
+                .and_then(|event| event.as_ref())
+                .map_or(0, Vec::len),
+            ProxyEvent::Watcher(Ok(change)) => change.path.as_os_str().len(),
+            ProxyEvent::Internal(InternalEvent::Bulk { document, .. }) => {
+                document.path.as_os_str().len()
+                    + document.key.as_os_str().len()
+                    + document.text.len()
+            }
+            _ => 0,
+        }
 }
 
 struct FrameState {
@@ -412,7 +458,7 @@ fn wait_for_detached_ports_during_handoff(
                 }
             }
             Ok(ProxyEvent::Godot(_)) => {}
-            Ok(event) => session.deferred.push_back(event),
+            Ok(event) => session.deferred.push_back(event)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 crate::bail!("Zed closed during GUI handoff")
@@ -545,7 +591,7 @@ pub fn run() -> Result<ExitCode> {
     .map_err(|error| crate::error::Error::new(error.to_string()))?;
     let mut client = FrameState::new(CLIENT_FRAME_CAP);
     let mut godot = FrameState::new(GODOT_FRAME_CAP);
-    let mut deferred = VecDeque::new();
+    let mut deferred = DeferredQueue::default();
     let mut output = client_writer();
     let initialize = match receive_client_frame(&event_receiver, &mut client, &mut deferred)? {
         Some(body) => parse_message(&body).map_err(crate::error::Error::new)?,
@@ -1137,7 +1183,10 @@ fn forward_server_message<W: Write>(
                         message.get("result").unwrap_or(&Value::Null),
                         &uri,
                         &mut proxy.symbol_containers,
-                    ) {
+                    )
+                    .into_iter()
+                    .filter(|(symbol_uri, _)| symbol_uri == &uri)
+                    {
                         proxy
                             .symbol_cache
                             .entry(symbol_uri)
@@ -1564,7 +1613,7 @@ fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
 fn receive_client_frame(
     events: &Receiver<ProxyEvent>,
     client: &mut FrameState,
-    deferred: &mut VecDeque<ProxyEvent>,
+    deferred: &mut DeferredQueue,
 ) -> Result<Option<Vec<u8>>> {
     loop {
         if let Some(body) = client.frames.pop_front() {
@@ -1578,7 +1627,7 @@ fn receive_client_frame(
             .map_err(|_| io::Error::other("event channel is closed"))?;
         match event {
             ProxyEvent::Client(event) => client.feed(event)?,
-            event => deferred.push_back(event),
+            event => deferred.push_back(event)?,
         }
     }
 }
@@ -1917,16 +1966,22 @@ mod tests {
         let mut decoder = FrameDecoder::new(GODOT_FRAME_CAP);
         decoder.push(&bytes[..size]);
         let request = crate::json::from_slice(decoder.next_frame().unwrap().unwrap()).unwrap();
-        let response = crate::json!({"jsonrpc":"2.0","id":(request["id"].clone()),"result":null});
+        let response = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"id":{},"result":null}}"#,
+            request["id"], request["id"]
+        );
         forward_server_message(
             &mut editor.connection.writer,
             0,
             &mut output,
             &mut proxy,
-            &crate::json::to_vec(&response),
+            response.as_bytes(),
             false,
         )
         .unwrap();
-        assert!(String::from_utf8(output).unwrap().contains("\"id\":99"));
+        let output = String::from_utf8(output).unwrap();
+        let body = output.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(body.matches("\"id\"").count(), 1);
+        assert_eq!(crate::json::from_str(body).unwrap()["id"], crate::json!(99));
     }
 }

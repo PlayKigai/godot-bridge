@@ -322,7 +322,7 @@ pub(super) fn replay_initialize(
     proxy: &mut ProxyState,
     events: &Receiver<ProxyEvent>,
     godot: &mut FrameState,
-    deferred: &mut VecDeque<ProxyEvent>,
+    deferred: &mut DeferredQueue,
 ) -> Result<()> {
     let mut initialize = proxy.initialize.clone();
     let id = proxy.next_id;

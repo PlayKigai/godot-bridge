@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Index, IndexMut};
 use std::str;
@@ -133,34 +133,6 @@ impl Map {
         }
         self.0.push((key, value));
         None
-    }
-
-    fn push(&mut self, key: String, value: Value) {
-        self.0.push((key, value));
-    }
-
-    fn deduplicate(&mut self) {
-        if self.0.len() <= 16 {
-            return;
-        }
-        let entries = std::mem::take(&mut self.0);
-        let mut values = HashMap::with_capacity(entries.len());
-        let mut keys = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            match values.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    entry.insert(value);
-                }
-                Entry::Vacant(entry) => {
-                    keys.push(entry.key().clone());
-                    entry.insert(value);
-                }
-            }
-        }
-        self.0 = keys
-            .into_iter()
-            .map(|key| (key.clone(), values.remove(&key).expect("deduplicated key")))
-            .collect();
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
@@ -681,6 +653,45 @@ struct Parser<'a> {
     relaxed: bool,
 }
 
+struct ObjectBuilder {
+    object: Map,
+    indices: Option<HashMap<String, usize>>,
+}
+
+impl ObjectBuilder {
+    fn new() -> Self {
+        Self {
+            object: Map::new(),
+            indices: None,
+        }
+    }
+
+    fn insert(&mut self, key: String, value: Value) {
+        if self.indices.is_none() && self.object.0.len() >= 16 {
+            let mut indices = HashMap::with_capacity(self.object.0.len() + 1);
+            for (index, (key, _)) in self.object.0.iter().enumerate() {
+                indices.insert(key.clone(), index);
+            }
+            self.indices = Some(indices);
+        }
+        if let Some(indices) = &mut self.indices {
+            if let Some(&index) = indices.get(&key) {
+                self.object.0[index].1 = value;
+            } else {
+                let index = self.object.0.len();
+                indices.insert(key.clone(), index);
+                self.object.0.push((key, value));
+            }
+        } else {
+            self.object.insert(key, value);
+        }
+    }
+
+    fn finish(self) -> Map {
+        self.object
+    }
+}
+
 impl<'a> Parser<'a> {
     fn new(input: &'a [u8], relaxed: bool) -> Self {
         Self {
@@ -938,9 +949,9 @@ impl<'a> Parser<'a> {
         }
         self.index += 1;
         self.skip_space()?;
-        let mut object = Map::new();
+        let mut object = ObjectBuilder::new();
         if self.take(b'}') {
-            return Ok(Value::Object(object));
+            return Ok(Value::Object(object.finish()));
         }
         loop {
             if self.input.get(self.index) != Some(&b'"') {
@@ -952,11 +963,10 @@ impl<'a> Parser<'a> {
                 return self.error("expected ':' after object key");
             }
             let value = self.parse_value(depth + 1)?;
-            object.push(key, value);
+            object.insert(key, value);
             self.skip_space()?;
             if self.take(b'}') {
-                object.deduplicate();
-                return Ok(Value::Object(object));
+                return Ok(Value::Object(object.finish()));
             }
             if !self.take(b',') {
                 return self.error("expected ',' or '}' in object");
@@ -964,8 +974,7 @@ impl<'a> Parser<'a> {
             self.skip_space()?;
             if self.take(b'}') {
                 if self.relaxed {
-                    object.deduplicate();
-                    return Ok(Value::Object(object));
+                    return Ok(Value::Object(object.finish()));
                 }
                 return self.error("trailing comma is not allowed");
             }
@@ -1265,6 +1274,16 @@ break"}"#,
     fn numbers_keep_their_lexical_form() {
         let value = from_str(r#"{"id":-12.3400e+05}"#).unwrap();
         assert_eq!(value["id"].to_string(), "-12.3400e+05");
+    }
+
+    #[test]
+    fn duplicate_keys_are_replaced_and_removed_once() {
+        let mut value = from_str(r#"{"key":1,"key":2}"#).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.iter().count(), 1);
+        assert_eq!(value["key"], crate::json!(2));
+        assert!(value.as_object_mut().unwrap().remove("key").is_some());
+        assert!(!value.as_object().unwrap().contains_key("key"));
     }
 
     #[test]
