@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) struct InitializeInput<'a> {
+    pub(super) events: &'a Receiver<ProxyEvent>,
+    pub(super) godot: &'a mut FrameState,
+    pub(super) deferred: &'a mut VecDeque<ProxyEvent>,
+}
+
 pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitCode> {
     if unmanaged {
         let init = session.proxy.initialize.clone();
@@ -10,6 +16,11 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             &mut session.proxy,
             &project,
             session.settings.project_diagnostics,
+            InitializeInput {
+                events: &session.events,
+                godot: &mut session.godot,
+                deferred: &mut session.deferred,
+            },
         ) {
             send_error(
                 &mut session.output,
@@ -23,13 +34,17 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
     }
     if session.settings.project_diagnostics {
         session.watch.watcher = Some(
-            crate::watch::watch_project(&session.proxy.project, session.settings.diagnose_addons)
-                .context("cannot watch project")?,
+            crate::watch::watch_project_into(
+                &session.proxy.project,
+                session.settings.diagnose_addons,
+                session.proxy.internal_sender.clone(),
+                ProxyEvent::Watcher,
+            )
+            .context("cannot watch project")?,
         );
     }
     let gui_interval = Duration::from_millis(200);
     let mut gui_deadline = Instant::now() + gui_interval;
-    let mut turn = 0;
     loop {
         if !session.proxy.bulk_replay
             && !session.proxy.project_diagnostics_started
@@ -47,16 +62,15 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             }
             continue;
         }
-        let symbol_deadline = session
-            .proxy
-            .symbol_scheduled
-            .values()
-            .map(|(_, _, deadline)| *deadline)
-            .min();
+        let mut symbol_deadline = next_symbol_deadline(&session.proxy);
         if symbol_deadline.is_some_and(|deadline| deadline <= now) {
-            if let Err(error) = send_due_symbol_requests(&mut session.editor, &mut session.proxy) {
-                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                    return Ok(code);
+            let result = send_due_symbol_requests(&mut session.editor, &mut session.proxy);
+            match result {
+                Ok(next) => symbol_deadline = next,
+                Err(error) => {
+                    if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                        return Ok(code);
+                    }
                 }
             }
         }
@@ -64,12 +78,10 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS || session.proxy.bulk_complete)
             && bulk_can_advance(&session.proxy, now)
         {
-            if let Err(error) =
-                pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
-            {
-                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                    return Ok(code);
-                }
+            let result =
+                pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer);
+            if let Some(code) = guard(&mut session, unmanaged, result)? {
+                return Ok(code);
             }
         }
         if session
@@ -79,176 +91,19 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         {
             let changes = coalesce_watcher_changes(std::mem::take(&mut session.watch.pending));
             session.watch.deadline = None;
-            if let Err(error) = process_watcher_changes(
+            let result = process_watcher_changes(
                 &mut session.proxy,
                 &mut session.output,
                 Some(&mut session.editor),
                 &session.settings,
                 changes,
                 false,
-            ) {
-                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                    return Ok(code);
-                }
+            );
+            if let Some(code) = guard(&mut session, unmanaged, result)? {
+                return Ok(code);
             }
         }
-        let mut processed = false;
-        for offset in 0..5 {
-            match (turn + offset) % 5 {
-                0 => {
-                    let event = {
-                        let input = &mut session.input;
-                        let editor = &mut session.editor;
-                        let output = &mut session.output;
-                        let proxy = &mut session.proxy;
-                        let settings = &session.settings;
-                        input.try_with_next_frame(|body| {
-                            process_client_frame(editor, output, proxy, settings, body)
-                        })
-                    };
-                    match event {
-                        Ok(FramePoll::Frame(Ok(frame))) => {
-                            processed = true;
-                            if let Some(code) = handle_client_frame(&mut session, unmanaged, frame)?
-                            {
-                                return Ok(code);
-                            }
-                        }
-                        Ok(FramePoll::End) => return exit_session(&mut session, 0),
-                        Ok(FramePoll::Empty) => {}
-                        Ok(FramePoll::Frame(Err(error))) => {
-                            crate::error!("malformed client message: {error}");
-                            return exit_session(&mut session, 1);
-                        }
-                        Err(error) => {
-                            crate::error!("malformed client frame: {error}");
-                            return exit_session(&mut session, 1);
-                        }
-                    }
-                }
-                1 => {
-                    let lsp_port = session.editor.lsp_port;
-                    let event = {
-                        let connection = &mut session.editor.connection;
-                        let reader = connection.reader.as_mut();
-                        let writer = &mut connection.writer;
-                        let output = &mut session.output;
-                        let proxy = &mut session.proxy;
-                        reader
-                            .ok_or_else(|| {
-                                crate::framing::FrameError::Io(io::Error::other("reader is closed"))
-                            })?
-                            .try_with_next_frame(|body| {
-                                forward_server_message(writer, lsp_port, output, proxy, body, false)
-                            })
-                    };
-                    match event {
-                        Ok(FramePoll::Frame(Ok(()))) => processed = true,
-                        Ok(FramePoll::Frame(Err(error))) => {
-                            processed = true;
-                            crate::error!("cannot forward server message: {error}");
-                            if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                                return Ok(code);
-                            }
-                        }
-                        Ok(FramePoll::Empty) => {}
-                        Ok(FramePoll::End) | Err(_) => {
-                            if unmanaged {
-                                return exit_session(&mut session, 1);
-                            }
-                            let reason = session
-                                .editor
-                                .child
-                                .as_mut()
-                                .and_then(|child| child.child.try_wait().ok().flatten());
-                            recover_with_status(&mut session, reason)?;
-                        }
-                    }
-                }
-                2 => {
-                    let handoff = session
-                        .runtime
-                        .handoff_receiver
-                        .as_mut()
-                        .and_then(|receiver| receiver.try_recv().ok());
-                    if let Some(handoff) = handoff {
-                        processed = true;
-                        perform_handoff(&mut session, handoff)?;
-                    }
-                }
-                3 => {
-                    let watcher_result = session
-                        .watch
-                        .watcher
-                        .as_mut()
-                        .and_then(|watcher| watcher.receiver.try_recv().ok());
-                    if let Some(watcher_result) = watcher_result {
-                        processed = true;
-                        absorb_watcher_event(&mut session.watch, Some(watcher_result));
-                    }
-                }
-                _ => match session.proxy.internal_events.try_recv() {
-                    Ok(event) => {
-                        processed = true;
-                        match event {
-                            InternalEvent::Document(event) => {
-                                schedule_symbol_event(&mut session.proxy, event);
-                                if let Err(error) = send_due_symbol_requests(
-                                    &mut session.editor,
-                                    &mut session.proxy,
-                                ) {
-                                    if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                                        return Ok(code);
-                                    }
-                                }
-                            }
-                            InternalEvent::Bulk {
-                                generation,
-                                document,
-                            } if generation == session.proxy.bulk_generation => {
-                                session.proxy.bulk_documents.push_back(document);
-                                if session.proxy.bulk_documents.len() >= BULK_DOCUMENTS {
-                                    if let Err(error) = pump_bulk_documents(
-                                        &mut session.proxy,
-                                        &mut session.editor.connection.writer,
-                                    ) {
-                                        if let Some(code) =
-                                            on_error(&mut session, unmanaged, &error)?
-                                        {
-                                            return Ok(code);
-                                        }
-                                    }
-                                }
-                            }
-                            InternalEvent::BulkComplete { generation }
-                                if generation == session.proxy.bulk_generation =>
-                            {
-                                session.proxy.bulk_complete = true;
-                                if let Err(error) = pump_bulk_documents(
-                                    &mut session.proxy,
-                                    &mut session.editor.connection.writer,
-                                ) {
-                                    if let Some(code) = on_error(&mut session, unmanaged, &error)? {
-                                        return Ok(code);
-                                    }
-                                }
-                            }
-                            InternalEvent::Bulk { .. } => {}
-                            InternalEvent::BulkComplete { .. } => {}
-                        }
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
-                },
-            }
-            if processed {
-                break;
-            }
-        }
-        turn = (turn + 1) % 5;
-        if processed {
-            continue;
-        }
-        let mut wait = Duration::from_millis(100);
+        let mut wait = Duration::from_secs(3600);
         let now = Instant::now();
         if let Some(deadline) = symbol_deadline {
             wait = wait.min(
@@ -271,29 +126,165 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                     .unwrap_or(Duration::ZERO),
             );
         }
-        if wait.is_zero() {
-            continue;
+        if let Some(deadline) = session.proxy.bulk_deadline {
+            wait = wait.min(
+                deadline
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO),
+            );
         }
-        let event = {
-            let input = &mut session.input;
-            let editor = &mut session.editor;
-            let output = &mut session.output;
-            let proxy = &mut session.proxy;
-            let settings = &session.settings;
-            input.recv_timeout_with_frame(wait, |body| {
-                process_client_frame(editor, output, proxy, settings, body)
-            })
-        };
+        let event = session
+            .deferred
+            .pop_front()
+            .map(Ok)
+            .unwrap_or_else(|| session.events.recv_timeout(wait));
         match event {
-            Ok(FramePoll::Frame(Ok(frame))) => {
-                if let Some(code) = handle_client_frame(&mut session, unmanaged, frame)? {
+            Ok(event) => {
+                if let Some(code) = handle_event(&mut session, unmanaged, event)? {
                     return Ok(code);
                 }
             }
-            Ok(FramePoll::End) => return exit_session(&mut session, 0),
-            Ok(FramePoll::Empty) => {}
-            Ok(FramePoll::Frame(Err(error))) => return Err(error.into()),
-            Err(_) => return exit_session(&mut session, 1),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return exit_session(&mut session, 1),
+        }
+    }
+}
+
+fn handle_event(
+    session: &mut Session,
+    unmanaged: bool,
+    event: ProxyEvent,
+) -> Result<Option<ExitCode>> {
+    match event {
+        ProxyEvent::Client(event) => {
+            session.client.feed(event)?;
+            while let Some(body) = session.client.frames.pop_front() {
+                let frame = process_client_frame(
+                    &mut session.editor,
+                    &mut session.output,
+                    &mut session.proxy,
+                    &session.settings,
+                    &body,
+                );
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        crate::error!("malformed client message: {error}");
+                        return Ok(Some(exit_session(session, 1)?));
+                    }
+                };
+                if let Some(code) = handle_client_frame(session, unmanaged, frame)? {
+                    return Ok(Some(code));
+                }
+            }
+            if session.client.eof && session.client.frames.is_empty() {
+                return Ok(Some(exit_session(session, 0)?));
+            }
+        }
+        ProxyEvent::Godot(event) => {
+            let result = session.godot.feed(event);
+            if let Some(code) = guard(session, unmanaged, result)? {
+                return Ok(Some(code));
+            }
+            while let Some(body) = session.godot.frames.pop_front() {
+                let result = forward_server_message(
+                    &mut session.editor.connection.writer,
+                    session.editor.lsp_port,
+                    &mut session.output,
+                    &mut session.proxy,
+                    &body,
+                    false,
+                );
+                let failed = result.is_err();
+                if let Some(code) = guard(session, unmanaged, result)? {
+                    return Ok(Some(code));
+                }
+                if failed {
+                    break;
+                }
+            }
+            if session.godot.eof && session.godot.frames.is_empty() {
+                if unmanaged {
+                    return Ok(Some(exit_session(session, 1)?));
+                }
+                let reason = session
+                    .editor
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.child.try_wait().ok().flatten());
+                recover_with_status(session, reason)?;
+            }
+        }
+        ProxyEvent::Watcher(result) => {
+            absorb_watcher_event(&mut session.watch, Some(result));
+        }
+        ProxyEvent::Internal(event) => match event {
+            InternalEvent::Document(event) => {
+                schedule_symbol_event(&mut session.proxy, event);
+                let result = send_due_symbol_requests(&mut session.editor, &mut session.proxy);
+                if let Some(code) = guard(session, unmanaged, result)? {
+                    return Ok(Some(code));
+                }
+            }
+            InternalEvent::Bulk {
+                generation,
+                document,
+            } if generation == session.proxy.bulk_generation => {
+                session.proxy.bulk_documents.push_back(document);
+                if session.proxy.bulk_documents.len() >= BULK_DOCUMENTS {
+                    let result = pump_bulk_documents(
+                        &mut session.proxy,
+                        &mut session.editor.connection.writer,
+                    );
+                    if let Some(code) = guard(session, unmanaged, result)? {
+                        return Ok(Some(code));
+                    }
+                }
+            }
+            InternalEvent::BulkComplete { generation }
+                if generation == session.proxy.bulk_generation =>
+            {
+                session.proxy.bulk_complete = true;
+                let result =
+                    pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer);
+                if let Some(code) = guard(session, unmanaged, result)? {
+                    return Ok(Some(code));
+                }
+            }
+            InternalEvent::Bulk { .. } | InternalEvent::BulkComplete { .. } => {}
+        },
+        ProxyEvent::Handoff(lock) => perform_handoff(session, lock)?,
+    }
+    Ok(None)
+}
+
+pub(super) fn receive_godot_frame(
+    events: &Receiver<ProxyEvent>,
+    godot: &mut FrameState,
+    deferred: &mut VecDeque<ProxyEvent>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(body) = godot.frames.pop_front() {
+        return Ok(Some(body));
+    }
+    if godot.eof {
+        return Ok(None);
+    }
+    loop {
+        let event = events
+            .recv()
+            .map_err(|_| io::Error::other("event channel is closed"))?;
+        match event {
+            ProxyEvent::Client(event) => deferred.push_back(ProxyEvent::Client(event)),
+            ProxyEvent::Godot(event) => {
+                godot.feed(event)?;
+                if let Some(body) = godot.frames.pop_front() {
+                    return Ok(Some(body));
+                }
+                if godot.eof {
+                    return Ok(None);
+                }
+            }
+            event => deferred.push_back(event),
         }
     }
 }
@@ -359,6 +350,16 @@ fn on_error(
     Ok(None)
 }
 
+fn guard<T>(session: &mut Session, unmanaged: bool, result: Result<T>) -> Result<Option<ExitCode>> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(error) => {
+            crate::error!("proxy error: {error}");
+            on_error(session, unmanaged, &error)
+        }
+    }
+}
+
 fn exit_session(session: &mut Session, code: u8) -> Result<ExitCode> {
     let child = session.editor.child.take();
     cleanup_runtime(&mut session.runtime, child);
@@ -384,8 +385,8 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
         }
     };
     loop {
-        match session.editor.connection.read_frame() {
-            Ok(Some(body)) => {
+        match receive_godot_frame(&session.events, &mut session.godot, &mut session.deferred)? {
+            Some(body) => {
                 let is_response = parse_message(&body)
                     .ok()
                     .and_then(|message| message.get("id").and_then(Value::as_i64))
@@ -402,7 +403,7 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
                     return exit_session(session, 0);
                 }
             }
-            Ok(None) | Err(_) => return exit_session(session, 1),
+            None => return exit_session(session, 1),
         }
     }
 }
@@ -413,6 +414,7 @@ pub(super) fn forward_initialize(
     proxy: &mut ProxyState,
     project: &Path,
     project_diagnostics: bool,
+    input: InitializeInput<'_>,
 ) -> std::result::Result<(), String> {
     let mut initialize = proxy.initialize.clone();
     let original_id = initialize.get("id").cloned().unwrap_or(Value::Null);
@@ -426,11 +428,9 @@ pub(super) fn forward_initialize(
         return Err(error.to_string());
     }
     loop {
-        let frame = match editor.connection.read_frame() {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Err("Godot closed during initialize".to_owned()),
-            Err(error) => return Err(error.to_string()),
-        };
+        let frame = receive_godot_frame(input.events, input.godot, input.deferred)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Godot closed during initialize".to_owned())?;
         let fields = crate::json::scan_top_level(&frame).map_err(|error| error.to_string())?;
         let message = parse_message(&frame)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")

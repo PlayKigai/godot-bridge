@@ -1,9 +1,9 @@
 use super::*;
 
-pub(super) fn start_recovery(session: &mut Session) -> Result<RecoveryQueue> {
+pub(super) fn start_recovery(session: &mut Session) -> Result<()> {
     reset_for_recovery(session)?;
     fail_in_flight(session)?;
-    Ok(RecoveryQueue::default())
+    Ok(())
 }
 
 fn reset_for_recovery(session: &mut Session) -> Result<()> {
@@ -16,6 +16,7 @@ fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.bulk_active = false;
     session.proxy.bulk_replay = false;
     session.proxy.bulk_deadline = None;
+    session.godot = FrameState::new(GODOT_FRAME_CAP);
     session.proxy.bulk_generation += 1;
     session.proxy.project_diagnostics_started = false;
     set_recovering(&session.runtime)
@@ -32,10 +33,8 @@ fn fail_in_flight(session: &mut Session) -> Result<()> {
             )?;
         }
     }
-    for (queued, _) in session.proxy.queued.drain(..) {
-        if let Some(id) = queued.get("id") {
-            send_error(&mut session.output, id, -32803, "RequestFailed")?;
-        }
+    for (_, zed_id, _) in session.proxy.queued.drain(..) {
+        send_error(&mut session.output, &zed_id, -32803, "RequestFailed")?;
     }
     session.proxy.queued_bytes = 0;
     let served = session.proxy.server_requests.drain();
@@ -96,7 +95,6 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     let deadline = startup_deadline(session.settings.startup_timeout_s);
     let mut candidate = None;
     let mut last_error = None;
-    let mut recovery_queue = RecoveryQueue::default();
     let project = session.proxy.project.clone();
     for _ in 0..STARTUP_ATTEMPTS {
         match spawn_one(
@@ -137,9 +135,15 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
             true,
         )?;
     }
-    replay_initialize(&mut replacement, &mut session.proxy)?;
+    replay_initialize(
+        &mut replacement,
+        &mut session.proxy,
+        &session.events,
+        &mut session.godot,
+        &mut session.deferred,
+    )?;
     session.editor = replacement;
-    finish_recovery(session, &mut recovery_queue)?;
+    finish_recovery(session, &mut RecoveryQueue::default())?;
     Ok(())
 }
 
@@ -181,8 +185,12 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
     set_ready(&session.runtime, &session.editor)?;
     while let Some(item) = queue.items.pop_front() {
         let message = match item {
-            RecoveryItem::Request(message) | RecoveryItem::Notification(message) => message,
-            RecoveryItem::Response(message) => {
+            RecoveryItem::Request(message, size) | RecoveryItem::Notification(message, size) => {
+                queue.bytes = queue.bytes.saturating_sub(size);
+                message
+            }
+            RecoveryItem::Response(message, size) => {
+                queue.bytes = queue.bytes.saturating_sub(size);
                 if message.get("id").is_some_and(|id| {
                     session
                         .proxy
@@ -252,7 +260,7 @@ pub(super) fn queue_recovery_message(
     body: &[u8],
 ) -> Result<()> {
     let message = parse_message(body)?;
-    let size = crate::json::to_vec(&message).len();
+    let size = body.len();
     if message.get("method").is_some() {
         if message.get("id").is_some() {
             if queue.requests >= RECOVERY_QUEUE_CAP
@@ -265,18 +273,19 @@ pub(super) fn queue_recovery_message(
             }
             queue.requests += 1;
             queue.bytes += size;
-            queue.items.push_back(RecoveryItem::Request(message));
+            queue.items.push_back(RecoveryItem::Request(message, size));
         } else {
-            if queue.notifications >= RECOVERY_QUEUE_CAP
+            while queue.notifications >= RECOVERY_QUEUE_CAP
                 || queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP
             {
                 if let Some(index) = queue
                     .items
                     .iter()
-                    .position(|item| matches!(item, RecoveryItem::Notification(_)))
+                    .position(|item| matches!(item, RecoveryItem::Notification(_, _)))
                 {
-                    if let Some(RecoveryItem::Notification(old)) = queue.items.remove(index) {
-                        queue.bytes = queue.bytes.saturating_sub(crate::json::to_vec(&old).len());
+                    if let Some(RecoveryItem::Notification(_, old_size)) = queue.items.remove(index)
+                    {
+                        queue.bytes = queue.bytes.saturating_sub(old_size);
                     }
                     queue.notifications -= 1;
                     crate::warn!("dropping oldest notification from recovery queue");
@@ -285,9 +294,15 @@ pub(super) fn queue_recovery_message(
                     return Ok(());
                 }
             }
+            if queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP {
+                crate::warn!("dropping notification from full recovery queue");
+                return Ok(());
+            }
             queue.notifications += 1;
             queue.bytes += size;
-            queue.items.push_back(RecoveryItem::Notification(message));
+            queue
+                .items
+                .push_back(RecoveryItem::Notification(message, size));
         }
     } else if message.get("id").is_some() {
         if queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP {
@@ -295,14 +310,20 @@ pub(super) fn queue_recovery_message(
             return Ok(());
         }
         queue.bytes += size;
-        queue.items.push_back(RecoveryItem::Response(message));
+        queue.items.push_back(RecoveryItem::Response(message, size));
     } else {
         crate::warn!("dropping invalid message from recovery queue");
     }
     Ok(())
 }
 
-pub(super) fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyState) -> Result<()> {
+pub(super) fn replay_initialize(
+    editor: &mut Editor,
+    proxy: &mut ProxyState,
+    events: &Receiver<ProxyEvent>,
+    godot: &mut FrameState,
+    deferred: &mut VecDeque<ProxyEvent>,
+) -> Result<()> {
     let mut initialize = proxy.initialize.clone();
     let id = proxy.next_id;
     proxy.next_id += 1;
@@ -320,10 +341,21 @@ pub(super) fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyState) -> 
     );
     send_godot(&mut editor.connection.writer, &initialize, true)?;
     loop {
-        let body = editor
-            .connection
-            .read_frame()?
-            .ok_or_else(|| crate::error::Error::new("Godot closed during recovery initialize"))?;
+        let body = match receive_godot_frame(events, godot, deferred)? {
+            Some(body) => body,
+            None => {
+                if let Some(child) = editor.child.as_mut() {
+                    crate::debug!(
+                        "recovery Godot status: {:?}; output: {:?}",
+                        child.child.try_wait(),
+                        child.last_lines()
+                    );
+                }
+                return Err(crate::error::Error::new(
+                    "Godot closed during recovery initialize",
+                ));
+            }
+        };
         let message = parse_message(&body)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {

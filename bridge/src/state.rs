@@ -516,10 +516,6 @@ where
     })
 }
 
-pub fn unknown_command() -> Value {
-    crate::json!({"error": "unknown cmd"})
-}
-
 fn handle_client<F>(stream: UnixStream, handler: Arc<F>, stop: Arc<AtomicBool>)
 where
     F: Fn(Value) -> Value + Send + Sync + 'static,
@@ -532,11 +528,12 @@ where
     };
     let mut reader = BufReader::new(reader_stream);
     let mut write = stream;
+    let mut partial = Vec::new();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let line = match read_line_limited(&mut reader) {
+        let line = match read_line_limited(&mut reader, &mut partial) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
@@ -551,7 +548,7 @@ where
                 if known {
                     handler(request)
                 } else {
-                    unknown_command()
+                    crate::json!({"error": "unknown cmd"})
                 }
             }
             Err(_) => crate::json!({"error": "invalid json"}),
@@ -564,8 +561,10 @@ where
     }
 }
 
-fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
@@ -596,7 +595,7 @@ fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(Some(line));
+            return Ok(Some(std::mem::take(line)));
         }
     }
 }
@@ -610,7 +609,8 @@ pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) ->
     let mut bytes = crate::json::to_vec(req);
     bytes.push(b'\n');
     write.write_all(&bytes)?;
-    let line = read_line_limited(&mut reader)?
+    let mut partial = Vec::new();
+    let line = read_line_limited(&mut reader, &mut partial)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
     crate::json::from_slice(&line).map_err(io::Error::other)
 }

@@ -2,10 +2,12 @@ use crate::error::{Context, Result};
 use crate::json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
+use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, TcpStream};
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,8 +17,8 @@ use crate::docs_state::{
     WatcherChangeKind, BULK_DOCUMENTS,
 };
 use crate::framing::{
-    parse_json_object, spawn_frame_reader, write_frame, write_json, Connection, FrameInput,
-    FramePoll,
+    parse_json_object, spawn_frame_reader_with, write_frame, write_json, Connection, FrameDecoder,
+    ReadEvent,
 };
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{
@@ -52,7 +54,19 @@ const QUEUE_BYTES_CAP: usize = 64 * 1024 * 1024;
 const WATCHER_PENDING_CAP: usize = 4096;
 const STARTUP_ATTEMPTS: usize = 3;
 
-type ClientWriter = BufWriter<std::io::Stdout>;
+type ClientWriter = BufWriter<StdoutFile>;
+
+struct StdoutFile(ManuallyDrop<std::fs::File>);
+
+impl Write for StdoutFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
 
 struct PendingRequest {
     zed_id: Value,
@@ -103,7 +117,7 @@ impl RequestKeys {
 struct ProxyState {
     documents: DocumentState,
     pending: HashMap<i64, PendingRequest>,
-    queued: VecDeque<(Value, usize)>,
+    queued: VecDeque<(Value, Value, usize)>,
     queued_bytes: usize,
     server_requests: RequestKeys,
     stale_server_ids: RequestKeys,
@@ -115,9 +129,9 @@ struct ProxyState {
     recovery_times: VecDeque<Instant>,
     project_diagnostics_started: bool,
     workspace_symbols_notice_sent: bool,
-    internal_events: Receiver<InternalEvent>,
-    internal_sender: mpsc::Sender<InternalEvent>,
+    internal_sender: mpsc::SyncSender<ProxyEvent>,
     symbol_cache: HashMap<String, Vec<Symbol>>,
+    symbol_containers: symbols::ContainerTable,
     symbol_scheduled: HashMap<String, (u64, i64, Instant)>,
     bulk_generation: u64,
     bulk_documents: VecDeque<docs_state::ScannedDocument>,
@@ -141,7 +155,7 @@ enum InternalEvent {
 
 struct Editor {
     child: Option<GodotChild>,
-    connection: Connection,
+    connection: Connection<()>,
     lsp_port: u16,
     dap_port: u16,
 }
@@ -151,19 +165,22 @@ struct Runtime {
     state: Arc<RwLock<State>>,
     socket: Option<crate::state::SocketHandle>,
     lock: Option<crate::state::LockGuard>,
-    handoff_receiver: Option<Receiver<LockGuard>>,
+    event_sender: mpsc::SyncSender<ProxyEvent>,
     mode: Mode,
 }
 
 #[derive(Default)]
 struct Watch {
-    watcher: Option<ProjectWatcher>,
+    watcher: Option<ProjectWatcher<ProxyEvent>>,
     pending: Vec<WatcherChange>,
     deadline: Option<Instant>,
 }
 
 struct Session {
-    input: FrameInput,
+    events: Receiver<ProxyEvent>,
+    client: FrameState,
+    godot: FrameState,
+    deferred: VecDeque<ProxyEvent>,
     output: ClientWriter,
     proxy: ProxyState,
     runtime: Runtime,
@@ -173,9 +190,50 @@ struct Session {
 }
 
 enum RecoveryItem {
-    Request(Value),
-    Notification(Value),
-    Response(Value),
+    Request(Value, usize),
+    Notification(Value, usize),
+    Response(Value, usize),
+}
+
+const MERGED_EVENT_CAP: usize = 64;
+
+enum ProxyEvent {
+    Client(ReadEvent),
+    Godot(ReadEvent),
+    Watcher(std::io::Result<WatcherChange>),
+    Internal(InternalEvent),
+    Handoff(LockGuard),
+}
+
+struct FrameState {
+    decoder: FrameDecoder,
+    eof: bool,
+    frames: VecDeque<Vec<u8>>,
+}
+
+impl FrameState {
+    fn new(cap: usize) -> Self {
+        Self {
+            decoder: FrameDecoder::new(cap),
+            eof: false,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn feed(&mut self, event: ReadEvent) -> Result<()> {
+        match event {
+            Ok(Some(chunk)) => self.decoder.push(&chunk),
+            Ok(None) => self.eof = true,
+            Err(error) => return Err(error.into()),
+        }
+        while let Some(body) = self.decoder.next_frame()? {
+            self.frames.push_back(body.to_owned());
+        }
+        if self.eof && self.decoder.has_pending_bytes() {
+            return Err(crate::framing::FrameError::Malformed("unexpected EOF".to_owned()).into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -205,7 +263,7 @@ impl StartupError {
 enum GuiReconnect {
     Ready {
         state: State,
-        connection: Connection,
+        connection: Connection<()>,
     },
     Dead,
     Deadline {
@@ -218,6 +276,7 @@ fn reconnect_gui(
     files: &ProjectFiles,
     mut state: State,
     timeout_seconds: u32,
+    event_sender: &mpsc::SyncSender<ProxyEvent>,
 ) -> Result<GuiReconnect> {
     let Some(pid) = state.godot_pid else {
         cleanup_files(files);
@@ -248,7 +307,7 @@ fn reconnect_gui(
             set_owner_identity(&mut state);
             Ok(GuiReconnect::Ready {
                 state,
-                connection: connection_from_stream(stream),
+                connection: connection_from_stream(stream, event_sender.clone()),
             })
         }
         DetachedPorts::Dead => {
@@ -343,12 +402,22 @@ fn wait_for_detached_ports_during_handoff(
                 .unwrap_or(Duration::ZERO)
                 .min(Duration::from_millis(200))
         });
-        match session.input.recv_timeout_with_frame(sleep_for, |body| {
-            queue_recovery_message(queue, &mut session.output, body)
-        })? {
-            FramePoll::Frame(result) => result?,
-            FramePoll::End => crate::bail!("Zed closed during GUI handoff"),
-            FramePoll::Empty => {}
+        match session.events.recv_timeout(sleep_for) {
+            Ok(ProxyEvent::Client(event)) => {
+                session.client.feed(event)?;
+                while let Some(body) = session.client.frames.pop_front() {
+                    queue_recovery_message(queue, &mut session.output, &body)?;
+                }
+                if session.client.eof && session.client.frames.is_empty() {
+                    crate::bail!("Zed closed during GUI handoff");
+                }
+            }
+            Ok(ProxyEvent::Godot(_)) => {}
+            Ok(event) => session.deferred.push_back(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                crate::bail!("Zed closed during GUI handoff")
+            }
         }
     }
 }
@@ -363,7 +432,8 @@ fn gui_process_is_alive(runtime: &Runtime) -> bool {
 
 fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
     let _dap_lock = dap_lock;
-    let mut recovery_queue = start_recovery(session)?;
+    start_recovery(session)?;
+    let mut recovery_queue = RecoveryQueue::default();
     let old_lsp_port = session.editor.lsp_port;
     let old_dap_port = session.editor.dap_port;
     let mut gui_identity = None;
@@ -408,7 +478,9 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
             deadline,
             &mut recovery_queue,
         )? {
-            DetachedPorts::Ready(stream) => connection_from_stream(stream),
+            DetachedPorts::Ready(stream) => {
+                connection_from_stream(stream, session.proxy.internal_sender.clone())
+            }
             DetachedPorts::Dead => crate::bail!("GUI editor exited during handoff"),
             DetachedPorts::Deadline => {
                 crate::bail!("GUI editor {pid} is not answering on its ports")
@@ -420,7 +492,13 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
             lsp_port: old_lsp_port,
             dap_port: old_dap_port,
         };
-        replay_initialize(&mut replacement, &mut session.proxy)?;
+        replay_initialize(
+            &mut replacement,
+            &mut session.proxy,
+            &session.events,
+            &mut session.godot,
+            &mut session.deferred,
+        )?;
         session.editor = replacement;
         finish_recovery(session, &mut recovery_queue)
     })();
@@ -447,7 +525,8 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
 
 fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> Result<()> {
     while let Some(item) = queue.items.pop_front() {
-        if let RecoveryItem::Request(message) = item {
+        if let RecoveryItem::Request(message, size) = item {
+            queue.bytes = queue.bytes.saturating_sub(size);
             if let Some(id) = message.get("id") {
                 send_error(output, id, -32803, "RequestFailed")?;
             }
@@ -457,23 +536,21 @@ fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> 
 }
 
 pub fn run() -> Result<ExitCode> {
-    let (input_sender, input_receiver) = mpsc::sync_channel(1);
-    let _input_thread = spawn_frame_reader(
+    let (event_sender, event_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
+    let _input_thread = spawn_frame_reader_with(
         "godot-bridge-lsp-client-reader",
         std::io::stdin(),
-        input_sender,
+        event_sender.clone(),
+        ProxyEvent::Client,
     )
     .map_err(|error| crate::error::Error::new(error.to_string()))?;
-    let mut input = FrameInput::new(input_receiver, CLIENT_FRAME_CAP);
-    let mut output = BufWriter::new(std::io::stdout());
-    let initialize = match input.with_next_frame(parse_message) {
-        Ok(Some(Ok(message))) => message,
-        Ok(Some(Err(error))) => return Err(error.into()),
-        Ok(None) => return Ok(ExitCode::SUCCESS),
-        Err(error) => {
-            crate::error!("invalid initialize frame: {error}");
-            return Ok(ExitCode::from(1));
-        }
+    let mut client = FrameState::new(CLIENT_FRAME_CAP);
+    let mut godot = FrameState::new(GODOT_FRAME_CAP);
+    let mut deferred = VecDeque::new();
+    let mut output = client_writer();
+    let initialize = match receive_client_frame(&event_receiver, &mut client, &mut deferred)? {
+        Some(body) => parse_message(&body).map_err(crate::error::Error::new)?,
+        None => return Ok(ExitCode::SUCCESS),
     };
     let initialize_id = initialize.get("id").cloned().unwrap_or(Value::Null);
     let params = initialize
@@ -514,11 +591,11 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-    let (internal_sender, internal_events) = mpsc::channel();
     let mut documents = DocumentState::new();
-    let event_sender = internal_sender.clone();
+    let internal_sender = event_sender.clone();
+    let document_event_sender = event_sender.clone();
     documents.set_event_hook(Arc::new(move |event| {
-        let _ = event_sender.send(InternalEvent::Document(event));
+        let _ = document_event_sender.send(ProxyEvent::Internal(InternalEvent::Document(event)));
     }));
     let mut proxy = ProxyState {
         documents,
@@ -535,9 +612,9 @@ pub fn run() -> Result<ExitCode> {
         recovery_times: VecDeque::new(),
         project_diagnostics_started: false,
         workspace_symbols_notice_sent: false,
-        internal_events,
         internal_sender,
         symbol_cache: HashMap::new(),
+        symbol_containers: symbols::ContainerTable::default(),
         symbol_scheduled: HashMap::new(),
         bulk_generation: 0,
         bulk_documents: VecDeque::new(),
@@ -569,9 +646,12 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-        let connection = connection_from_stream(stream);
+        let connection = connection_from_stream(stream, event_sender.clone());
         let session = Session {
-            input,
+            events: event_receiver,
+            client,
+            godot,
+            deferred,
             output,
             proxy,
             settings,
@@ -580,7 +660,7 @@ pub fn run() -> Result<ExitCode> {
                 state: Arc::new(RwLock::new(new_state(&project, Mode::Unmanaged))),
                 socket: None,
                 lock: None,
-                handoff_receiver: None,
+                event_sender: event_sender.clone(),
                 mode: Mode::Unmanaged,
             },
             editor: Editor {
@@ -619,18 +699,17 @@ pub fn run() -> Result<ExitCode> {
             } else if !gui_process_alive(&previous) {
                 cleanup_files(&files);
             } else {
-                match reconnect_gui(&files, previous, settings.startup_timeout_s)? {
+                match reconnect_gui(&files, previous, settings.startup_timeout_s, &event_sender)? {
                     GuiReconnect::Ready { state, connection } => {
                         let state = Arc::new(RwLock::new(state));
-                        let (handoff_sender, handoff_receiver) = mpsc::channel();
                         let socket =
-                            serve_owner_socket(&files, Arc::clone(&state), handoff_sender)?;
+                            serve_owner_socket(&files, Arc::clone(&state), event_sender.clone())?;
                         let mut runtime = Runtime {
                             files,
                             state,
                             socket: Some(socket),
                             lock: Some(lock),
-                            handoff_receiver: Some(handoff_receiver),
+                            event_sender: event_sender.clone(),
                             mode: Mode::Gui,
                         };
                         publish(&runtime)?;
@@ -656,6 +735,11 @@ pub fn run() -> Result<ExitCode> {
                             &mut proxy,
                             &project,
                             settings.project_diagnostics,
+                            InitializeInput {
+                                events: &event_receiver,
+                                godot: &mut godot,
+                                deferred: &mut deferred,
+                            },
                         ) {
                             drop(editor);
                             cleanup_runtime(&mut runtime, None);
@@ -665,7 +749,10 @@ pub fn run() -> Result<ExitCode> {
                         set_ready(&runtime, &editor)?;
                         return run_session(
                             Session {
-                                input,
+                                events: event_receiver,
+                                client,
+                                godot,
+                                deferred,
                                 output,
                                 proxy,
                                 settings,
@@ -709,14 +796,13 @@ pub fn run() -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let state = Arc::new(RwLock::new(new_state(&project, Mode::Headless)));
-    let (handoff_sender, handoff_receiver) = mpsc::channel();
-    let socket = serve_owner_socket(&files, Arc::clone(&state), handoff_sender)?;
+    let socket = serve_owner_socket(&files, Arc::clone(&state), event_sender.clone())?;
     let mut runtime = Runtime {
         files,
         state,
         socket: Some(socket),
         lock: Some(lock),
-        handoff_receiver: Some(handoff_receiver),
+        event_sender: event_sender.clone(),
         mode: Mode::Headless,
     };
     publish(&runtime)?;
@@ -732,6 +818,11 @@ pub fn run() -> Result<ExitCode> {
                     &mut proxy,
                     &project,
                     settings.project_diagnostics,
+                    InitializeInput {
+                        events: &event_receiver,
+                        godot: &mut godot,
+                        deferred: &mut deferred,
+                    },
                 ) {
                     Ok(()) => {
                         proxy.initialized_forwarded = true;
@@ -746,10 +837,8 @@ pub fn run() -> Result<ExitCode> {
             }
             Err(error) => {
                 startup_error = Some(error);
-                if startup_error
-                    .as_ref()
-                    .is_some_and(|error| matches!(error, StartupError::Deadline(_)))
-                {
+                let deadline_error = matches!(startup_error, Some(StartupError::Deadline(_)));
+                if deadline_error {
                     break;
                 }
             }
@@ -764,7 +853,10 @@ pub fn run() -> Result<ExitCode> {
     set_ready(&runtime, &editor)?;
     run_session(
         Session {
-            input,
+            events: event_receiver,
+            client,
+            godot,
+            deferred,
             output,
             proxy,
             settings,
@@ -832,10 +924,11 @@ fn forward_client_message(
                     symbols.iter().map(move |symbol| (uri.as_str(), symbol))
                 }),
                 query,
+                &proxy.symbol_containers,
             );
             send_client(
                 output,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(matches.iter().map(|(uri, symbol)| symbols::symbol_information(symbol, uri)).collect::<Vec<_>>()) }),
+                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(matches.iter().map(|(uri, symbol)| symbols::symbol_information(symbol, uri, &proxy.symbol_containers)).collect::<Vec<_>>()) }),
             )?;
             return Ok(());
         }
@@ -883,9 +976,9 @@ fn forward_client_message(
     send_godot(&mut editor.connection.writer, &message, false)
 }
 
-fn forward_client_request(
+fn forward_client_request<W: Write>(
     editor: &mut Editor,
-    output: &mut ClientWriter,
+    output: &mut W,
     proxy: &mut ProxyState,
     mut message: Value,
 ) -> Result<Option<i64>> {
@@ -900,17 +993,13 @@ fn forward_client_request(
         return Ok(None);
     }
     if proxy.pending.len() >= IN_FLIGHT_CAP && !is_shutdown {
-        let queued_size = crate::json::to_vec(&message).len();
-        if queued_size > GODOT_WRITE_CAP {
-            send_error(output, &zed_id, -32803, "message too large for Godot")?;
-            return Ok(None);
-        }
+        let queued_size = body.len();
         if proxy.queued_bytes.saturating_add(queued_size) > QUEUE_BYTES_CAP {
             send_error(output, &zed_id, -32803, "RequestFailed")?;
             return Ok(None);
         }
         proxy.queued_bytes += queued_size;
-        proxy.queued.push_back((message, queued_size));
+        proxy.queued.push_back((message, zed_id, queued_size));
         return Ok(None);
     }
     proxy.pending.insert(
@@ -928,9 +1017,9 @@ fn forward_client_request(
     Ok(is_shutdown.then_some(bridge_id))
 }
 
-fn cancel_request(
+fn cancel_request<W: Write>(
     editor: &mut Editor,
-    output: &mut ClientWriter,
+    output: &mut W,
     proxy: &mut ProxyState,
     message: Value,
 ) -> Result<()> {
@@ -942,9 +1031,9 @@ fn cancel_request(
     if let Some(index) = proxy
         .queued
         .iter()
-        .position(|(queued, _)| queued.get("id") == Some(&target))
+        .position(|(_, zed_id, _)| zed_id == &target)
     {
-        if let Some((_, queued_size)) = proxy.queued.remove(index) {
+        if let Some((_, _, queued_size)) = proxy.queued.remove(index) {
             proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
         }
         send_error(output, &target, -32800, "RequestCancelled")?;
@@ -962,15 +1051,23 @@ fn cancel_request(
     Ok(())
 }
 
-fn forward_server_message(
+fn forward_server_message<W: Write>(
     writer: &mut TcpStream,
     lsp_port: u16,
-    output: &mut ClientWriter,
+    output: &mut W,
     proxy: &mut ProxyState,
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
     let fields = crate::json::scan_top_level(body)?;
+    if fields
+        .method
+        .is_some_and(|method| method.string_eq("textDocument/publishDiagnostics"))
+        && proxy.bulk_batch_uris.is_empty()
+    {
+        send_client_body(output, body)?;
+        return Ok(());
+    }
     let intercepted = fields.method.is_some_and(|method| {
         method.string_eq("textDocument/publishDiagnostics")
             || method.string_eq("gdscript_client/changeWorkspace")
@@ -1041,9 +1138,11 @@ fn forward_server_message(
                     });
                 if valid {
                     proxy.symbol_cache.remove(&uri);
-                    for (symbol_uri, symbol) in
-                        symbols::flatten(message.get("result").unwrap_or(&Value::Null), &uri)
-                    {
+                    for (symbol_uri, symbol) in symbols::flatten(
+                        message.get("result").unwrap_or(&Value::Null),
+                        &uri,
+                        &mut proxy.symbol_containers,
+                    ) {
                         proxy
                             .symbol_cache
                             .entry(symbol_uri)
@@ -1069,17 +1168,16 @@ fn forward_server_message(
     Ok(())
 }
 
-fn flush_queued(
-    output: &mut ClientWriter,
+fn flush_queued<W: Write>(
+    output: &mut W,
     writer: &mut TcpStream,
     proxy: &mut ProxyState,
 ) -> Result<()> {
     while proxy.pending.len() < IN_FLIGHT_CAP {
-        let Some((mut message, queued_size)) = proxy.queued.pop_front() else {
+        let Some((mut message, zed_id, queued_size)) = proxy.queued.pop_front() else {
             break;
         };
         proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
-        let zed_id = message.get("id").cloned().unwrap_or(Value::Null);
         let bridge_id = proxy.next_id;
         proxy.next_id += 1;
         message["id"] = crate::json!(bridge_id);
@@ -1133,13 +1231,12 @@ fn rewrite_document_messages(
                 crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let planned = proxy.documents.planned_zed_open(&uri, text);
-            let body = crate::json::to_vec(&document_action_message(&planned));
+            let action = proxy.documents.zed_open(&uri, text.to_owned());
+            let body = crate::json::to_vec(&document_action_message(&action));
             if body.len() > GODOT_WRITE_CAP {
                 crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let action = proxy.documents.zed_open(&uri, text.to_owned());
             schedule_document_action(proxy, &action);
             return Ok(vec![body]);
         }
@@ -1164,7 +1261,6 @@ fn rewrite_document_messages(
                 crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let planned = proxy.documents.planned_zed_change(&uri, text);
             let Some(action) = proxy.documents.zed_change(&uri, text.to_owned()) else {
                 let body = crate::json::to_vec(&message);
                 if body.len() > GODOT_WRITE_CAP {
@@ -1173,9 +1269,7 @@ fn rewrite_document_messages(
                 }
                 return Ok(vec![body]);
             };
-            let body = crate::json::to_vec(&document_action_message(
-                planned.as_ref().expect("planned change exists"),
-            ));
+            let body = crate::json::to_vec(&document_action_message(&action));
             if body.len() > GODOT_WRITE_CAP {
                 crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
@@ -1262,16 +1356,18 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
             let documents = docs_state::scan_project(&project, diagnose_addons);
             for document in documents {
                 if sender
-                    .send(InternalEvent::Bulk {
+                    .send(ProxyEvent::Internal(InternalEvent::Bulk {
                         generation,
                         document,
-                    })
+                    }))
                     .is_err()
                 {
                     return;
                 }
             }
-            let _ = sender.send(InternalEvent::BulkComplete { generation });
+            let _ = sender.send(ProxyEvent::Internal(InternalEvent::BulkComplete {
+                generation,
+            }));
         });
 }
 
@@ -1469,12 +1565,38 @@ fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
     parse_json_object(body, "LSP")
 }
 
+fn receive_client_frame(
+    events: &Receiver<ProxyEvent>,
+    client: &mut FrameState,
+    deferred: &mut VecDeque<ProxyEvent>,
+) -> Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(body) = client.frames.pop_front() {
+            return Ok(Some(body));
+        }
+        if client.eof {
+            return Ok(None);
+        }
+        let event = events
+            .recv()
+            .map_err(|_| io::Error::other("event channel is closed"))?;
+        match event {
+            ProxyEvent::Client(event) => client.feed(event)?,
+            event => deferred.push_back(event),
+        }
+    }
+}
+
 fn send_client<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
     write_json(writer, message, CLIENT_FRAME_CAP, true)?;
     Ok(())
 }
 
-fn send_client_body(writer: &mut ClientWriter, body: &[u8]) -> Result<()> {
+fn client_writer() -> ClientWriter {
+    unsafe { BufWriter::new(StdoutFile(ManuallyDrop::new(std::fs::File::from_raw_fd(1)))) }
+}
+
+fn send_client_body<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
     write_frame(writer, body, CLIENT_FRAME_CAP)?;
     writer.flush()?;
     Ok(())
@@ -1618,9 +1740,25 @@ fn coalesce_watcher_changes(changes: Vec<WatcherChange>) -> Vec<WatcherChange> {
     changes
 }
 
-fn send_due_symbol_requests(editor: &mut Editor, proxy: &mut ProxyState) -> Result<()> {
+fn next_symbol_deadline(proxy: &ProxyState) -> Option<Instant> {
+    proxy
+        .symbol_scheduled
+        .iter()
+        .filter(|(uri, _)| {
+            !(proxy.bulk_active
+                && proxy.documents.owner(&proxy.documents.key_for_uri(uri))
+                    == Some(DocumentOwner::Bridge))
+        })
+        .map(|(_, (_, _, deadline))| *deadline)
+        .min()
+}
+
+fn send_due_symbol_requests(
+    editor: &mut Editor,
+    proxy: &mut ProxyState,
+) -> Result<Option<Instant>> {
     if !proxy.zed_initialized {
-        return Ok(());
+        return Ok(None);
     }
     let now = Instant::now();
     let due = proxy
@@ -1655,7 +1793,7 @@ fn send_due_symbol_requests(editor: &mut Editor, proxy: &mut ProxyState) -> Resu
             true,
         )?;
     }
-    Ok(())
+    Ok(next_symbol_deadline(proxy))
 }
 
 fn patch_initialize_response(response: &mut Value) {
@@ -1671,6 +1809,7 @@ fn patch_initialize_response(response: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn startup_deadline_zero_is_unbounded() {
@@ -1679,7 +1818,7 @@ mod tests {
 
     #[test]
     fn document_uri_is_canonicalized() {
-        let (internal_sender, internal_events) = mpsc::channel();
+        let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
         let mut proxy = ProxyState {
             documents: DocumentState::new(),
             pending: HashMap::new(),
@@ -1695,9 +1834,9 @@ mod tests {
             recovery_times: VecDeque::new(),
             project_diagnostics_started: false,
             workspace_symbols_notice_sent: false,
-            internal_events,
             internal_sender,
             symbol_cache: HashMap::new(),
+            symbol_containers: symbols::ContainerTable::default(),
             symbol_scheduled: HashMap::new(),
             bulk_generation: 0,
             bulk_documents: VecDeque::new(),
@@ -1713,5 +1852,85 @@ mod tests {
         let rewritten = crate::json::from_slice(&rewritten[0]).unwrap();
         assert_eq!(rewritten["params"]["textDocument"]["version"], 1);
         assert_eq!(proxy.documents.open_docs.len(), 1);
+    }
+
+    #[test]
+    fn queued_request_response_keeps_zed_id() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let socket = writer.try_clone().unwrap();
+        let mut editor = Editor {
+            child: None,
+            connection: Connection::with_parts(socket, None, None, writer),
+            lsp_port: 0,
+            dap_port: 0,
+        };
+        let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
+        let mut proxy = ProxyState {
+            documents: DocumentState::new(),
+            pending: (1..=IN_FLIGHT_CAP as i64)
+                .map(|id| {
+                    (
+                        id,
+                        PendingRequest {
+                            zed_id: crate::json!(id),
+                            internal: false,
+                            symbol: None,
+                        },
+                    )
+                })
+                .collect(),
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            server_requests: RequestKeys::default(),
+            stale_server_ids: RequestKeys::default(),
+            next_id: IN_FLIGHT_CAP as i64 + 1,
+            initialized_forwarded: false,
+            zed_initialized: false,
+            initialize: crate::json!({}),
+            project: PathBuf::from("/tmp"),
+            recovery_times: VecDeque::new(),
+            project_diagnostics_started: false,
+            workspace_symbols_notice_sent: false,
+            internal_sender,
+            symbol_cache: HashMap::new(),
+            symbol_containers: symbols::ContainerTable::default(),
+            symbol_scheduled: HashMap::new(),
+            bulk_generation: 0,
+            bulk_documents: VecDeque::new(),
+            bulk_batch_uris: HashSet::new(),
+            bulk_complete: false,
+            bulk_active: false,
+            bulk_replay: false,
+            bulk_deadline: None,
+        };
+        let mut output = Vec::new();
+        forward_client_request(
+            &mut editor,
+            &mut output,
+            &mut proxy,
+            crate::json!({"jsonrpc":"2.0","id":99,"method":"test"}),
+        )
+        .unwrap();
+        proxy.pending.remove(&1);
+        flush_queued(&mut output, &mut editor.connection.writer, &mut proxy).unwrap();
+        let mut bytes = [0; 1024];
+        let size = peer.read(&mut bytes).unwrap();
+        let mut decoder = FrameDecoder::new(GODOT_FRAME_CAP);
+        decoder.push(&bytes[..size]);
+        let request = crate::json::from_slice(decoder.next_frame().unwrap().unwrap()).unwrap();
+        let response = crate::json!({"jsonrpc":"2.0","id":(request["id"].clone()),"result":null});
+        forward_server_message(
+            &mut editor.connection.writer,
+            0,
+            &mut output,
+            &mut proxy,
+            &crate::json::to_vec(&response),
+            false,
+        )
+        .unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("\"id\":99"));
     }
 }

@@ -5,11 +5,9 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use crate::docs_state::{directory_is_skipped, WatcherChange, WatcherChangeKind};
 use crate::root::canonical_or_normalized;
@@ -22,12 +20,11 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MOVED_FROM
     | libc::IN_MOVED_TO
     | libc::IN_MOVE_SELF;
-const POLL_TIMEOUT_MS: i32 = 100;
 const EVENT_BUFFER_SIZE: usize = 64 * 1024;
 
-pub struct ProjectWatcher {
-    pub(crate) receiver: Receiver<io::Result<WatcherChange>>,
-    stop: Arc<AtomicBool>,
+pub struct ProjectWatcher<T = io::Result<WatcherChange>> {
+    pub(crate) receiver: Option<Receiver<T>>,
+    stop_write: RawFd,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -40,6 +37,22 @@ struct WatcherState {
 }
 
 pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<ProjectWatcher> {
+    let (sender, receiver) = mpsc::sync_channel(4096);
+    let mut watcher = watch_project_into(project, diagnose_addons, sender, |event| event)?;
+    watcher.receiver = Some(receiver);
+    Ok(watcher)
+}
+
+pub(crate) fn watch_project_into<T, F>(
+    project: &Path,
+    diagnose_addons: bool,
+    sender: SyncSender<T>,
+    map: F,
+) -> io::Result<ProjectWatcher<T>>
+where
+    T: Send + 'static,
+    F: Fn(io::Result<WatcherChange>) -> T + Send + 'static,
+{
     let project = canonical_or_normalized(project);
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if fd == -1 {
@@ -59,32 +72,49 @@ pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<Projec
         return Err(error);
     }
 
-    let (sender, receiver) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = Arc::clone(&stop);
+    let mut stop_pipe = [0; 2];
+    if unsafe { libc::pipe2(stop_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    let stop_write = stop_pipe[1];
     let thread = match thread::Builder::new()
         .name("godot-bridge-watch".to_owned())
         .stack_size(256 * 1024)
-        .spawn(move || watch_events(state, sender, stop_for_thread))
+        .spawn(move || watch_events(state, stop_pipe[0], sender, map))
     {
         Ok(thread) => thread,
         Err(error) => {
             unsafe {
                 libc::close(fd);
+                libc::close(stop_pipe[0]);
+                libc::close(stop_write);
             }
             return Err(error);
         }
     };
     Ok(ProjectWatcher {
-        receiver,
-        stop,
+        receiver: None,
+        stop_write,
         thread: Some(thread),
     })
 }
 
-impl Drop for ProjectWatcher {
+impl<T> ProjectWatcher<T> {
+    #[cfg(test)]
+    pub(crate) fn receiver(&self) -> &Receiver<T> {
+        self.receiver.as_ref().expect("watcher has no receiver")
+    }
+}
+
+impl<T> Drop for ProjectWatcher<T> {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        unsafe {
+            libc::close(self.stop_write);
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -93,24 +123,33 @@ impl Drop for ProjectWatcher {
 
 impl WatcherState {
     fn watch_directory(&mut self, path: &Path) -> io::Result<()> {
-        if directory_is_skipped(path, &self.project, self.diagnose_addons) {
-            return Ok(());
-        }
-        if self.add_watch(path)? {
-            let entries = std::fs::read_dir(path)?;
+        let root = path.to_owned();
+        let mut directories = vec![root.clone()];
+        while let Some(directory) = directories.pop() {
+            if directory_is_skipped(&directory, &self.project, self.diagnose_addons) {
+                continue;
+            }
+            if !self.add_watch(&directory)? {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if directory != root => {
+                    crate::warn!(
+                        "skipping unreadable diagnostics watch directory {}: {error}",
+                        directory.display()
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
-                if !file_type.is_dir() || file_type.is_symlink() {
-                    continue;
-                }
-                if let Err(error) = self.watch_directory(&entry_path) {
-                    crate::warn!(
-                        "skipping unreadable diagnostics watch directory {}: {error}",
-                        entry_path.display()
-                    );
+                if file_type.is_dir() && !file_type.is_symlink() {
+                    directories.push(entry_path);
                 }
             }
         }
@@ -138,7 +177,11 @@ impl WatcherState {
         Ok(true)
     }
 
-    fn read_events(&mut self, sender: &Sender<io::Result<WatcherChange>>) -> io::Result<bool> {
+    fn read_events<T, F>(&mut self, sender: &SyncSender<T>, map: &F) -> io::Result<bool>
+    where
+        T: Send + 'static,
+        F: Fn(io::Result<WatcherChange>) -> T,
+    {
         let mut buffer = [0u8; EVENT_BUFFER_SIZE];
         let size = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if size == -1 {
@@ -180,6 +223,7 @@ impl WatcherState {
                 &event,
                 &bytes[offset + header_size..offset + event_size],
                 sender,
+                map,
             ) {
                 return Ok(false);
             }
@@ -188,18 +232,23 @@ impl WatcherState {
         Ok(true)
     }
 
-    fn emit_event(
+    fn emit_event<T, F>(
         &mut self,
         event: &libc::inotify_event,
         name_bytes: &[u8],
-        sender: &Sender<io::Result<WatcherChange>>,
-    ) -> bool {
+        sender: &SyncSender<T>,
+        map: &F,
+    ) -> bool
+    where
+        T: Send + 'static,
+        F: Fn(io::Result<WatcherChange>) -> T,
+    {
         if event.mask & libc::IN_Q_OVERFLOW != 0 {
             return sender
-                .send(Ok(WatcherChange {
+                .send(map(Ok(WatcherChange {
                     kind: WatcherChangeKind::Rescan,
                     path: self.project.clone(),
-                }))
+                })))
                 .is_ok();
         }
         if event.mask & libc::IN_IGNORED != 0 {
@@ -223,10 +272,10 @@ impl WatcherState {
         if event.mask & libc::IN_DELETE_SELF != 0 {
             self.watch_paths.remove(&event.wd);
             return sender
-                .send(Ok(WatcherChange {
+                .send(map(Ok(WatcherChange {
                     kind: WatcherChangeKind::Removed,
                     path,
-                }))
+                })))
                 .is_ok();
         }
         if event.mask & libc::IN_MOVE_SELF != 0 {
@@ -252,47 +301,60 @@ impl WatcherState {
         } else {
             return true;
         };
-        sender.send(Ok(WatcherChange { kind, path })).is_ok()
+        sender.send(map(Ok(WatcherChange { kind, path }))).is_ok()
     }
 }
 
-fn watch_events(
-    mut state: WatcherState,
-    sender: Sender<io::Result<WatcherChange>>,
-    stop: Arc<AtomicBool>,
-) {
-    while !stop.load(Ordering::Acquire) {
-        let mut pollfd = libc::pollfd {
-            fd: state.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut pollfd, 1, POLL_TIMEOUT_MS) };
+fn watch_events<T, F>(mut state: WatcherState, stop_read: RawFd, sender: SyncSender<T>, map: F)
+where
+    T: Send + 'static,
+    F: Fn(io::Result<WatcherChange>) -> T,
+{
+    while let Some(result) = (|| {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: state.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop_read,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) };
         if result == -1 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+                return Some(true);
             }
-            let _ = sender.send(Err(io::Error::last_os_error()));
-            break;
+            let _ = sender.send(map(Err(io::Error::last_os_error())));
+            return Some(false);
         }
-        if result == 0 {
-            continue;
+        if pollfds[1].revents != 0 {
+            return Some(false);
         }
-        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            let _ = sender.send(Err(io::Error::other("inotify watch closed")));
-            break;
+        if pollfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            let _ = sender.send(map(Err(io::Error::other("inotify watch closed"))));
+            return Some(false);
         }
-        match state.read_events(&sender) {
-            Ok(true) => {}
-            Ok(false) => break,
+        match state.read_events(&sender, &map) {
+            Ok(true) => Some(true),
+            Ok(false) => Some(false),
             Err(error) => {
-                let _ = sender.send(Err(error));
-                break;
+                let _ = sender.send(map(Err(error)));
+                Some(false)
             }
+        }
+    })() {
+        match result {
+            true => {}
+            false => break,
         }
     }
     unsafe {
         libc::close(state.fd);
+        libc::close(stop_read);
     }
 }
 
@@ -313,7 +375,7 @@ mod tests {
         while changes.len() < 2 {
             changes.push(
                 watcher
-                    .receiver
+                    .receiver()
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap(),
@@ -328,7 +390,7 @@ mod tests {
 
         fs::write(&path, "two").unwrap();
         let modified = watcher
-            .receiver
+            .receiver()
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
@@ -341,7 +403,7 @@ mod tests {
         while rename_changes.len() < 2 {
             rename_changes.push(
                 watcher
-                    .receiver
+                    .receiver()
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap(),
@@ -356,7 +418,7 @@ mod tests {
 
         fs::remove_file(&renamed).unwrap();
         let removed = watcher
-            .receiver
+            .receiver()
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
@@ -372,7 +434,7 @@ mod tests {
         fs::create_dir(&nested).unwrap();
         loop {
             let change = watcher
-                .receiver
+                .receiver()
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
                 .unwrap();
@@ -384,7 +446,7 @@ mod tests {
         fs::write(&path, "one").unwrap();
         loop {
             let change = watcher
-                .receiver
+                .receiver()
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
                 .unwrap();

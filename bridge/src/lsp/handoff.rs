@@ -3,16 +3,13 @@ use super::*;
 pub(super) fn serve_owner_socket(
     files: &ProjectFiles,
     state: Arc<RwLock<State>>,
-    handoff_sender: mpsc::Sender<LockGuard>,
+    event_sender: mpsc::SyncSender<ProxyEvent>,
 ) -> Result<crate::state::SocketHandle> {
     let dap_path = files.dap_lock.clone();
     Ok(serve_socket(&files.sock, move |request: Value| {
-        let handoff_sender = handoff_sender.clone();
+        let event_sender = event_sender.clone();
         let dap_path = dap_path.clone();
         let cmd = request.get("cmd").and_then(Value::as_str);
-        if !matches!(cmd, Some("status") | Some("handoff")) {
-            return crate::state::unknown_command();
-        }
         let requested = request.get("project").and_then(Value::as_str);
         let state = state
             .read()
@@ -36,7 +33,7 @@ pub(super) fn serve_owner_socket(
                     HandoffDecision::AlreadyGui => crate::json!({"version": 1, "accepted": true}),
                     HandoffDecision::Swap => match try_lock(&dap_path) {
                         Ok(Some(guard)) => {
-                            if handoff_sender.send(guard).is_ok() {
+                            if event_sender.send(ProxyEvent::Handoff(guard)).is_ok() {
                                 crate::json!({"version": 1, "accepted": true})
                             } else {
                                 crate::json!({"version": 1, "accepted": false, "reason": "owner is shutting down"})
@@ -51,7 +48,7 @@ pub(super) fn serve_owner_socket(
                     },
                 }
             }
-            _ => crate::state::unknown_command(),
+            _ => crate::json!({"error": "unknown cmd"}),
         }
     })?)
 }

@@ -1,7 +1,11 @@
 use super::*;
+use crate::framing::connection_without_reader;
 
-pub(super) fn connection_from_stream(stream: TcpStream) -> Connection {
-    Connection::from_stream(stream, "godot-bridge-lsp-reader", GODOT_FRAME_CAP)
+pub(super) fn connection_from_stream(
+    stream: TcpStream,
+    sender: mpsc::SyncSender<ProxyEvent>,
+) -> Connection<()> {
+    connection_without_reader(stream, "godot-bridge-lsp-reader", sender, ProxyEvent::Godot)
         .expect("Godot reader thread should spawn")
 }
 
@@ -189,7 +193,7 @@ pub(super) fn spawn_one(
     let dap_port =
         pick_free_port(7005..=7999).map_err(|error| StartupError::Io(error.to_string()))?;
     let log_path = runtime.files.state.with_extension("godot.log");
-    let mut child = spawn_godot(
+    let child = spawn_godot(
         binary,
         &settings.extra_args,
         project,
@@ -202,33 +206,25 @@ pub(super) fn spawn_one(
         terminate_editor_child(child);
         return Err(StartupError::Io(error.to_string()));
     }
-    let stream = match wait_for_port(&mut child, lsp_port, deadline) {
-        Ok(Readiness::Ready(stream)) => stream,
-        Ok(Readiness::ChildExited(_status)) => {
-            return Err(StartupError::ChildExited(child.last_lines()))
-        }
-        Ok(Readiness::Deadline) => {
-            let lines = child.last_lines();
-            terminate_editor_child(child);
-            return Err(StartupError::Deadline(lines));
-        }
-        Err(error) => {
-            let lines = child.last_lines();
-            terminate_editor_child(child);
-            return Err(StartupError::Io(format!(
-                "cannot wait for Godot LSP: {error}; {}",
-                lines.join("\n")
-            )));
-        }
-    };
-    match wait_for_port(&mut child, dap_port, deadline) {
-        Ok(Readiness::Ready(_)) => Ok(Editor {
-            child: Some(child),
-            connection: connection_from_stream(stream),
-            lsp_port,
-            dap_port,
-        }),
-        Ok(Readiness::ChildExited(_status)) => Err(StartupError::ChildExited(child.last_lines())),
+    let (child, stream) = await_port(child, lsp_port, deadline, "LSP")?;
+    let (child, _) = await_port(child, dap_port, deadline, "DAP")?;
+    Ok(Editor {
+        child: Some(child),
+        connection: connection_from_stream(stream, runtime.event_sender.clone()),
+        lsp_port,
+        dap_port,
+    })
+}
+
+fn await_port(
+    mut child: GodotChild,
+    port: u16,
+    deadline: Option<Instant>,
+    label: &str,
+) -> std::result::Result<(GodotChild, TcpStream), StartupError> {
+    match wait_for_port(&mut child, port, deadline) {
+        Ok(Readiness::Ready(stream)) => Ok((child, stream)),
+        Ok(Readiness::ChildExited(_)) => Err(StartupError::ChildExited(child.last_lines())),
         Ok(Readiness::Deadline) => {
             let lines = child.last_lines();
             terminate_editor_child(child);
@@ -238,7 +234,7 @@ pub(super) fn spawn_one(
             let lines = child.last_lines();
             terminate_editor_child(child);
             Err(StartupError::Io(format!(
-                "cannot wait for Godot DAP: {error}; {}",
+                "cannot wait for Godot {label}: {error}; {}",
                 lines.join("\n")
             )))
         }
