@@ -399,10 +399,9 @@ fn copy_output(
     let mut lines = [Vec::new(), Vec::new()];
     let mut ended = 0;
     while ended < reader_count {
-        let event = match receiver.recv_timeout(Duration::from_millis(10)) {
+        let event = match receiver.recv() {
             Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         };
         match event {
             OutputEvent::End => ended += 1,

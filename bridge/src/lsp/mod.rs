@@ -7,15 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::docs_state::{
     self, DocumentAction, DocumentEvent, DocumentOwner, DocumentState, WatcherChange,
-    WatcherChangeKind, BULK_DOCUMENTS, BULK_INTERVAL_MS,
+    WatcherChangeKind, BULK_DOCUMENTS,
 };
 use crate::framing::{
-    parse_json_object, spawn_frame_reader, write_frame, write_json, FrameInput, FramePoll,
+    parse_json_object, spawn_frame_reader, write_frame, write_json, Connection, FrameInput,
+    FramePoll,
 };
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{
@@ -62,7 +63,7 @@ struct PendingRequest {
 struct ProxyState {
     documents: DocumentState,
     pending: HashMap<i64, PendingRequest>,
-    queued: VecDeque<Value>,
+    queued: VecDeque<(Value, usize)>,
     queued_bytes: usize,
     server_requests: HashSet<crate::json::RequestKey>,
     stale_server_ids: HashSet<crate::json::RequestKey>,
@@ -83,6 +84,7 @@ struct ProxyState {
     bulk_batch_uris: HashSet<String>,
     bulk_complete: bool,
     bulk_active: bool,
+    bulk_replay: bool,
     bulk_deadline: Option<Instant>,
 }
 
@@ -95,37 +97,6 @@ enum InternalEvent {
     BulkComplete {
         generation: u64,
     },
-}
-
-struct Connection {
-    socket: TcpStream,
-    reader: Option<FrameInput>,
-    reader_thread: Option<JoinHandle<()>>,
-    writer: TcpStream,
-}
-
-impl Connection {
-    fn read_frame(&mut self) -> std::result::Result<Option<Vec<u8>>, crate::framing::FrameError> {
-        self.reader
-            .as_mut()
-            .ok_or_else(|| crate::framing::FrameError::Io(io::Error::other("reader is closed")))?
-            .with_next_frame(|body| body.to_owned())
-    }
-
-    fn close(&mut self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
-        let reader = self.reader.take();
-        drop(reader);
-        if let Some(thread) = self.reader_thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.close();
-    }
 }
 
 struct Editor {
@@ -549,6 +520,7 @@ pub fn run() -> Result<ExitCode> {
         bulk_batch_uris: HashSet::new(),
         bulk_complete: false,
         bulk_active: false,
+        bulk_replay: false,
         bulk_deadline: None,
     };
 
@@ -856,7 +828,7 @@ fn forward_client_message(
             for message in
                 rewrite_document_messages(proxy, message, method, settings.project_diagnostics)?
             {
-                send_godot(&mut editor.connection.writer, &message, false)?;
+                send_godot_body(&mut editor.connection.writer, &message, false)?;
             }
             return Ok(());
         }
@@ -904,16 +876,17 @@ fn forward_client_request(
         return Ok(None);
     }
     if proxy.pending.len() >= IN_FLIGHT_CAP && !is_shutdown {
-        message["id"] = zed_id;
         let queued_size = crate::json::to_vec(&message).len();
+        if queued_size > GODOT_WRITE_CAP {
+            send_error(output, &zed_id, -32803, "message too large for Godot")?;
+            return Ok(None);
+        }
         if proxy.queued_bytes.saturating_add(queued_size) > QUEUE_BYTES_CAP {
-            if let Some(id) = message.get("id") {
-                send_error(output, id, -32803, "RequestFailed")?;
-            }
+            send_error(output, &zed_id, -32803, "RequestFailed")?;
             return Ok(None);
         }
         proxy.queued_bytes += queued_size;
-        proxy.queued.push_back(message);
+        proxy.queued.push_back((message, queued_size));
         return Ok(None);
     }
     proxy.pending.insert(
@@ -945,12 +918,10 @@ fn cancel_request(
     if let Some(index) = proxy
         .queued
         .iter()
-        .position(|queued| queued.get("id") == Some(&target))
+        .position(|(queued, _)| queued.get("id") == Some(&target))
     {
-        if let Some(queued) = proxy.queued.remove(index) {
-            proxy.queued_bytes = proxy
-                .queued_bytes
-                .saturating_sub(crate::json::to_vec(&queued).len());
+        if let Some((_, queued_size)) = proxy.queued.remove(index) {
+            proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
         }
         send_error(output, &target, -32800, "RequestCancelled")?;
         return Ok(());
@@ -1080,12 +1051,10 @@ fn flush_queued(
     proxy: &mut ProxyState,
 ) -> Result<()> {
     while proxy.pending.len() < IN_FLIGHT_CAP {
-        let Some(mut message) = proxy.queued.pop_front() else {
+        let Some((mut message, queued_size)) = proxy.queued.pop_front() else {
             break;
         };
-        proxy.queued_bytes = proxy
-            .queued_bytes
-            .saturating_sub(crate::json::to_vec(&message).len());
+        proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
         let zed_id = message.get("id").cloned().unwrap_or(Value::Null);
         let bridge_id = proxy.next_id;
         proxy.next_id += 1;
@@ -1113,10 +1082,10 @@ fn rewrite_document_messages(
     message: Value,
     method: &str,
     reopen_from_disk: bool,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<Vec<u8>>> {
     let mut message = message;
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
-        return Ok(vec![message]);
+        return Ok(vec![crate::json::to_vec(&message)]);
     };
     let Some(uri) = params
         .get("textDocument")
@@ -1125,26 +1094,30 @@ fn rewrite_document_messages(
         .and_then(Value::as_str)
         .map(str::to_owned)
     else {
-        return Ok(vec![message]);
+        return Ok(vec![crate::json::to_vec(&message)]);
     };
     match method {
         "textDocument/didOpen" => {
             let Some(document) = params.get("textDocument").and_then(Value::as_object) else {
-                return Ok(vec![message]);
+                return Ok(vec![crate::json::to_vec(&message)]);
             };
             let text = document
                 .get("text")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let planned = proxy.documents.planned_zed_open(&uri, text.clone());
-            if crate::json::to_vec(&document_action_message(planned)).len() > GODOT_WRITE_CAP {
+                .unwrap_or_default();
+            if text.len() > GODOT_WRITE_CAP {
                 crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let action = proxy.documents.zed_open(&uri, text);
+            let planned = proxy.documents.planned_zed_open(&uri, text);
+            let body = crate::json::to_vec(&document_action_message(&planned));
+            if body.len() > GODOT_WRITE_CAP {
+                crate::warn!("skipping oversized didOpen for Godot {uri}");
+                return Ok(Vec::new());
+            }
+            let action = proxy.documents.zed_open(&uri, text.to_owned());
             schedule_document_action(proxy, &action);
-            return Ok(vec![document_action_message(action)]);
+            return Ok(vec![body]);
         }
         "textDocument/didChange" => {
             let changes = params
@@ -1156,42 +1129,47 @@ fn rewrite_document_messages(
                 .is_some_and(|changes| changes.len() == 1 && changes[0].get("range").is_none());
             if !full_sync {
                 crate::warn!("didChange was not a full synchronization {uri}");
-                return Ok(vec![message]);
+                return Ok(vec![crate::json::to_vec(&message)]);
             }
             let text = changes
                 .as_ref()
                 .and_then(|changes| changes[0].get("text"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let planned = proxy.documents.planned_zed_change(&uri, text.clone());
-            if planned.is_some_and(|action| {
-                crate::json::to_vec(&document_action_message(action)).len() > GODOT_WRITE_CAP
-            }) {
+                .unwrap_or_default();
+            if text.len() > GODOT_WRITE_CAP {
                 crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let Some(action) = proxy.documents.zed_change(&uri, text) else {
-                if crate::json::to_vec(&message).len() > GODOT_WRITE_CAP {
+            let planned = proxy.documents.planned_zed_change(&uri, text);
+            let Some(action) = proxy.documents.zed_change(&uri, text.to_owned()) else {
+                let body = crate::json::to_vec(&message);
+                if body.len() > GODOT_WRITE_CAP {
                     crate::warn!("skipping oversized didChange for Godot {uri}");
                     return Ok(Vec::new());
                 }
-                return Ok(vec![message]);
+                return Ok(vec![body]);
             };
+            let body = crate::json::to_vec(&document_action_message(
+                planned.as_ref().expect("planned change exists"),
+            ));
+            if body.len() > GODOT_WRITE_CAP {
+                crate::warn!("skipping oversized didChange for Godot {uri}");
+                return Ok(Vec::new());
+            }
             schedule_document_action(proxy, &action);
-            return Ok(vec![document_action_message(action)]);
+            return Ok(vec![body]);
         }
         "textDocument/didClose" => {
             let Some((key, close_uri)) = proxy.documents.zed_close(&uri) else {
-                return Ok(vec![message]);
+                return Ok(vec![crate::json::to_vec(&message)]);
             };
             schedule_close(proxy, &close_uri);
-            let mut messages = vec![close_message(&close_uri)];
+            let mut messages = vec![crate::json::to_vec(&close_message(&close_uri))];
             if reopen_from_disk && key.is_file() {
                 if let Some(text) = docs_state::read_document(&key) {
                     if let Some(open) = proxy.documents.bridge_open_path(&key, text) {
                         schedule_document_action(proxy, &open);
-                        messages.push(document_action_message(open));
+                        messages.push(crate::json::to_vec(&document_action_message(&open)));
                     }
                 } else {
                     proxy.documents.forget_closed(&key, &close_uri);
@@ -1203,24 +1181,24 @@ fn rewrite_document_messages(
         }
         _ => {}
     }
-    Ok(vec![message])
+    Ok(vec![crate::json::to_vec(&message)])
 }
 
-fn document_action_message(action: DocumentAction) -> Value {
+fn document_action_message(action: &DocumentAction) -> Value {
     match action {
         DocumentAction::Open {
             uri, version, text, ..
         } => crate::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
-            "params": {"textDocument": {"uri": uri, "languageId": "gdscript", "version": version, "text": text}}
+            "params": {"textDocument": {"uri": uri, "languageId": "gdscript", "version": (*version), "text": text}}
         }),
         DocumentAction::Change {
             uri, version, text, ..
         } => crate::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
-            "params": {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": (text)}]}
+            "params": {"textDocument": {"uri": uri, "version": (*version)}, "contentChanges": [{"text": (text)}]}
         }),
     }
 }
@@ -1238,6 +1216,7 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
         || !proxy.initialized_forwarded
         || !proxy.zed_initialized
         || proxy.project_diagnostics_started
+        || proxy.bulk_replay
     {
         return;
     }
@@ -1280,6 +1259,18 @@ fn process_bulk_document(
     proxy
         .documents
         .register_watcher_path(&document.path, document.key.clone());
+    if proxy.bulk_replay {
+        let Some(open) = proxy.documents.open_docs.get(&document.key) else {
+            return Ok(None);
+        };
+        let message = crate::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {"textDocument": {"uri": (open.uri.clone()), "languageId": "gdscript", "version": 1, "text": (open.text.clone())}}
+        });
+        send_godot(writer, &message, false)?;
+        return Ok(Some(open.uri.clone()));
+    }
     if proxy.documents.open_docs.contains_key(&document.key) {
         return Ok(None);
     }
@@ -1290,16 +1281,14 @@ fn process_bulk_document(
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
         };
-        send_godot(writer, &document_action_message(action), false)?;
+        send_godot(writer, &document_action_message(&action), false)?;
         return Ok(Some(uri));
     }
     Ok(None)
 }
 
 fn bulk_can_advance(proxy: &ProxyState, now: Instant) -> bool {
-    proxy.bulk_batch_uris.is_empty()
-        || proxy.pending.len() < IN_FLIGHT_CAP
-        || proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
+    proxy.bulk_batch_uris.is_empty() || proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
 }
 
 fn pump_bulk_documents(proxy: &mut ProxyState, writer: &mut TcpStream) -> Result<()> {
@@ -1320,15 +1309,13 @@ fn pump_bulk_documents(proxy: &mut ProxyState, writer: &mut TcpStream) -> Result
             sent += 1;
         }
         if !proxy.bulk_batch_uris.is_empty() {
-            proxy.bulk_deadline = Some(Instant::now() + Duration::from_millis(BULK_INTERVAL_MS));
-            if proxy.bulk_complete && proxy.bulk_documents.is_empty() {
-                proxy.bulk_active = false;
-            }
+            proxy.bulk_deadline = Some(Instant::now() + Duration::from_secs(1));
             return Ok(());
         }
         if proxy.bulk_documents.is_empty() {
             if proxy.bulk_complete {
                 proxy.bulk_active = false;
+                proxy.bulk_replay = false;
             }
             return Ok(());
         }
@@ -1416,7 +1403,7 @@ fn process_watcher_changes(
                         };
                         send_godot(
                             &mut editor.connection.writer,
-                            &document_action_message(action),
+                            &document_action_message(&action),
                             false,
                         )?;
                     }
@@ -1693,12 +1680,14 @@ mod tests {
             bulk_batch_uris: HashSet::new(),
             bulk_complete: false,
             bulk_active: false,
+            bulk_replay: false,
             bulk_deadline: None,
         };
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =
             rewrite_document_messages(&mut proxy, message, "textDocument/didOpen", true).unwrap();
-        assert_eq!(rewritten[0]["params"]["textDocument"]["version"], 1);
+        let rewritten = crate::json::from_slice(&rewritten[0]).unwrap();
+        assert_eq!(rewritten["params"]["textDocument"]["version"], 1);
         assert_eq!(proxy.documents.open_docs.len(), 1);
     }
 }

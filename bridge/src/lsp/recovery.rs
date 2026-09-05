@@ -14,6 +14,7 @@ fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.bulk_batch_uris.clear();
     session.proxy.bulk_complete = false;
     session.proxy.bulk_active = false;
+    session.proxy.bulk_replay = false;
     session.proxy.bulk_deadline = None;
     session.proxy.bulk_generation += 1;
     session.proxy.project_diagnostics_started = false;
@@ -31,7 +32,7 @@ fn fail_in_flight(session: &mut Session) -> Result<()> {
             )?;
         }
     }
-    for queued in session.proxy.queued.drain(..) {
+    for (queued, _) in session.proxy.queued.drain(..) {
         if let Some(id) = queued.get("id") {
             send_error(&mut session.output, id, -32803, "RequestFailed")?;
         }
@@ -174,7 +175,9 @@ pub(super) fn absorb_watcher_event(
 pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) -> Result<()> {
     replay_open_documents(session)?;
     session.proxy.documents.set_open_change_events(true);
-    start_project_diagnostics(&mut session.proxy, &session.settings);
+    if !session.proxy.bulk_replay {
+        start_project_diagnostics(&mut session.proxy, &session.settings);
+    }
     set_ready(&session.runtime, &session.editor)?;
     while let Some(item) = queue.items.pop_front() {
         let message = match item {
@@ -208,29 +211,23 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
 }
 
 fn replay_open_documents(session: &mut Session) -> Result<()> {
-    let messages = session
-        .proxy
-        .documents
-        .open_docs
-        .values_mut()
-        .map(|doc| {
-            doc.version = 1;
-            crate::json!({
-                "jsonrpc": "2.0",
-                "method": "textDocument/didOpen",
-                "params": {"textDocument": {"uri": (doc.uri.clone()), "languageId": "gdscript", "version": 1, "text": (doc.text.clone())}}
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut deadline = Instant::now();
-    for (index, message) in messages.into_iter().enumerate() {
-        send_godot(&mut session.editor.connection.writer, &message, false)?;
-        if (index + 1) % BULK_DOCUMENTS == 0 {
-            deadline += Duration::from_millis(BULK_INTERVAL_MS);
-            if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                thread::sleep(remaining);
-            }
-        }
+    session.proxy.bulk_generation += 1;
+    session.proxy.bulk_documents.clear();
+    session.proxy.bulk_batch_uris.clear();
+    session.proxy.bulk_complete = true;
+    session.proxy.bulk_active = true;
+    session.proxy.bulk_replay = true;
+    session.proxy.bulk_deadline = None;
+    for (key, doc) in &mut session.proxy.documents.open_docs {
+        doc.version = 1;
+        session
+            .proxy
+            .bulk_documents
+            .push_back(docs_state::ScannedDocument {
+                path: key.clone(),
+                key: key.clone(),
+                text: doc.text.clone(),
+            });
     }
     let replayed = session
         .proxy
@@ -246,7 +243,7 @@ fn replay_open_documents(session: &mut Session) -> Result<()> {
     for event in replayed {
         schedule_symbol_event(&mut session.proxy, event);
     }
-    Ok(())
+    pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
 }
 
 pub(super) fn queue_recovery_message(

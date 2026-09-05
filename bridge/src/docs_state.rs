@@ -95,29 +95,29 @@ impl DocumentState {
         self.emit_open_change_events = enabled;
     }
 
-    pub fn planned_zed_open(&self, incoming_uri: &str, text: String) -> DocumentAction {
+    pub fn planned_zed_open(&self, incoming_uri: &str, text: &str) -> DocumentAction {
         let key = self.key_for_uri(incoming_uri);
         match self.open_docs.get(&key) {
             Some(doc) => DocumentAction::Change {
                 uri: doc.uri.clone(),
                 version: doc.version + 1,
-                text,
+                text: text.to_owned(),
             },
             None => DocumentAction::Open {
                 uri: path_to_uri(&key),
                 version: 1,
-                text,
+                text: text.to_owned(),
             },
         }
     }
 
-    pub fn planned_zed_change(&self, incoming_uri: &str, text: String) -> Option<DocumentAction> {
+    pub fn planned_zed_change(&self, incoming_uri: &str, text: &str) -> Option<DocumentAction> {
         let key = self.key_for_uri(incoming_uri);
         let doc = self.open_docs.get(&key)?;
         Some(DocumentAction::Change {
             uri: doc.uri.clone(),
             version: doc.version + 1,
-            text,
+            text: text.to_owned(),
         })
     }
 

@@ -463,11 +463,10 @@ where
     let path = path.as_ref().to_path_buf();
     not_found_ok(std::fs::remove_file(&path))?;
     let listener = UnixListener::bind(&path)?;
-    listener.set_nonblocking(true)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let handler = Arc::new(handler);
     let stop = Arc::new(AtomicBool::new(false));
-    let clients = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
     let count = Arc::new(AtomicUsize::new(0));
     let stop_for_thread = Arc::clone(&stop);
     let clients_for_thread = Arc::clone(&clients);
@@ -479,10 +478,6 @@ where
             while !stop_for_thread.load(Ordering::Acquire) {
                 let (stream, _) = match listener.accept() {
                     Ok(connection) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
                     Err(_) => break,
                 };
                 if count_for_thread.load(Ordering::Acquire) >= SOCKET_CLIENT_CAP {
@@ -501,6 +496,7 @@ where
                     });
                 if let Ok(client) = client {
                     if let Ok(mut clients) = clients_for_thread.lock() {
+                        clients.retain(|client| !client.is_finished());
                         clients.push(client);
                     }
                 } else {

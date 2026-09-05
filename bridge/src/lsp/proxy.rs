@@ -28,11 +28,15 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         );
     }
     let gui_interval = Duration::from_millis(200);
-    let symbol_interval = Duration::from_millis(50);
     let mut gui_deadline = Instant::now() + gui_interval;
-    let mut symbol_deadline = Instant::now() + symbol_interval;
     let mut turn = 0;
     loop {
+        if !session.proxy.bulk_replay
+            && !session.proxy.project_diagnostics_started
+            && session.settings.project_diagnostics
+        {
+            start_project_diagnostics(&mut session.proxy, &session.settings);
+        }
         let now = Instant::now();
         if session.runtime.mode == Mode::Gui && now >= gui_deadline {
             while gui_deadline <= now {
@@ -43,10 +47,13 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             }
             continue;
         }
-        if now >= symbol_deadline {
-            while symbol_deadline <= now {
-                symbol_deadline += symbol_interval;
-            }
+        let symbol_deadline = session
+            .proxy
+            .symbol_scheduled
+            .values()
+            .map(|(_, _, deadline)| *deadline)
+            .min();
+        if symbol_deadline.is_some_and(|deadline| deadline <= now) {
             if let Err(error) = send_due_symbol_requests(&mut session.editor, &mut session.proxy) {
                 if unmanaged {
                     return exit_session(&mut session, 1);
@@ -54,14 +61,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                 recover(&mut session, &error.to_string(), true)?;
             }
         }
-        if (!session.proxy.bulk_documents.is_empty()
-            && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS
-                || session.proxy.bulk_complete))
-            && (session
-                .proxy
-                .bulk_deadline
-                .is_some_and(|deadline| deadline <= now)
-                || session.proxy.pending.len() < IN_FLIGHT_CAP)
+        if !session.proxy.bulk_documents.is_empty()
+            && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS || session.proxy.bulk_complete)
+            && bulk_can_advance(&session.proxy, now)
         {
             if let Err(error) =
                 pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
@@ -251,13 +253,15 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         if processed {
             continue;
         }
-        let mut wait = Duration::from_millis(50);
+        let mut wait = Duration::from_millis(100);
         let now = Instant::now();
-        wait = wait.min(
-            symbol_deadline
-                .checked_duration_since(now)
-                .unwrap_or(Duration::ZERO),
-        );
+        if let Some(deadline) = symbol_deadline {
+            wait = wait.min(
+                deadline
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO),
+            );
+        }
         if session.runtime.mode == Mode::Gui {
             wait = wait.min(
                 gui_deadline

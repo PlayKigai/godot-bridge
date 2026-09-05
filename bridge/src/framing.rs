@@ -164,11 +164,109 @@ impl FrameDecoder {
 
 pub(crate) type ReadEvent = Result<Option<Vec<u8>>, std::io::Error>;
 
+pub(crate) struct Connection<R = FrameInput> {
+    pub(crate) socket: std::net::TcpStream,
+    pub(crate) reader: Option<R>,
+    pub(crate) reader_thread: Option<JoinHandle<()>>,
+    pub(crate) writer: std::net::TcpStream,
+}
+
+impl<R> Connection<R> {
+    pub(crate) fn with_parts(
+        socket: std::net::TcpStream,
+        reader: Option<R>,
+        reader_thread: Option<JoinHandle<()>>,
+        writer: std::net::TcpStream,
+    ) -> Self {
+        Self {
+            socket,
+            reader,
+            reader_thread,
+            writer,
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        drop(self.reader.take());
+        if let Some(reader_thread) = self.reader_thread.take() {
+            let _ = reader_thread.join();
+        }
+    }
+}
+
+impl<R> Drop for Connection<R> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl Connection<FrameInput> {
+    pub(crate) fn from_stream(
+        stream: std::net::TcpStream,
+        name: &str,
+        cap: usize,
+    ) -> std::io::Result<Self> {
+        let reader_stream = stream.try_clone()?;
+        let writer = stream.try_clone()?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader_thread = spawn_frame_reader(name, reader_stream, sender)?;
+        Ok(Self::with_parts(
+            stream,
+            Some(FrameInput::new(receiver, cap)),
+            Some(reader_thread),
+            writer,
+        ))
+    }
+
+    pub(crate) fn read_frame(&mut self) -> std::result::Result<Option<Vec<u8>>, FrameError> {
+        self.reader
+            .as_mut()
+            .ok_or_else(|| FrameError::Io(std::io::Error::other("reader is closed")))?
+            .with_next_frame(|body| body.to_owned())
+    }
+}
+
+pub(crate) fn connection_without_reader<T, F>(
+    stream: std::net::TcpStream,
+    name: &str,
+    sender: SyncSender<T>,
+    map: F,
+) -> std::io::Result<Connection<()>>
+where
+    T: Send + 'static,
+    F: Fn(ReadEvent) -> T + Send + 'static,
+{
+    let reader_stream = stream.try_clone()?;
+    let writer = stream.try_clone()?;
+    let reader_thread = spawn_frame_reader_with(name, reader_stream, sender, map)?;
+    Ok(Connection::with_parts(
+        stream,
+        None,
+        Some(reader_thread),
+        writer,
+    ))
+}
+
 pub fn spawn_frame_reader<R: Read + Send + 'static>(
     name: &str,
-    mut reader: R,
+    reader: R,
     sender: SyncSender<ReadEvent>,
 ) -> std::io::Result<JoinHandle<()>> {
+    spawn_frame_reader_with(name, reader, sender, |event| event)
+}
+
+pub(crate) fn spawn_frame_reader_with<R, T, F>(
+    name: &str,
+    mut reader: R,
+    sender: SyncSender<T>,
+    map: F,
+) -> std::io::Result<JoinHandle<()>>
+where
+    R: Read + Send + 'static,
+    T: Send + 'static,
+    F: Fn(ReadEvent) -> T + Send + 'static,
+{
     let name = name.to_owned();
     thread::Builder::new()
         .name(name)
@@ -184,7 +282,7 @@ pub fn spawn_frame_reader<R: Read + Send + 'static>(
                 Err(error) => Err(error),
             };
             let done = matches!(&event, Ok(None) | Err(_));
-            if sender.send(event).is_err() {
+            if sender.send(map(event)).is_err() {
                 return;
             }
             if done {
