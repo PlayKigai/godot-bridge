@@ -505,6 +505,43 @@ mod tests {
     }
 
     #[test]
+    fn real_name_search_benchmark() {
+        const NAMES: [&str; 16] = [
+            "_ready",
+            "_process",
+            "_physics_process",
+            "spawn_enemy",
+            "player_velocity",
+            "take_damage",
+            "on_area_entered",
+            "PlayerController",
+            "inventory_slot",
+            "apply_impulse",
+            "update_health_bar",
+            "camera_shake",
+            "save_game_state",
+            "load_scene_async",
+            "connect_signals",
+            "queue_free_children",
+        ];
+        let items = (0..32_000)
+            .map(|index| {
+                symbol(
+                    &format!("{}_{index}", NAMES[index as usize % NAMES.len()]),
+                    "file:///a",
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        for query in ["ready", "", "pv", "player jump"] {
+            let start = std::time::Instant::now();
+            let results = search(&items, query);
+            println!("real-name search {query:?}: {:?}", start.elapsed());
+            assert!(results.len() <= 200);
+        }
+    }
+
+    #[test]
     fn synthetic_search_benchmark_matches_reference() {
         let items = (0..32_000)
             .map(|index| symbol(&format!("symbol_{index:05}_ready"), "file:///a", index))
