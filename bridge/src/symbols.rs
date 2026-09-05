@@ -4,6 +4,9 @@ use crate::json::Value;
 pub struct Symbol {
     pub name: String,
     folded_name: String,
+    folded_container_name: String,
+    boundary_positions: Vec<usize>,
+    container_boundary_positions: Vec<usize>,
     pub kind: Value,
     pub container: String,
     pub uri: String,
@@ -17,6 +20,7 @@ struct Match<'a> {
     offset: usize,
     indices: Vec<usize>,
     range_start: (u64, u64),
+    boundary_count: usize,
 }
 
 pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
@@ -28,28 +32,35 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
     for item in items {
         if item.get("location").is_some() {
             let location = item.get("location").unwrap_or(&Value::Null);
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let folded_name = name.to_lowercase();
+            let container = item
+                .get("containerName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let container_name = if container.is_empty() {
+                name.clone()
+            } else {
+                format!("{container}.{name}")
+            };
             let uri = location
                 .get("uri")
                 .and_then(Value::as_str)
                 .map(normalize_uri)
                 .unwrap_or_else(|| default_uri.clone());
             output.push(Symbol {
-                name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                folded_name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_lowercase(),
+                boundary_positions: boundary_positions(&name),
+                container_boundary_positions: boundary_positions(&container_name),
+                folded_container_name: container_name.to_lowercase(),
+                name,
+                folded_name,
                 kind: item.get("kind").cloned().unwrap_or(Value::Null),
-                container: item
-                    .get("containerName")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                container,
                 uri,
                 range: location.get("range").cloned().unwrap_or(Value::Null),
             });
@@ -67,6 +78,12 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<S
         .and_then(Value::as_str)
         .map(normalize_uri)
         .unwrap_or_else(|| uri.to_owned());
+    let folded_name = name.to_lowercase();
+    let container_name = if container.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{container}.{name}")
+    };
     let current_container = if container.is_empty() {
         String::new()
     } else {
@@ -74,7 +91,10 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<S
     };
     output.push(Symbol {
         name: name.to_owned(),
-        folded_name: name.to_lowercase(),
+        folded_name,
+        folded_container_name: container_name.to_lowercase(),
+        boundary_positions: boundary_positions(name),
+        container_boundary_positions: boundary_positions(&container_name),
         kind: item.get("kind").cloned().unwrap_or(Value::Null),
         container: current_container,
         uri: uri.clone(),
@@ -104,16 +124,52 @@ fn normalize_uri(uri: &str) -> String {
     }
 }
 
+fn boundary_positions(value: &str) -> Vec<usize> {
+    let characters = value.chars().collect::<Vec<_>>();
+    characters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, character)| {
+            (index == 0
+                || characters[index - 1] == '_'
+                || (character.is_uppercase() && characters[index - 1].is_lowercase()))
+            .then_some(index)
+        })
+        .collect()
+}
+
 pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
+    let container_query = query.contains('.') || query.contains(' ');
     let query = query.to_lowercase();
+    let query = if container_query {
+        query.replace(' ', ".")
+    } else {
+        query
+    };
     let mut matches = symbols
         .iter()
         .filter_map(|symbol| {
-            let matched = best_match(&symbol.folded_name, &query)?;
+            let target = if container_query {
+                &symbol.folded_container_name
+            } else {
+                &symbol.folded_name
+            };
+            let matched = best_match(target, &query)?;
+            let boundary_positions = if container_query {
+                &symbol.container_boundary_positions
+            } else {
+                &symbol.boundary_positions
+            };
+            let boundary_count = matched
+                .2
+                .iter()
+                .filter(|index| boundary_positions.binary_search(index).is_ok())
+                .count();
             Some(Match {
                 symbol,
-                gap: matched.0,
+                gap: matched.0.saturating_sub(boundary_count * 4),
                 offset: matched.1,
+                boundary_count,
                 indices: matched.2,
                 range_start: range_start(&symbol.range),
             })
@@ -122,6 +178,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
     matches.sort_by(|left, right| {
         left.gap
             .cmp(&right.gap)
+            .then(right.boundary_count.cmp(&left.boundary_count))
             .then(left.offset.cmp(&right.offset))
             .then(left.symbol.name.cmp(&right.symbol.name))
             .then(left.symbol.uri.cmp(&right.symbol.uri))
@@ -214,11 +271,24 @@ mod tests {
     use super::*;
 
     fn symbol(name: &str, uri: &str, line: u64) -> Symbol {
+        symbol_with_container(name, "", uri, line)
+    }
+
+    fn symbol_with_container(name: &str, container: &str, uri: &str, line: u64) -> Symbol {
+        let folded_name = name.to_lowercase();
+        let container_name = if container.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{container}.{name}")
+        };
         Symbol {
             name: name.to_owned(),
-            folded_name: name.to_lowercase(),
+            folded_name,
+            folded_container_name: container_name.to_lowercase(),
+            boundary_positions: boundary_positions(name),
+            container_boundary_positions: boundary_positions(&container_name),
             kind: crate::json!(12),
-            container: String::new(),
+            container: container.to_owned(),
             uri: uri.to_owned(),
             range: crate::json!({"start":{"line":line,"character":0},"end":{"line":line,"character":1}}),
         }
@@ -236,7 +306,7 @@ mod tests {
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["_ready", "a_ready", "read_y"]
+            vec!["read_y", "_ready", "a_ready"]
         );
         assert_eq!(
             search(&items, "")
@@ -259,6 +329,23 @@ mod tests {
             best_match("rreaddy", "ready").unwrap().2,
             vec![1, 2, 3, 4, 6]
         );
+    }
+
+    #[test]
+    fn boundary_bonus_prefers_word_starts() {
+        let items = vec![
+            symbol("improve", "file:///a", 0),
+            symbol("player_velocity", "file:///b", 0),
+        ];
+        assert_eq!(search(&items, "pv")[0].name, "player_velocity");
+    }
+
+    #[test]
+    fn container_queries_match_dotted_and_spaced_names() {
+        let items = vec![symbol_with_container("jump", "Player", "file:///a", 0)];
+        assert_eq!(search(&items, "player jump")[0].name, "jump");
+        assert_eq!(search(&items, "Player.jump")[0].name, "jump");
+        assert!(search(&items, "player").is_empty());
     }
 
     #[test]
@@ -316,5 +403,4 @@ mod tests {
         assert_eq!(flattened[2].uri, "file:///tmp/other.gd");
         assert_eq!(flattened[3].uri, "file:///tmp/other.gd");
     }
-
 }
