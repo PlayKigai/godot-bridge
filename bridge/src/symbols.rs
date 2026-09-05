@@ -201,7 +201,7 @@ pub fn search_with_uris<'a>(
             } else {
                 &symbol.folded_name
             };
-            if target.chars().count() > 256 {
+            if target.len() > 256 && target.chars().count() > 256 {
                 return None;
             }
             let (gap, offset, indices) =
