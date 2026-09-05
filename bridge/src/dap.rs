@@ -20,7 +20,7 @@ use crate::scene::resolve_scene;
 use crate::settings_file::{parse_trusted_settings, Settings};
 use crate::state::{socket_request, try_lock, LockGuard, ProjectFiles};
 
-const FRAME_CAP: usize = 64 * 1024 * 1024;
+const FRAME_CAP: usize = 8 * 1024 * 1024;
 const BUFFER_CAP: usize = 64 * 1024 * 1024;
 const SOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);

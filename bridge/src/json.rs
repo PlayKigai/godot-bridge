@@ -410,30 +410,30 @@ impl RawJson<'_> {
     }
 
     fn lexical(self) -> String {
-        String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8")
+        from_slice(self.0).map_or_else(
+            |_| String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8"),
+            |value| to_string(&value),
+        )
     }
 
     pub(crate) fn request_key(self) -> Option<RequestKey> {
-        if self.0.first() == Some(&b'"') {
-            if let Ok(Value::String(value)) = from_slice(self.0) {
-                if value.len() > 256 {
-                    crate::warn!("dropping request id longer than 256 bytes");
-                    return None;
-                }
-                return Some(RequestKey::String(value));
+        let key = if self.is_string() {
+            match from_slice(self.0) {
+                Ok(Value::String(value)) => RequestKey::String(value),
+                _ => RequestKey::Lexical(self.lexical()),
             }
+        } else if let Some(number) = self.as_i64() {
+            RequestKey::Number(number)
+        } else {
+            RequestKey::Lexical(self.lexical())
+        };
+        if matches!(&key, RequestKey::String(value) | RequestKey::Lexical(value) if value.len() > 256)
+        {
+            crate::warn!("dropping request id longer than 256 bytes");
+            None
+        } else {
+            Some(key)
         }
-        self.as_i64().map_or_else(
-            || {
-                if self.0.len() > 256 {
-                    crate::warn!("dropping request id longer than 256 bytes");
-                    None
-                } else {
-                    Some(RequestKey::Lexical(self.lexical()))
-                }
-            },
-            |number| Some(RequestKey::Number(number)),
-        )
     }
 
     pub(crate) fn string_eq(self, expected: &str) -> bool {
@@ -457,36 +457,19 @@ impl RawJson<'_> {
 }
 
 pub(crate) fn value_request_key(value: &Value) -> Option<RequestKey> {
-    match value {
-        Value::String(value) => {
-            if value.len() > 256 {
-                crate::warn!("dropping request id longer than 256 bytes");
-                None
-            } else {
-                Some(RequestKey::String(value.clone()))
-            }
-        }
+    let key = match value {
+        Value::String(value) => RequestKey::String(value.clone()),
         Value::Number(number) => number.as_i64().map_or_else(
-            || {
-                let lexical = number.to_string();
-                if lexical.len() > 256 {
-                    crate::warn!("dropping request id longer than 256 bytes");
-                    None
-                } else {
-                    Some(RequestKey::Lexical(lexical))
-                }
-            },
-            |number| Some(RequestKey::Number(number)),
+            || RequestKey::Lexical(number.to_string()),
+            RequestKey::Number,
         ),
-        _ => {
-            let lexical = to_string(value);
-            if lexical.len() > 256 {
-                crate::warn!("dropping request id longer than 256 bytes");
-                None
-            } else {
-                Some(RequestKey::Lexical(lexical))
-            }
-        }
+        _ => RequestKey::Lexical(to_string(value)),
+    };
+    if matches!(&key, RequestKey::String(value) | RequestKey::Lexical(value) if value.len() > 256) {
+        crate::warn!("dropping request id longer than 256 bytes");
+        None
+    } else {
+        Some(key)
     }
 }
 
@@ -1386,6 +1369,18 @@ break"}"#,
             .request_key()
             .unwrap();
         let parsed = value_request_key(&from_str(r#""a/b""#).unwrap()).unwrap();
+        assert_eq!(wire, parsed);
+    }
+
+    #[test]
+    fn request_keys_canonicalize_spaced_arrays() {
+        let wire = scan_top_level(br#"{"id":[1, 2]}"#)
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key()
+            .unwrap();
+        let parsed = value_request_key(&from_str("[1, 2]").unwrap()).unwrap();
         assert_eq!(wire, parsed);
     }
 

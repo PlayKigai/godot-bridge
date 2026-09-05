@@ -251,14 +251,15 @@ fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     if metadata.len() > SETTINGS_FILE_CAP {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut text = String::new();
     use std::io::Read;
-    file.read_to_string(&mut text)
+    file.take(SETTINGS_FILE_CAP + 1)
+        .read_to_string(&mut text)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     if text.len() > SETTINGS_FILE_CAP as usize {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));

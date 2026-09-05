@@ -45,12 +45,12 @@ use proxy::*;
 use recovery::*;
 use startup::*;
 
-const CLIENT_FRAME_CAP: usize = 64 * 1024 * 1024;
-const GODOT_FRAME_CAP: usize = 64 * 1024 * 1024;
+const CLIENT_FRAME_CAP: usize = 8 * 1024 * 1024;
+const GODOT_FRAME_CAP: usize = 8 * 1024 * 1024;
 const GODOT_WRITE_CAP: usize = 4 * 1024 * 1024;
 const IN_FLIGHT_CAP: usize = 32;
 const RECOVERY_QUEUE_CAP: usize = 1000;
-const QUEUE_BYTES_CAP: usize = 64 * 1024 * 1024;
+const QUEUE_BYTES_CAP: usize = 8 * 1024 * 1024;
 const WATCHER_PENDING_CAP: usize = 4096;
 const STARTUP_ATTEMPTS: usize = 3;
 
@@ -1045,9 +1045,13 @@ fn forward_client_message(
             method,
             "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose"
         ) {
-            for message in
-                rewrite_document_messages(proxy, message, method, settings.project_diagnostics)?
-            {
+            for message in rewrite_document_messages(
+                proxy,
+                message,
+                method,
+                settings.project_diagnostics,
+                settings.diagnose_addons,
+            )? {
                 send_godot_body(&mut editor.connection.writer, &message, false)?;
             }
             return Ok(());
@@ -1324,6 +1328,7 @@ fn rewrite_document_messages(
     message: Value,
     method: &str,
     reopen_from_disk: bool,
+    diagnose_addons: bool,
 ) -> Result<Vec<Vec<u8>>> {
     let mut message = message;
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
@@ -1402,7 +1407,10 @@ fn rewrite_document_messages(
             };
             forget_symbols(proxy, &close_uri);
             let mut messages = vec![crate::json::to_vec(&close_message(&close_uri))];
-            if reopen_from_disk && key.is_file() {
+            if reopen_from_disk
+                && docs_state::eligible_path(&proxy.project, &key, diagnose_addons)
+                && key.is_file()
+            {
                 if let Some(text) = docs_state::read_document(&key) {
                     if let Some(open) = proxy.documents.bridge_open_path(&key, text) {
                         schedule_document_action(proxy, &open);
@@ -1978,7 +1986,8 @@ mod tests {
         );
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =
-            rewrite_document_messages(&mut proxy, message, "textDocument/didOpen", true).unwrap();
+            rewrite_document_messages(&mut proxy, message, "textDocument/didOpen", true, false)
+                .unwrap();
         let rewritten = crate::json::from_slice(&rewritten[0]).unwrap();
         assert_eq!(rewritten["params"]["textDocument"]["version"], 1);
         assert_eq!(proxy.documents.open_docs.len(), 1);

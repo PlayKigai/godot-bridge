@@ -429,7 +429,7 @@ mod tests {
                         let value = parse_json_object(&body, "LSP").unwrap();
                         crate::json::to_vec(&value)
                     };
-                    write_frame(&mut writer, &body, 64 * 1024 * 1024).unwrap();
+                    write_frame(&mut writer, &body, 8 * 1024 * 1024).unwrap();
                     checksum = checksum.wrapping_add(body.len());
                 }
                 drop(writer);
@@ -451,7 +451,7 @@ mod tests {
 
     fn frame_for_test(body: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        write_frame(&mut frame, body, 64 * 1024 * 1024).unwrap();
+        write_frame(&mut frame, body, 8 * 1024 * 1024).unwrap();
         frame
     }
 }
