@@ -144,7 +144,7 @@ impl FrameDecoder {
         Ok(Some(&self.buf[body_start..body_end]))
     }
 
-    fn has_pending_bytes(&self) -> bool {
+    pub(crate) fn has_pending_bytes(&self) -> bool {
         self.consumed < self.buf.len()
     }
 
@@ -198,32 +198,6 @@ impl<R> Connection<R> {
 impl<R> Drop for Connection<R> {
     fn drop(&mut self) {
         self.close();
-    }
-}
-
-impl Connection<FrameInput> {
-    pub(crate) fn from_stream(
-        stream: std::net::TcpStream,
-        name: &str,
-        cap: usize,
-    ) -> std::io::Result<Self> {
-        let reader_stream = stream.try_clone()?;
-        let writer = stream.try_clone()?;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let reader_thread = spawn_frame_reader(name, reader_stream, sender)?;
-        Ok(Self::with_parts(
-            stream,
-            Some(FrameInput::new(receiver, cap)),
-            Some(reader_thread),
-            writer,
-        ))
-    }
-
-    pub(crate) fn read_frame(&mut self) -> std::result::Result<Option<Vec<u8>>, FrameError> {
-        self.reader
-            .as_mut()
-            .ok_or_else(|| FrameError::Io(std::io::Error::other("reader is closed")))?
-            .with_next_frame(|body| body.to_owned())
     }
 }
 
@@ -303,6 +277,12 @@ pub struct FrameInput {
     eof: bool,
 }
 
+enum ReceivePoll {
+    Event(ReadEvent),
+    Empty,
+    Closed,
+}
+
 impl FrameInput {
     pub fn new(receiver: Receiver<ReadEvent>, cap: usize) -> Self {
         Self {
@@ -316,22 +296,17 @@ impl FrameInput {
         &mut self,
         callback: impl FnOnce(&[u8]) -> T,
     ) -> Result<Option<T>, FrameError> {
-        loop {
-            if let Some(body) = self.decoder.next_frame()? {
-                return Ok(Some(callback(body)));
-            }
-            if self.eof {
-                if self.decoder.has_pending_bytes() {
-                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
-                }
-                return Ok(None);
-            }
-            match self.receiver.recv() {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
-                Ok(Ok(None)) => self.eof = true,
-                Ok(Err(error)) => return Err(FrameError::Io(error)),
-                Err(_) => return Err(FrameError::Io(std::io::Error::other("reader is closed"))),
-            }
+        match self.next_frame(
+            |receiver| {
+                receiver
+                    .recv()
+                    .map_or(ReceivePoll::Closed, ReceivePoll::Event)
+            },
+            callback,
+        )? {
+            FramePoll::Frame(frame) => Ok(Some(frame)),
+            FramePoll::End => Ok(None),
+            FramePoll::Empty => unreachable!(),
         }
     }
 
@@ -339,26 +314,14 @@ impl FrameInput {
         &mut self,
         callback: impl FnOnce(&[u8]) -> T,
     ) -> Result<FramePoll<T>, FrameError> {
-        loop {
-            if let Some(body) = self.decoder.next_frame()? {
-                return Ok(FramePoll::Frame(callback(body)));
-            }
-            if self.eof {
-                if self.decoder.has_pending_bytes() {
-                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
-                }
-                return Ok(FramePoll::End);
-            }
-            match self.receiver.try_recv() {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
-                Ok(Ok(None)) => self.eof = true,
-                Ok(Err(error)) => return Err(FrameError::Io(error)),
-                Err(TryRecvError::Empty) => return Ok(FramePoll::Empty),
-                Err(TryRecvError::Disconnected) => {
-                    return Err(FrameError::Io(std::io::Error::other("reader is closed")))
-                }
-            }
-        }
+        self.next_frame(
+            |receiver| match receiver.try_recv() {
+                Ok(event) => ReceivePoll::Event(event),
+                Err(TryRecvError::Empty) => ReceivePoll::Empty,
+                Err(TryRecvError::Disconnected) => ReceivePoll::Closed,
+            },
+            callback,
+        )
     }
 
     pub fn recv_timeout_with_frame<T>(
@@ -366,6 +329,24 @@ impl FrameInput {
         timeout: Duration,
         callback: impl FnOnce(&[u8]) -> T,
     ) -> Result<FramePoll<T>, FrameError> {
+        self.next_frame(
+            |receiver| match receiver.recv_timeout(timeout) {
+                Ok(event) => ReceivePoll::Event(event),
+                Err(RecvTimeoutError::Timeout) => ReceivePoll::Empty,
+                Err(RecvTimeoutError::Disconnected) => ReceivePoll::Closed,
+            },
+            callback,
+        )
+    }
+
+    fn next_frame<T, R>(
+        &mut self,
+        mut receive: R,
+        callback: impl FnOnce(&[u8]) -> T,
+    ) -> Result<FramePoll<T>, FrameError>
+    where
+        R: FnMut(&Receiver<ReadEvent>) -> ReceivePoll,
+    {
         loop {
             if let Some(body) = self.decoder.next_frame()? {
                 return Ok(FramePoll::Frame(callback(body)));
@@ -376,12 +357,12 @@ impl FrameInput {
                 }
                 return Ok(FramePoll::End);
             }
-            match self.receiver.recv_timeout(timeout) {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
-                Ok(Ok(None)) => self.eof = true,
-                Ok(Err(error)) => return Err(FrameError::Io(error)),
-                Err(RecvTimeoutError::Timeout) => return Ok(FramePoll::Empty),
-                Err(RecvTimeoutError::Disconnected) => {
+            match receive(&self.receiver) {
+                ReceivePoll::Event(Ok(Some(chunk))) => self.decoder.push(&chunk),
+                ReceivePoll::Event(Ok(None)) => self.eof = true,
+                ReceivePoll::Event(Err(error)) => return Err(FrameError::Io(error)),
+                ReceivePoll::Empty => return Ok(FramePoll::Empty),
+                ReceivePoll::Closed => {
                     return Err(FrameError::Io(std::io::Error::other("reader is closed")))
                 }
             }
@@ -389,37 +370,14 @@ impl FrameInput {
     }
 }
 
-pub fn encode_frame(body: &[u8]) -> Vec<u8> {
-    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    frame.extend_from_slice(body);
-    frame
-}
-
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<(), FrameError> {
     if body.len() > cap {
         return Err(FrameError::Oversized(body.len()));
     }
     let mut header = [0u8; 64];
-    let prefix = b"Content-Length: ";
-    header[..prefix.len()].copy_from_slice(prefix);
-    let mut digits = [0u8; 20];
-    let mut value = body.len();
-    let mut digit_count = 0;
-    if value == 0 {
-        digits[0] = b'0';
-        digit_count = 1;
-    } else {
-        while value != 0 {
-            digits[digit_count] = b'0' + (value % 10) as u8;
-            value /= 10;
-            digit_count += 1;
-        }
-        digits[..digit_count].reverse();
-    }
-    let header_end = prefix.len() + digit_count;
-    header[prefix.len()..header_end].copy_from_slice(&digits[..digit_count]);
-    header[header_end..header_end + 4].copy_from_slice(b"\r\n\r\n");
-    let header_len = header_end + 4;
+    let mut header_writer = io::Cursor::new(&mut header[..]);
+    write!(header_writer, "Content-Length: {}\r\n\r\n", body.len()).map_err(FrameError::Io)?;
+    let header_len = header_writer.position() as usize;
     let mut header_offset = 0;
     let mut body_offset = 0;
     while header_offset < header_len || body_offset < body.len() {
@@ -547,7 +505,7 @@ mod tests {
 
     #[test]
     fn consumed_prefix_is_compacted_after_threshold() {
-        let frame = encode_frame(b"x");
+        let frame = frame_for_test(b"x");
         let mut decoder = FrameDecoder::new(64);
         decoder.push(&frame);
         assert_eq!(decoder.next_frame().unwrap(), Some(&b"x"[..]));
@@ -623,6 +581,12 @@ mod tests {
 
     #[test]
     fn single_header_output_is_exact() {
-        assert_eq!(encode_frame(b"hello"), b"Content-Length: 5\r\n\r\nhello");
+        assert_eq!(frame_for_test(b"hello"), b"Content-Length: 5\r\n\r\nhello");
+    }
+
+    fn frame_for_test(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, body, 64 * 1024 * 1024).unwrap();
+        frame
     }
 }

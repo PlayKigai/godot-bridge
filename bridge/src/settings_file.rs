@@ -47,13 +47,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn from_value(value: &Value) -> Result<Self, String> {
-        let Some(object) = value.as_object() else {
-            return Err("initializationOptions must be an object".to_owned());
-        };
-        Self::from_object(object)
-    }
-
     fn from_object(object: &Map) -> Result<Self, String> {
         let settings = Self {
             godot_path: optional_string(object, "godot_path")?,
@@ -143,7 +136,10 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
             crate::warn!("ignoring unknown key {key} in lsp.godot.settings");
         }
     }
-    deserialize_settings(value)
+    let settings = Settings::from_object(object)
+        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    Ok(settings)
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
@@ -216,13 +212,6 @@ fn validate_section(path: &Path, section: &Map) -> Result<(), String> {
         Settings::from_object(section).map_err(|error| format!("{}: {error}", path.display()))?;
     validate_settings(&settings).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(())
-}
-
-fn deserialize_settings(value: &Value) -> Result<Settings, String> {
-    let settings = Settings::from_value(value)
-        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    Ok(settings)
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), String> {

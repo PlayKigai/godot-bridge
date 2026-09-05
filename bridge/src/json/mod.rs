@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::ops::{Index, IndexMut};
 use std::str;
@@ -16,7 +17,13 @@ pub enum Value {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Number(String);
+pub struct Number(NumberRepr);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NumberRepr {
+    Small { bytes: [u8; 24], len: u8 },
+    Heap(String),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Map(Vec<(String, Value)>);
@@ -50,21 +57,44 @@ impl std::error::Error for Error {}
 
 impl Number {
     fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        let value = value.into();
+        Self::from_bytes(value.as_bytes())
+    }
+
+    fn from_bytes(value: &[u8]) -> Self {
+        if value.len() <= 24 {
+            let mut bytes = [0; 24];
+            bytes[..value.len()].copy_from_slice(value);
+            Self(NumberRepr::Small {
+                bytes,
+                len: value.len() as u8,
+            })
+        } else {
+            Self(NumberRepr::Heap(
+                String::from_utf8(value.to_vec()).expect("number syntax is ASCII"),
+            ))
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            NumberRepr::Small { bytes, len } => &bytes[..*len as usize],
+            NumberRepr::Heap(value) => value.as_bytes(),
+        }
     }
 
     fn as_i64(&self) -> Option<i64> {
-        self.0.parse().ok()
+        str::from_utf8(self.as_bytes()).ok()?.parse().ok()
     }
 
     fn as_u64(&self) -> Option<u64> {
-        self.0.parse().ok()
+        str::from_utf8(self.as_bytes()).ok()?.parse().ok()
     }
 }
 
 impl fmt::Display for Number {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(str::from_utf8(self.as_bytes()).map_err(|_| fmt::Error)?)
     }
 }
 
@@ -103,6 +133,34 @@ impl Map {
         }
         self.0.push((key, value));
         None
+    }
+
+    fn push(&mut self, key: String, value: Value) {
+        self.0.push((key, value));
+    }
+
+    fn deduplicate(&mut self) {
+        if self.0.len() <= 16 {
+            return;
+        }
+        let entries = std::mem::take(&mut self.0);
+        let mut values = HashMap::with_capacity(entries.len());
+        let mut keys = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            match values.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(value);
+                }
+                Entry::Vacant(entry) => {
+                    keys.push(entry.key().clone());
+                    entry.insert(value);
+                }
+            }
+        }
+        self.0 = keys
+            .into_iter()
+            .map(|key| (key.clone(), values.remove(&key).expect("deduplicated key")))
+            .collect();
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
@@ -404,76 +462,7 @@ impl RawJson<'_> {
         if !bytes.contains(&b'\\') {
             return bytes == expected;
         }
-        let mut input_index = 0;
-        let mut expected_index = 0;
-        while input_index < bytes.len() {
-            let mut decoded = [0; 4];
-            let decoded = if bytes[input_index] == b'\\' {
-                input_index += 1;
-                let Some(escape) = bytes.get(input_index).copied() else {
-                    return false;
-                };
-                input_index += 1;
-                match escape {
-                    b'"' | b'\\' | b'/' => &[escape],
-                    b'b' => b"\x08",
-                    b'f' => b"\x0c",
-                    b'n' => b"\n",
-                    b'r' => b"\r",
-                    b't' => b"\t",
-                    b'u' => {
-                        let Some(hex) = bytes.get(input_index..input_index + 4) else {
-                            return false;
-                        };
-                        let Some(code) = hex_code(hex) else {
-                            return false;
-                        };
-                        input_index += 4;
-                        let code = match code {
-                            0xd800..=0xdbff => {
-                                if bytes.get(input_index..input_index + 2) != Some(b"\\u") {
-                                    return false;
-                                }
-                                let Some(hex) = bytes.get(input_index + 2..input_index + 6) else {
-                                    return false;
-                                };
-                                let Some(low) = hex_code(hex) else {
-                                    return false;
-                                };
-                                if !(0xdc00..=0xdfff).contains(&low) {
-                                    return false;
-                                }
-                                input_index += 6;
-                                0x10000 + (u32::from(code - 0xd800) << 10) + u32::from(low - 0xdc00)
-                            }
-                            0xdc00..=0xdfff => return false,
-                            code => u32::from(code),
-                        };
-                        let Some(character) = char::from_u32(code) else {
-                            return false;
-                        };
-                        character.encode_utf8(&mut decoded).as_bytes()
-                    }
-                    _ => return false,
-                }
-            } else {
-                let Some(character) = str::from_utf8(&bytes[input_index..])
-                    .ok()
-                    .and_then(|value| value.chars().next())
-                else {
-                    return false;
-                };
-                let length = character.len_utf8();
-                let value = &bytes[input_index..input_index + length];
-                input_index += length;
-                value
-            };
-            if expected.get(expected_index..expected_index + decoded.len()) != Some(decoded) {
-                return false;
-            }
-            expected_index += decoded.len();
-        }
-        expected_index == expected.len()
+        matches!(from_slice(self.0), Ok(Value::String(value)) if value.as_bytes() == expected)
     }
 }
 
@@ -499,13 +488,10 @@ pub(crate) struct TopLevel<'a> {
 }
 
 pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
-    let mut scanner = Scanner {
-        input: bytes,
-        index: 0,
-    };
-    scanner.skip_space();
-    if !scanner.take(b'{') {
-        return Err(Error::new(scanner.index, "message is not an object"));
+    let mut parser = Parser::new(bytes, false);
+    parser.skip_space()?;
+    if !parser.take(b'{') {
+        return Err(Error::new(parser.index, "message is not an object"));
     }
     let mut fields = TopLevel {
         id: None,
@@ -516,25 +502,25 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
         seq: None,
         request_seq: None,
     };
-    scanner.skip_space();
-    if scanner.take(b'}') {
-        scanner.skip_space();
-        return if scanner.index == bytes.len() {
+    parser.skip_space()?;
+    if parser.take(b'}') {
+        parser.skip_space()?;
+        return if parser.index == bytes.len() {
             Ok(fields)
         } else {
-            Err(Error::new(scanner.index, "trailing characters"))
+            Err(Error::new(parser.index, "trailing characters"))
         };
     }
     loop {
-        let (key_start, key_end) = scanner.parse_string()?;
-        scanner.skip_space();
-        if !scanner.take(b':') {
-            return Err(Error::new(scanner.index, "expected ':' after object key"));
+        let (key_start, key_end) = parser.parse_string_span()?;
+        parser.skip_space()?;
+        if !parser.take(b':') {
+            return Err(Error::new(parser.index, "expected ':' after object key"));
         }
-        scanner.skip_space();
-        let value_start = scanner.index;
-        scanner.skip_value(1)?;
-        let value = RawJson(&bytes[value_start..scanner.index]);
+        parser.skip_space()?;
+        let value_start = parser.index;
+        parser.skip_value(1)?;
+        let value = RawJson(&bytes[value_start..parser.index]);
         let key = RawJson(&bytes[key_start..key_end]);
         if key.string_eq("id") {
             fields.id = Some(value);
@@ -551,236 +537,18 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
         } else if key.string_eq("request_seq") {
             fields.request_seq = Some(value);
         }
-        scanner.skip_space();
-        if scanner.take(b'}') {
-            scanner.skip_space();
-            if scanner.index != bytes.len() {
-                return Err(Error::new(scanner.index, "trailing characters"));
+        parser.skip_space()?;
+        if parser.take(b'}') {
+            parser.skip_space()?;
+            if parser.index != bytes.len() {
+                return Err(Error::new(parser.index, "trailing characters"));
             }
             return Ok(fields);
         }
-        if !scanner.take(b',') {
-            return Err(Error::new(scanner.index, "expected ',' or '}' in object"));
+        if !parser.take(b',') {
+            return Err(Error::new(parser.index, "expected ',' or '}' in object"));
         }
-        scanner.skip_space();
-    }
-}
-
-struct Scanner<'a> {
-    input: &'a [u8],
-    index: usize,
-}
-
-impl Scanner<'_> {
-    fn skip_space(&mut self) {
-        while self
-            .input
-            .get(self.index)
-            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
-        {
-            self.index += 1;
-        }
-    }
-
-    fn take(&mut self, byte: u8) -> bool {
-        if self.input.get(self.index) == Some(&byte) {
-            self.index += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<(usize, usize), Error> {
-        let start = self.index;
-        if !self.take(b'"') {
-            return Err(Error::new(self.index, "object keys must be strings"));
-        }
-        loop {
-            let Some(byte) = self.input.get(self.index).copied() else {
-                return Err(Error::new(self.index, "unterminated string"));
-            };
-            match byte {
-                b'"' => {
-                    self.index += 1;
-                    if str::from_utf8(&self.input[start + 1..self.index - 1]).is_err() {
-                        return Err(Error::new(self.index, "string is not UTF-8"));
-                    }
-                    return Ok((start, self.index));
-                }
-                b'\\' => {
-                    self.index += 1;
-                    let Some(escape) = self.input.get(self.index).copied() else {
-                        return Err(Error::new(self.index, "unterminated escape"));
-                    };
-                    self.index += 1;
-                    if escape == b'u' {
-                        let start = self.index;
-                        self.index += 4;
-                        let Some(hex) = self.input.get(start..self.index) else {
-                            return Err(Error::new(start, "invalid Unicode escape"));
-                        };
-                        let Some(code) = hex_code(hex) else {
-                            return Err(Error::new(start, "invalid Unicode escape"));
-                        };
-                        if (0xd800..=0xdbff).contains(&code) {
-                            if self.input.get(self.index..self.index + 2) != Some(b"\\u") {
-                                return Err(Error::new(
-                                    self.index,
-                                    "high surrogate is not followed by a low surrogate",
-                                ));
-                            }
-                            let low_start = self.index + 2;
-                            self.index += 6;
-                            let Some(hex) = self.input.get(low_start..self.index) else {
-                                return Err(Error::new(low_start, "invalid Unicode escape"));
-                            };
-                            let Some(low) = hex_code(hex) else {
-                                return Err(Error::new(low_start, "invalid Unicode escape"));
-                            };
-                            if !(0xdc00..=0xdfff).contains(&low) {
-                                return Err(Error::new(
-                                    low_start,
-                                    "high surrogate is not followed by a low surrogate",
-                                ));
-                            }
-                        } else if (0xdc00..=0xdfff).contains(&code) {
-                            return Err(Error::new(start, "unexpected low surrogate"));
-                        }
-                    } else if !matches!(
-                        escape,
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
-                    ) {
-                        return Err(Error::new(self.index - 1, "invalid escape sequence"));
-                    }
-                }
-                byte if byte < 0x20 => {
-                    return Err(Error::new(self.index, "control character in string"));
-                }
-                _ => self.index += 1,
-            }
-        }
-    }
-
-    fn skip_value(&mut self, depth: usize) -> Result<(), Error> {
-        if depth >= MAX_DEPTH {
-            return Err(Error::new(self.index, "nesting exceeds 128 levels"));
-        }
-        let Some(byte) = self.input.get(self.index).copied() else {
-            return Err(Error::new(self.index, "expected a value"));
-        };
-        match byte {
-            b'"' => {
-                self.parse_string()?;
-            }
-            b'[' => {
-                self.index += 1;
-                self.skip_space();
-                if self.take(b']') {
-                    return Ok(());
-                }
-                loop {
-                    self.skip_value(depth + 1)?;
-                    self.skip_space();
-                    if self.take(b']') {
-                        return Ok(());
-                    }
-                    if !self.take(b',') {
-                        return Err(Error::new(self.index, "expected ',' or ']' in array"));
-                    }
-                    self.skip_space();
-                }
-            }
-            b'{' => {
-                self.index += 1;
-                self.skip_space();
-                if self.take(b'}') {
-                    return Ok(());
-                }
-                loop {
-                    self.parse_string()?;
-                    self.skip_space();
-                    if !self.take(b':') {
-                        return Err(Error::new(self.index, "expected ':' after object key"));
-                    }
-                    self.skip_space();
-                    self.skip_value(depth + 1)?;
-                    self.skip_space();
-                    if self.take(b'}') {
-                        return Ok(());
-                    }
-                    if !self.take(b',') {
-                        return Err(Error::new(self.index, "expected ',' or '}' in object"));
-                    }
-                    self.skip_space();
-                }
-            }
-            b'n' if self.take_keyword(b"null") => {}
-            b't' if self.take_keyword(b"true") => {}
-            b'f' if self.take_keyword(b"false") => {}
-            b'-' | b'0'..=b'9' => self.skip_number()?,
-            _ => return Err(Error::new(self.index, "expected a value")),
-        }
-        Ok(())
-    }
-
-    fn take_keyword(&mut self, keyword: &[u8]) -> bool {
-        if self.input.get(self.index..self.index + keyword.len()) == Some(keyword) {
-            self.index += keyword.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn skip_number(&mut self) -> Result<(), Error> {
-        self.take(b'-');
-        match self.input.get(self.index).copied() {
-            Some(b'0') => {
-                self.index += 1;
-                if self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    return Err(Error::new(self.index, "leading zero in number"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                self.index += 1;
-                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    self.index += 1;
-                }
-            }
-            _ => return Err(Error::new(self.index, "invalid number")),
-        }
-        if self.take(b'.') {
-            let start = self.index;
-            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                self.index += 1;
-            }
-            if self.index == start {
-                return Err(Error::new(self.index, "fraction has no digits"));
-            }
-        }
-        if self
-            .input
-            .get(self.index)
-            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
-        {
-            self.index += 1;
-            if self
-                .input
-                .get(self.index)
-                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-            {
-                self.index += 1;
-            }
-            let start = self.index;
-            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                self.index += 1;
-            }
-            if self.index == start {
-                return Err(Error::new(self.index, "exponent has no digits"));
-            }
-        }
-        Ok(())
+        parser.skip_space()?;
     }
 }
 
@@ -843,7 +611,7 @@ fn write_value(value: &Value, output: &mut Vec<u8>) {
         Value::Null => output.extend_from_slice(b"null"),
         Value::Bool(true) => output.extend_from_slice(b"true"),
         Value::Bool(false) => output.extend_from_slice(b"false"),
-        Value::Number(number) => output.extend_from_slice(number.0.as_bytes()),
+        Value::Number(number) => output.extend_from_slice(number.as_bytes()),
         Value::String(string) => write_string(string, output),
         Value::Array(array) => {
             output.push(b'[');
@@ -944,11 +712,195 @@ impl<'a> Parser<'a> {
             b'"' => self.parse_string().map(Value::String),
             b'[' => self.parse_array(depth),
             b'{' => self.parse_object(depth),
-            b'-' | b'0'..=b'9' => self
-                .parse_number()
-                .map(|number| Value::Number(Number::new(number))),
+            b'-' | b'0'..=b'9' => self.parse_number().map(Value::Number),
             _ => self.error("expected a value"),
         }
+    }
+
+    fn parse_string_span(&mut self) -> Result<(usize, usize), Error> {
+        let start = self.index;
+        if !self.take(b'"') {
+            return self.error("object keys must be strings");
+        }
+        loop {
+            let Some(byte) = self.input.get(self.index).copied() else {
+                return self.error("unterminated string");
+            };
+            match byte {
+                b'"' => {
+                    self.index += 1;
+                    if str::from_utf8(&self.input[start + 1..self.index - 1]).is_err() {
+                        return self.error("string is not UTF-8");
+                    }
+                    return Ok((start, self.index));
+                }
+                b'\\' => {
+                    self.index += 1;
+                    let Some(escape) = self.input.get(self.index).copied() else {
+                        return self.error("unterminated escape");
+                    };
+                    self.index += 1;
+                    if escape == b'u' {
+                        let start = self.index;
+                        self.index += 4;
+                        let Some(hex) = self.input.get(start..self.index) else {
+                            return self.error("invalid Unicode escape");
+                        };
+                        let Some(code) = hex_code(hex) else {
+                            return self.error("invalid Unicode escape");
+                        };
+                        if (0xd800..=0xdbff).contains(&code) {
+                            if self.input.get(self.index..self.index + 2) != Some(b"\\u") {
+                                return self
+                                    .error("high surrogate is not followed by a low surrogate");
+                            }
+                            let low_start = self.index + 2;
+                            self.index += 6;
+                            let Some(hex) = self.input.get(low_start..self.index) else {
+                                return self.error("invalid Unicode escape");
+                            };
+                            let Some(low) = hex_code(hex) else {
+                                return self.error("invalid Unicode escape");
+                            };
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return self
+                                    .error("high surrogate is not followed by a low surrogate");
+                            }
+                        } else if (0xdc00..=0xdfff).contains(&code) {
+                            return self.error("unexpected low surrogate");
+                        }
+                    } else if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return self.error("invalid escape sequence");
+                    }
+                }
+                byte if byte < 0x20 => return self.error("control character in string"),
+                _ => self.index += 1,
+            }
+        }
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), Error> {
+        if depth >= MAX_DEPTH {
+            return self.error("nesting exceeds 128 levels");
+        }
+        let Some(byte) = self.input.get(self.index).copied() else {
+            return self.error("expected a value");
+        };
+        match byte {
+            b'"' => {
+                self.parse_string_span()?;
+            }
+            b'[' => {
+                self.index += 1;
+                self.skip_space()?;
+                if self.take(b']') {
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value(depth + 1)?;
+                    self.skip_space()?;
+                    if self.take(b']') {
+                        return Ok(());
+                    }
+                    if !self.take(b',') {
+                        return self.error("expected ',' or ']' in array");
+                    }
+                    self.skip_space()?;
+                }
+            }
+            b'{' => {
+                self.index += 1;
+                self.skip_space()?;
+                if self.take(b'}') {
+                    return Ok(());
+                }
+                loop {
+                    self.parse_string_span()?;
+                    self.skip_space()?;
+                    if !self.take(b':') {
+                        return self.error("expected ':' after object key");
+                    }
+                    self.skip_space()?;
+                    self.skip_value(depth + 1)?;
+                    self.skip_space()?;
+                    if self.take(b'}') {
+                        return Ok(());
+                    }
+                    if !self.take(b',') {
+                        return self.error("expected ',' or '}' in object");
+                    }
+                    self.skip_space()?;
+                }
+            }
+            b'n' if self.take_keyword(b"null") => {}
+            b't' if self.take_keyword(b"true") => {}
+            b'f' if self.take_keyword(b"false") => {}
+            b'-' | b'0'..=b'9' => self.skip_number()?,
+            _ => return self.error("expected a value"),
+        }
+        Ok(())
+    }
+
+    fn take_keyword(&mut self, keyword: &[u8]) -> bool {
+        if self.input.get(self.index..self.index + keyword.len()) == Some(keyword) {
+            self.index += keyword.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_number(&mut self) -> Result<(), Error> {
+        self.take(b'-');
+        match self.input.get(self.index).copied() {
+            Some(b'0') => {
+                self.index += 1;
+                if self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    return self.error("leading zero in number");
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.index += 1;
+                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    self.index += 1;
+                }
+            }
+            _ => return self.error("invalid number"),
+        }
+        if self.take(b'.') {
+            let start = self.index;
+            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                self.index += 1;
+            }
+            if self.index == start {
+                return self.error("fraction has no digits");
+            }
+        }
+        if self
+            .input
+            .get(self.index)
+            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
+        {
+            self.index += 1;
+            if self
+                .input
+                .get(self.index)
+                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+            {
+                self.index += 1;
+            }
+            let start = self.index;
+            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                self.index += 1;
+            }
+            if self.index == start {
+                return self.error("exponent has no digits");
+            }
+        }
+        Ok(())
     }
 
     fn parse_array(&mut self, depth: usize) -> Result<Value, Error> {
@@ -1000,9 +952,10 @@ impl<'a> Parser<'a> {
                 return self.error("expected ':' after object key");
             }
             let value = self.parse_value(depth + 1)?;
-            object.insert(key, value);
+            object.push(key, value);
             self.skip_space()?;
             if self.take(b'}') {
+                object.deduplicate();
                 return Ok(Value::Object(object));
             }
             if !self.take(b',') {
@@ -1011,6 +964,7 @@ impl<'a> Parser<'a> {
             self.skip_space()?;
             if self.take(b'}') {
                 if self.relaxed {
+                    object.deduplicate();
                     return Ok(Value::Object(object));
                 }
                 return self.error("trailing comma is not allowed");
@@ -1018,7 +972,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_number(&mut self) -> Result<String, Error> {
+    fn parse_number(&mut self) -> Result<Number, Error> {
         let start = self.index;
         self.take(b'-');
         match self.input.get(self.index).copied() {
@@ -1066,9 +1020,7 @@ impl<'a> Parser<'a> {
                 return self.error("exponent has no digits");
             }
         }
-        Ok(str::from_utf8(&self.input[start..self.index])
-            .expect("number syntax is ASCII")
-            .to_owned())
+        Ok(Number::from_bytes(&self.input[start..self.index]))
     }
 
     fn parse_string(&mut self) -> Result<String, Error> {

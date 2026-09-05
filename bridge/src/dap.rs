@@ -205,7 +205,6 @@ impl ServerRequests {
                 }
             }
         }
-        message["seq"] = crate::json!(bridge_seq);
     }
 
     fn restore_response(&mut self, message: &mut Value) {
@@ -300,7 +299,7 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
             DapFrame::Prepared(result) => break result,
         }
     };
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
             output.failure(&initialize, &message)?;
@@ -310,7 +309,18 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     for frame in early_frames {
         input.defer(frame);
     }
-    let result = run_session(initialize, prepared, &mut output, &mut input, &mut buffer);
+    let project = prepared.project.clone();
+    let file = prepared.file.clone();
+    let result = run_session_inner(
+        &initialize,
+        &mut prepared.connection,
+        &mut output,
+        &mut input,
+        &mut buffer,
+        &project,
+        file.as_deref(),
+    );
+    drop(prepared.lock);
     let _ = worker.join();
     result
 }
@@ -452,28 +462,6 @@ fn discover_owner(
             _ => return Err(no_owner),
         }
     }
-}
-
-fn run_session(
-    initialize: Value,
-    mut prepared: Prepared,
-    output: &mut ClientOutput<std::io::Stdout>,
-    input: &mut DapInput,
-    buffer: &mut ClientBuffer,
-) -> Result<ExitCode> {
-    let project = prepared.project.clone();
-    let file = prepared.file.clone();
-    let result = run_session_inner(
-        &initialize,
-        &mut prepared.connection,
-        output,
-        input,
-        buffer,
-        &project,
-        file.as_deref(),
-    );
-    drop(prepared.lock);
-    result
 }
 
 fn run_session_inner(
