@@ -5,6 +5,7 @@ use std::ops::{Index, IndexMut};
 use std::str;
 
 const MAX_DEPTH: usize = 128;
+const INVALID_UNICODE_ESCAPE: &str = "invalid unicode escape";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Value {
@@ -400,9 +401,9 @@ pub(crate) enum RequestKey {
 impl RawJson<'_> {
     pub(crate) fn as_i64(self) -> Option<i64> {
         self.is_number()
-            .then(|| str::from_utf8(self.0).ok())??
-            .parse()
-            .ok()
+            .then_some(self.0)
+            .and_then(|bytes| str::from_utf8(bytes).ok())
+            .and_then(|value| value.parse().ok())
     }
 
     fn is_number(self) -> bool {
@@ -418,22 +419,16 @@ impl RawJson<'_> {
 
     pub(crate) fn request_key(self) -> Option<RequestKey> {
         let key = if self.is_string() {
-            match from_slice(self.0) {
-                Ok(Value::String(value)) => RequestKey::String(value),
-                _ => RequestKey::Lexical(self.lexical()),
-            }
+            let Ok(Value::String(value)) = from_slice(self.0) else {
+                return None;
+            };
+            RequestKey::String(value)
         } else if let Some(number) = self.as_i64() {
             RequestKey::Number(number)
         } else {
             RequestKey::Lexical(self.lexical())
         };
-        if matches!(&key, RequestKey::String(value) | RequestKey::Lexical(value) if value.len() > 256)
-        {
-            crate::warn!("dropping request id longer than 256 bytes");
-            None
-        } else {
-            Some(key)
-        }
+        request_key_with_limit(key)
     }
 
     pub(crate) fn string_eq(self, expected: &str) -> bool {
@@ -465,6 +460,10 @@ pub(crate) fn value_request_key(value: &Value) -> Option<RequestKey> {
         ),
         _ => RequestKey::Lexical(to_string(value)),
     };
+    request_key_with_limit(key)
+}
+
+fn request_key_with_limit(key: RequestKey) -> Option<RequestKey> {
     if matches!(&key, RequestKey::String(value) | RequestKey::Lexical(value) if value.len() > 256) {
         crate::warn!("dropping request id longer than 256 bytes");
         None
@@ -1063,7 +1062,7 @@ impl<'a> Parser<'a> {
                     value => u32::from(value),
                 };
                 char::from_u32(code)
-                    .ok_or_else(|| Error::new(self.index, "invalid Unicode escape"))?
+                    .ok_or_else(|| Error::new(self.index, INVALID_UNICODE_ESCAPE))?
             }
             _ => return self.error("invalid escape sequence"),
         };
@@ -1076,7 +1075,7 @@ impl<'a> Parser<'a> {
     fn parse_hex(&mut self) -> Result<u16, Error> {
         let start = self.index;
         let Some(bytes) = self.input.get(start..start + 4) else {
-            return self.error("Unicode escape has fewer than four digits");
+            return self.error(INVALID_UNICODE_ESCAPE);
         };
         let mut value = 0u16;
         for byte in bytes {
@@ -1084,7 +1083,7 @@ impl<'a> Parser<'a> {
                 b'0'..=b'9' => byte - b'0',
                 b'a'..=b'f' => byte - b'a' + 10,
                 b'A'..=b'F' => byte - b'A' + 10,
-                _ => return self.error("invalid Unicode escape"),
+                _ => return self.error(INVALID_UNICODE_ESCAPE),
             };
             value = value * 16 + u16::from(digit);
         }

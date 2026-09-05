@@ -53,6 +53,7 @@ const RECOVERY_QUEUE_CAP: usize = 1000;
 const QUEUE_BYTES_CAP: usize = 8 * 1024 * 1024;
 const WATCHER_PENDING_CAP: usize = 4096;
 const STARTUP_ATTEMPTS: usize = 3;
+const EVENT_CHANNEL_CLOSED: &str = "event channel is closed";
 const INTERCEPTED_METHODS: [&str; 6] = [
     "workspace/symbol",
     "initialized",
@@ -358,17 +359,6 @@ enum StartupError {
     Io(String),
 }
 
-impl StartupError {
-    fn message(&self) -> String {
-        match self {
-            Self::ChildExited(lines) => format_lines("Godot exited", lines),
-            Self::Deadline(lines) => format_lines("Godot did not start before the deadline", lines),
-            Self::PortMismatch => "Godot port belongs to another process".to_owned(),
-            Self::Io(error) => error.clone(),
-        }
-    }
-}
-
 enum GuiReconnect {
     Ready {
         state: State,
@@ -597,7 +587,7 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
     match swap {
         Ok(()) => Ok(()),
         Err(error) => {
-            send_show_message(&mut session.output, &error.to_string())?;
+            send_error_message(&mut session.output, &error.to_string())?;
             if let Some((pid, pgid, ticks)) = gui_identity {
                 let _ = kill_recorded(pid, pgid, ticks);
             }
@@ -1729,7 +1719,7 @@ fn receive_client_frame(
         }
         let event = events
             .recv()
-            .map_err(|_| io::Error::other("event channel is closed"))?;
+            .map_err(|_| io::Error::other(EVENT_CHANNEL_CLOSED))?;
         match event {
             ProxyEvent::Client(event) => client.feed(event)?,
             event => deferred.push_back(event)?,
@@ -1759,7 +1749,7 @@ fn send_error<W: Write>(writer: &mut W, id: &Value, code: i64, message: &str) ->
     )
 }
 
-fn send_show_message<W: Write>(writer: &mut W, message: &str) -> Result<()> {
+fn send_error_message<W: Write>(writer: &mut W, message: &str) -> Result<()> {
     send_message_type(writer, 1, message)
 }
 
@@ -2037,8 +2027,8 @@ mod tests {
         decoder.push(&bytes[..size]);
         let request = crate::json::from_slice(decoder.next_frame().unwrap().unwrap()).unwrap();
         let response = format!(
-            r#"{{"jsonrpc":"2.0","id":{},"id":{},"result":null}}"#,
-            request["id"], request["id"]
+            r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#,
+            request["id"]
         );
         forward_server_message(
             &mut editor.connection.writer,

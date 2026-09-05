@@ -220,10 +220,7 @@ fn should_skip(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return true;
     };
-    matches!(
-        name,
-        ".git" | ".godot" | "addons" | "node_modules" | "target"
-    ) || name.starts_with('.')
+    matches!(name, "addons" | "node_modules" | "target") || name.starts_with('.')
 }
 
 pub fn normalize_absolute(path: &Path) -> PathBuf {

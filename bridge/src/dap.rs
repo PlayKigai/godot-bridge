@@ -163,11 +163,11 @@ impl<W: Write> ClientOutput<W> {
         Ok(())
     }
 
-    fn failure(&mut self, initialize: &Value, message: &str) -> Result<()> {
+    fn failure(&mut self, request_seq: Value, command: &str, message: &str) -> Result<()> {
         self.send(crate::json!({
             "type": "response",
-            "request_seq": (initialize.get("seq").cloned().unwrap_or(Value::Null)),
-            "command": "initialize",
+            "request_seq": (request_seq),
+            "command": (command),
             "success": false,
             "message": message,
         }))
@@ -259,7 +259,7 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
             DapFrame::Body(side, body) => input.defer(DapFrame::Body(side, body)),
             DapFrame::End(DapSide::Client) => return Ok(ExitCode::SUCCESS),
             DapFrame::End(DapSide::Godot) => return Ok(ExitCode::from(1)),
-            DapFrame::Prepared(_) => return Ok(ExitCode::from(1)),
+            DapFrame::Prepared(_) => unreachable!(),
         }
     };
 
@@ -315,7 +315,11 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
-            output.failure(&initialize, &message)?;
+            output.failure(
+                initialize.get("seq").cloned().unwrap_or(Value::Null),
+                "initialize",
+                &message,
+            )?;
             return Ok(ExitCode::from(1));
         }
     };
@@ -508,12 +512,10 @@ fn run_session_inner(
     loop {
         match input.recv_frame()? {
             DapFrame::Body(DapSide::Godot, body) => {
-                let mut message = parse_message(&body)?;
+                let message = parse_message(&body)?;
                 if should_forward_server_event(&message, &mut process_seen) {
-                    server_requests.restore_response(&mut message);
                     let seq = output.next_seq;
-                    server_requests.rewrite(&mut message, seq);
-                    output.send(message)?;
+                    output.send(forward_godot_message(message, &mut server_requests, seq))?;
                 }
             }
             DapFrame::Body(DapSide::Client, body) => {
@@ -525,7 +527,7 @@ fn run_session_inner(
             }
             DapFrame::End(DapSide::Godot) => return godot_died(output),
             DapFrame::End(DapSide::Client) => return Ok(ExitCode::SUCCESS),
-            DapFrame::Prepared(_) => return Ok(ExitCode::from(1)),
+            DapFrame::Prepared(_) => unreachable!(),
         }
     }
 }
@@ -562,22 +564,20 @@ fn wait_for_initialize(
                 }
             }
             DapFrame::Body(DapSide::Godot, body) => {
-                let mut message = parse_message(&body)?;
+                let message = parse_message(&body)?;
                 let is_initialize_response = message.get("type").and_then(Value::as_str)
                     == Some("response")
                     && message.get("command") == Some(&crate::json!("initialize"))
                     && message.get("request_seq") == Some(&initialize_seq);
-                server_requests.restore_response(&mut message);
                 let seq = output.next_seq;
-                server_requests.rewrite(&mut message, seq);
-                output.send(message)?;
+                output.send(forward_godot_message(message, server_requests, seq))?;
                 if is_initialize_response {
                     return Ok(InitializeWait::Ready);
                 }
             }
             DapFrame::End(DapSide::Client) => return Ok(InitializeWait::ClientEof),
             DapFrame::End(DapSide::Godot) => return Ok(InitializeWait::GodotDead),
-            DapFrame::Prepared(_) => return Ok(InitializeWait::GodotDead),
+            DapFrame::Prepared(_) => unreachable!(),
         }
     }
 }
@@ -610,8 +610,7 @@ fn forward_client_body(
             file,
         );
     }
-    send_to_godot_body(&mut connection.writer, body)?;
-    Ok(None)
+    send_to_godot_body(&mut connection.writer, body).map(|()| None)
 }
 
 fn forward_client(
@@ -651,13 +650,7 @@ fn send_request_failure(
     output: &mut ClientOutput<std::io::Stdout>,
     failure: RequestFailure,
 ) -> Result<()> {
-    output.send(crate::json!({
-        "type": "response",
-        "request_seq": (failure.request_seq),
-        "command": (failure.command),
-        "success": false,
-        "message": (failure.message),
-    }))
+    output.failure(failure.request_seq, &failure.command, &failure.message)
 }
 
 fn rewrite_launch_or_attach(
@@ -716,9 +709,19 @@ fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<Option<RequestFailure>> {
+fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<()> {
     write_frame(writer, body, FRAME_CAP)?;
-    Ok(None)
+    Ok(())
+}
+
+fn forward_godot_message(
+    mut message: Value,
+    server_requests: &mut ServerRequests,
+    bridge_seq: i64,
+) -> Value {
+    server_requests.restore_response(&mut message);
+    server_requests.rewrite(&mut message, bridge_seq);
+    message
 }
 
 fn godot_died(output: &mut ClientOutput<std::io::Stdout>) -> Result<ExitCode> {

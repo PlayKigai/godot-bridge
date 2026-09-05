@@ -68,16 +68,29 @@ pub fn resolve_scene(project: &Path, file: &Path) -> Result<String, SceneError> 
 }
 
 fn read_scene(path: &Path) -> Option<String> {
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(error) => {
+            crate::warn!("cannot read scene {}: {error}", path.display());
+            return None;
+        }
+    };
     let mut bytes = Vec::new();
-    file.take(MAX_SCENE_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()
-        .and_then(|_| String::from_utf8(bytes).ok())
+    if let Err(error) = file.take(MAX_SCENE_BYTES).read_to_end(&mut bytes) {
+        crate::warn!("cannot read scene {}: {error}", path.display());
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(contents) => Some(contents),
+        Err(error) => {
+            crate::warn!("scene {} is not UTF-8: {error}", path.display());
+            None
+        }
+    }
 }
 
 fn collect_scenes(root: &Path, directory: &Path, scenes: &mut Vec<(PathBuf, PathBuf)>) {

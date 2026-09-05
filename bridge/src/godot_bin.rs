@@ -150,6 +150,7 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -174,11 +175,24 @@ mod tests {
         }
     }
 
-    fn touch(dir: &Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
-        fs::write(&path, "").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn with_environment<T>(path: &OsStr, godot: Option<&OsStr>, test: impl FnOnce() -> T) -> T {
+        let old_path = env::var_os("PATH");
+        let old_godot = env::var_os("GODOT");
+        env::set_var("PATH", path);
+        match godot {
+            Some(value) => env::set_var("GODOT", value),
+            None => env::remove_var("GODOT"),
+        }
+        let result = test();
+        match old_path {
+            Some(value) => env::set_var("PATH", value),
+            None => env::remove_var("PATH"),
+        }
+        match old_godot {
+            Some(value) => env::set_var("GODOT", value),
+            None => env::remove_var("GODOT"),
+        }
+        result
     }
 
     #[test]
@@ -186,7 +200,6 @@ mod tests {
         let dir = crate::temp::TempDir::new().unwrap();
         let bin = write_script(dir.path(), "godot", "#!/bin/sh\necho 4.7.2.stable\n");
         let version = version_of(&bin).unwrap();
-        assert!(version.starts_with("4."));
         assert_eq!(version, "4.7.2.stable");
     }
 
@@ -220,43 +233,32 @@ mod tests {
     fn resolve_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = crate::temp::TempDir::new().unwrap();
-        let setting = touch(dir.path(), "setting");
-        let env_bin = touch(dir.path(), "env-bin");
+        let setting = write_script(dir.path(), "setting", "#!/bin/sh\n");
+        let env_bin = write_script(dir.path(), "env-bin", "#!/bin/sh\n");
         let first = dir.path().join("first");
         let second = dir.path().join("second");
         let empty = dir.path().join("empty");
         for path in [&first, &second, &empty] {
             fs::create_dir_all(path).unwrap();
         }
-        touch(&first, "godot4");
-        touch(&first, "godot");
-        touch(&second, "godot");
+        write_script(&first, "godot4", "#!/bin/sh\n");
+        write_script(&first, "godot", "#!/bin/sh\n");
+        write_script(&second, "godot", "#!/bin/sh\n");
 
-        let old_path = env::var_os("PATH");
-        let old_godot = env::var_os("GODOT");
-        env::set_var("PATH", format!("{}:{}", first.display(), second.display()));
-
-        env::set_var("GODOT", &env_bin);
-        assert_eq!(resolve_godot(Some(&setting)).unwrap(), setting);
-
-        assert_eq!(resolve_godot(None).unwrap(), env_bin);
-
-        env::set_var("GODOT", "");
-        assert_eq!(resolve_godot(None).unwrap(), first.join("godot4"));
-
-        env::remove_var("GODOT");
-        env::set_var("PATH", &empty);
-        let error = resolve_godot(None).unwrap_err();
-        assert_eq!(error, NO_BINARY);
-
-        match old_path {
-            Some(value) => env::set_var("PATH", value),
-            None => env::remove_var("PATH"),
-        }
-        match old_godot {
-            Some(value) => env::set_var("GODOT", value),
-            None => env::remove_var("GODOT"),
-        }
+        with_environment(
+            OsStr::new(&format!("{}:{}", first.display(), second.display())),
+            Some(env_bin.as_os_str()),
+            || {
+                assert_eq!(resolve_godot(Some(&setting)).unwrap(), setting);
+                assert_eq!(resolve_godot(None).unwrap(), env_bin);
+                env::set_var("GODOT", "");
+                assert_eq!(resolve_godot(None).unwrap(), first.join("godot4"));
+                env::remove_var("GODOT");
+                env::set_var("PATH", &empty);
+                let error = resolve_godot(None).unwrap_err();
+                assert_eq!(error, NO_BINARY);
+            },
+        );
     }
 
     #[test]
@@ -297,28 +299,14 @@ mod tests {
     fn godot_env_must_be_absolute_executable() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = crate::temp::TempDir::new().unwrap();
-        let old_godot = env::var_os("GODOT");
-        let old_path = env::var_os("PATH");
-
         let missing = dir.path().join("missing");
-        env::set_var("GODOT", &missing);
-        assert!(resolve_godot(None).is_err());
-
-        env::set_var("GODOT", "relative/godot");
-        assert!(resolve_godot(None).is_err());
-
-        env::set_var("PATH", dir.path());
-        env::remove_var("GODOT");
-        assert_eq!(resolve_godot(None).unwrap_err(), NO_BINARY);
-
-        match old_path {
-            Some(value) => env::set_var("PATH", value),
-            None => env::remove_var("PATH"),
-        }
-        match old_godot {
-            Some(value) => env::set_var("GODOT", value),
-            None => env::remove_var("GODOT"),
-        }
+        with_environment(dir.path().as_os_str(), Some(missing.as_os_str()), || {
+            assert!(resolve_godot(None).is_err());
+            env::set_var("GODOT", "relative/godot");
+            assert!(resolve_godot(None).is_err());
+            env::remove_var("GODOT");
+            assert_eq!(resolve_godot(None).unwrap_err(), NO_BINARY);
+        });
     }
 
     #[test]

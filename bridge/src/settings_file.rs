@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{io, os::unix::fs::OpenOptionsExt};
 
@@ -188,14 +189,7 @@ pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings
 
     let project_path = worktree.join(".zed").join("settings.json");
     if let Some(project_section) = read_settings_section(&project_path)? {
-        for key in PROJECT_UNTRUSTED_KEYS {
-            if project_section.contains_key(key) {
-                crate::warn!(
-                    "ignoring project setting {key} in {}",
-                    project_path.display()
-                );
-            }
-        }
+        warn_untrusted_project_keys(&project_path, &project_section);
     }
 
     let mut merged = user_section.unwrap_or_default();
@@ -210,6 +204,14 @@ pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings
 fn remove_untrusted_project_keys(path: &Path, section: &mut Map) {
     for key in PROJECT_UNTRUSTED_KEYS {
         if section.remove(key).is_some() {
+            crate::warn!("ignoring project setting {key} in {}", path.display());
+        }
+    }
+}
+
+fn warn_untrusted_project_keys(path: &Path, section: &Map) {
+    for key in PROJECT_UNTRUSTED_KEYS {
+        if section.contains_key(key) {
             crate::warn!("ignoring project setting {key} in {}", path.display());
         }
     }
@@ -258,7 +260,6 @@ fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut text = String::new();
-    use std::io::Read;
     file.take(SETTINGS_FILE_CAP + 1)
         .read_to_string(&mut text)
         .map_err(|error| format!("{}: {error}", path.display()))?;

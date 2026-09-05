@@ -158,14 +158,6 @@ pub(super) fn new_state(project: &Path, mode: Mode) -> State {
     }
 }
 
-pub(super) fn format_lines(prefix: &str, lines: &[String]) -> String {
-    if lines.is_empty() {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}: {}", lines.join(" | "))
-    }
-}
-
 pub(super) fn startup_failure_message(error: Option<&StartupError>, seconds: u32) -> String {
     match error {
         Some(StartupError::Deadline(lines)) => format!(
@@ -173,10 +165,14 @@ pub(super) fn startup_failure_message(error: Option<&StartupError>, seconds: u32
             lines.join(" | ")
         ),
         Some(StartupError::ChildExited(lines)) => {
-            format!("Godot exited 3 times. Last output: {}", lines.join(" | "))
+            format!(
+                "Godot exited {STARTUP_ATTEMPTS} times. Last output: {}",
+                lines.join(" | ")
+            )
         }
-        Some(error) => error.message(),
-        None => "Godot exited 3 times".to_owned(),
+        Some(StartupError::PortMismatch) => "Godot port belongs to another process".to_owned(),
+        Some(StartupError::Io(error)) => error.clone(),
+        None => format!("Godot exited {STARTUP_ATTEMPTS} times"),
     }
 }
 

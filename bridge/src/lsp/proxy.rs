@@ -83,9 +83,7 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS || session.proxy.bulk_complete)
             && bulk_can_advance(&session.proxy, now)
         {
-            let result =
-                pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer);
-            if let Some(code) = guard(&mut session, unmanaged, result)? {
+            if let Some(code) = pump_bulk(&mut session, unmanaged)? {
                 return Ok(code);
             }
         }
@@ -96,15 +94,7 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         {
             let changes = coalesce_watcher_changes(std::mem::take(&mut session.watch.pending));
             session.watch.deadline = None;
-            let result = process_watcher_changes(
-                &mut session.proxy,
-                &mut session.output,
-                Some(&mut session.editor),
-                &session.settings,
-                changes,
-                false,
-            );
-            if let Some(code) = guard(&mut session, unmanaged, result)? {
+            if let Some(code) = process_watcher(&mut session, unmanaged, changes)? {
                 return Ok(code);
             }
         }
@@ -224,7 +214,7 @@ fn handle_event(
 }
 
 fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<ExitCode>> {
-    if session.proxy.bulk_documents.len() > BULK_DOCUMENTS * 2 {
+    if bulk_documents_over_limit(session) {
         return Ok(None);
     }
     loop {
@@ -239,11 +229,7 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
             } if generation == session.proxy.bulk_generation => {
                 session.proxy.bulk_documents.push_back(document);
                 if session.proxy.bulk_documents.len() >= BULK_DOCUMENTS {
-                    let result = pump_bulk_documents(
-                        &mut session.proxy,
-                        &mut session.editor.connection.writer,
-                    );
-                    if let Some(code) = guard(session, unmanaged, result)? {
+                    if let Some(code) = pump_bulk(session, unmanaged)? {
                         return Ok(Some(code));
                     }
                 }
@@ -252,9 +238,7 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
                 if generation == session.proxy.bulk_generation =>
             {
                 session.proxy.bulk_complete = true;
-                let result =
-                    pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer);
-                if let Some(code) = guard(session, unmanaged, result)? {
+                if let Some(code) = pump_bulk(session, unmanaged)? {
                     return Ok(Some(code));
                 }
             }
@@ -271,15 +255,7 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
                     },
                     path: document.path,
                 };
-                let result = process_watcher_changes(
-                    &mut session.proxy,
-                    &mut session.output,
-                    Some(&mut session.editor),
-                    &session.settings,
-                    vec![change],
-                    false,
-                );
-                if let Some(code) = guard(session, unmanaged, result)? {
+                if let Some(code) = process_watcher(session, unmanaged, vec![change])? {
                     return Ok(Some(code));
                 }
             }
@@ -302,15 +278,7 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
                     })
                     .collect();
                 session.proxy.rescan_keys.clear();
-                let result = process_watcher_changes(
-                    &mut session.proxy,
-                    &mut session.output,
-                    Some(&mut session.editor),
-                    &session.settings,
-                    changes,
-                    false,
-                );
-                if let Some(code) = guard(session, unmanaged, result)? {
+                if let Some(code) = process_watcher(session, unmanaged, changes)? {
                     return Ok(Some(code));
                 }
             }
@@ -319,10 +287,35 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
             | InternalEvent::Rescan { .. }
             | InternalEvent::RescanComplete { .. } => {}
         }
-        if session.proxy.bulk_documents.len() > BULK_DOCUMENTS * 2 {
+        if bulk_documents_over_limit(session) {
             return Ok(None);
         }
     }
+}
+
+fn bulk_documents_over_limit(session: &Session) -> bool {
+    session.proxy.bulk_documents.len() > BULK_DOCUMENTS * 2
+}
+
+fn pump_bulk(session: &mut Session, unmanaged: bool) -> Result<Option<ExitCode>> {
+    let result = pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer);
+    guard(session, unmanaged, result)
+}
+
+fn process_watcher(
+    session: &mut Session,
+    unmanaged: bool,
+    changes: Vec<WatcherChange>,
+) -> Result<Option<ExitCode>> {
+    let result = process_watcher_changes(
+        &mut session.proxy,
+        &mut session.output,
+        Some(&mut session.editor),
+        &session.settings,
+        changes,
+        false,
+    );
+    guard(session, unmanaged, result)
 }
 
 pub(super) enum Received {
@@ -350,13 +343,13 @@ pub(super) fn receive_godot_frame(
                     Ok(event) => event,
                     Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Received::TimedOut),
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(io::Error::other("event channel is closed").into())
+                        return Err(io::Error::other(EVENT_CHANNEL_CLOSED).into())
                     }
                 }
             }
             None => events
                 .recv()
-                .map_err(|_| io::Error::other("event channel is closed"))?,
+                .map_err(|_| io::Error::other(EVENT_CHANNEL_CLOSED))?,
         };
         match event {
             ProxyEvent::Client(event) => deferred.push_back(ProxyEvent::Client(event))?,

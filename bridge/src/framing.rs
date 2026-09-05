@@ -81,10 +81,6 @@ impl FrameDecoder {
                 }
                 return Ok(None);
             };
-            if header_end > HEADER_CAP {
-                return Err(FrameError::Malformed("frame header is too long".to_owned()));
-            }
-
             let header = &input[..header_end];
             let mut content_length = None;
             for line in header.split(|byte| *byte == b'\n') {

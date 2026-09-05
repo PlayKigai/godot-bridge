@@ -144,10 +144,7 @@ fn launch_or_reuse(files: &ProjectFiles, project: &Path, settings: &Settings) ->
             let _ = kill_recorded(pid, pgid, ticks);
             let tail = log_tail(&files.state.with_extension("gui.log"));
             remove_files(files);
-            let message = match state.status {
-                Status::Starting => "GUI editor did not start",
-                Status::Ready | Status::Recovering => "GUI editor exited",
-            };
+            let message = "GUI editor did not start";
             crate::bail!("{message}: {tail}")
         }
     }

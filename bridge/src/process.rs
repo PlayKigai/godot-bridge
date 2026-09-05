@@ -74,8 +74,7 @@ pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "port range is empty")))
+    Err(last_error.expect("port range has at least one port"))
 }
 
 pub fn port_listener_belongs_to_process(pid: u32, port: u16) -> io::Result<bool> {
@@ -168,7 +167,7 @@ pub fn spawn_godot(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(spawn_failure(&mut child, error));
         }
     };
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LIMIT)));
@@ -231,7 +230,7 @@ pub fn spawn_gui(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(spawn_failure(&mut child, error));
         }
     };
     Ok((pid, pid as i32, start_ticks))
@@ -356,8 +355,13 @@ fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
     Ok(())
 }
 
+fn spawn_failure(child: &mut Child, error: io::Error) -> io::Error {
+    let _ = child.kill();
+    let _ = child.wait();
+    error
+}
+
 fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Result<bool> {
-    validate_ids(pid, pgid)?;
     if !pid_alive_with_ticks(pid, ticks) {
         return Ok(false);
     }

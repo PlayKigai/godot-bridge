@@ -53,10 +53,7 @@ impl ContainerTable {
     }
 
     fn get(&self, index: u32) -> &str {
-        self.names
-            .get(index as usize)
-            .map(String::as_str)
-            .unwrap_or_default()
+        self.names[index as usize].as_str()
     }
 }
 
@@ -121,10 +118,7 @@ pub fn flatten(
                 make_symbol(
                     name,
                     container,
-                    item.get("kind")
-                        .and_then(Value::as_u64)
-                        .and_then(|kind| u8::try_from(kind).ok())
-                        .unwrap_or_default(),
+                    symbol_kind(item),
                     range_values(location.get("range").unwrap_or(&Value::Null)),
                     containers,
                 ),
@@ -157,20 +151,13 @@ fn flatten_document(
         .and_then(Value::as_str)
         .map(|uri| normalize_uri_cached(uri, uri_cache))
         .unwrap_or_else(|| uri.to_owned());
-    let container_name = if container.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{container}.{name}")
-    };
+    let container_name = join_container(container, name);
     output.push((
         uri.clone(),
         make_symbol(
             name,
             container,
-            item.get("kind")
-                .and_then(Value::as_u64)
-                .and_then(|kind| u8::try_from(kind).ok())
-                .unwrap_or_default(),
+            symbol_kind(item),
             item.get("selectionRange")
                 .or_else(|| item.get("range"))
                 .map_or([0; 4], range_values),
@@ -208,11 +195,7 @@ fn make_symbol(
     range: [u32; 4],
     containers: &mut ContainerTable,
 ) -> Symbol {
-    let container_name = if container.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{container}.{name}")
-    };
+    let container_name = join_container(container, name);
     let (container_index, inline_container) = containers
         .intern(container)
         .map_or((0, Some(container.into())), |index| (index, None));
@@ -234,6 +217,22 @@ fn make_symbol(
         kind,
         container: container_index,
         range,
+    }
+}
+
+fn symbol_kind(value: &Value) -> u8 {
+    value
+        .get("kind")
+        .and_then(Value::as_u64)
+        .and_then(|kind| u8::try_from(kind).ok())
+        .unwrap_or_default()
+}
+
+fn join_container(container: &str, name: &str) -> String {
+    if container.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{container}.{name}")
     }
 }
 
@@ -366,7 +365,7 @@ pub fn search_with_uris<'a>(
                 if container.is_empty() {
                     Cow::Borrowed(symbol.name.as_ref())
                 } else {
-                    Cow::Owned(format!("{container}.{}", symbol.name))
+                    Cow::Owned(join_container(container, &symbol.name))
                 }
             }
         } else if let Some(target) = symbol

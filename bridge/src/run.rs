@@ -7,13 +7,7 @@ use crate::scene;
 use crate::settings_file;
 
 pub fn run(file: &Path, scene: Option<&str>) -> crate::error::Result<ExitCode> {
-    let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree)?;
-    let project = root::find_project_dir(
-        &worktree,
-        Some(file),
-        settings.project_dir.as_deref().map(Path::new),
-    )?;
+    let (project, settings) = resolve_project(file)?;
     let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))?;
     godot_bin::check_version(&godot)?;
 
@@ -38,6 +32,14 @@ pub fn run(file: &Path, scene: Option<&str>) -> crate::error::Result<ExitCode> {
 }
 
 pub fn project_dir(file: &Path) -> crate::error::Result<()> {
+    let (project, _) = resolve_project(file)?;
+    println!("{}", project.display());
+    Ok(())
+}
+
+fn resolve_project(
+    file: &Path,
+) -> crate::error::Result<(std::path::PathBuf, settings_file::Settings)> {
     let worktree = root::cwd_root()?;
     let settings = settings_file::load_zed_settings(&worktree)?;
     let project = root::find_project_dir(
@@ -45,6 +47,5 @@ pub fn project_dir(file: &Path) -> crate::error::Result<()> {
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
     )?;
-    println!("{}", project.display());
-    Ok(())
+    Ok((project, settings))
 }

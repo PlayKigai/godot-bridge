@@ -71,7 +71,7 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     reset_for_recovery(session)?;
     if session.proxy.recovery_times.len() >= 3 {
         let log_path = session.runtime.files.state.with_extension("godot.log");
-        send_show_message(
+        send_error_message(
             &mut session.output,
             &format!("Godot keeps crashing, see {}", log_path.display()),
         )?;
@@ -79,7 +79,7 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
         cleanup_runtime(&mut session.runtime, child);
         crate::bail!("Godot keeps crashing");
     }
-    send_show_message(
+    send_error_message(
         &mut session.output,
         &format!("Godot exited ({reason}), restarting."),
     )?;
@@ -117,7 +117,8 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     }
     let Some(mut replacement) = candidate else {
         if let Some(error) = last_error {
-            send_show_message(&mut session.output, &error.message())?;
+            let message = startup_failure_message(Some(&error), session.settings.startup_timeout_s);
+            send_error_message(&mut session.output, &message)?;
         }
         crate::bail!("recovery failed");
     };
