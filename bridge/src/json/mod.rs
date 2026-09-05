@@ -447,6 +447,9 @@ impl RawJson<'_> {
             return false;
         };
         let expected = expected.as_bytes();
+        if !bytes.contains(&b'\\') {
+            return bytes == expected;
+        }
         let mut input_index = 0;
         let mut expected_index = 0;
         while input_index < bytes.len() {

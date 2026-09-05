@@ -43,8 +43,7 @@ impl Connection {
         let reader_stream = stream.try_clone()?;
         let writer = stream.try_clone()?;
         let (sender, receiver) = mpsc::sync_channel(1);
-        let reader_thread =
-            spawn_frame_reader("godot-bridge-dap-reader", reader_stream, FRAME_CAP, sender)?;
+        let reader_thread = spawn_frame_reader("godot-bridge-dap-reader", reader_stream, sender)?;
         Ok(Self {
             socket: stream,
             reader: Some(FrameInput::new(receiver, FRAME_CAP)),
@@ -199,12 +198,8 @@ enum InitializeWait {
 
 pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    let _input_thread = spawn_frame_reader(
-        "godot-bridge-dap-client-reader",
-        std::io::stdin(),
-        FRAME_CAP,
-        sender,
-    )?;
+    let _input_thread =
+        spawn_frame_reader("godot-bridge-dap-client-reader", std::io::stdin(), sender)?;
     let mut input = FrameInput::new(receiver, FRAME_CAP);
     let initialize = match input.with_next_frame(parse_message)? {
         Some(Ok(message))

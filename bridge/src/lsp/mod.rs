@@ -464,7 +464,6 @@ pub fn run() -> Result<ExitCode> {
     let _input_thread = spawn_frame_reader(
         "godot-bridge-lsp-client-reader",
         std::io::stdin(),
-        CLIENT_FRAME_CAP,
         input_sender,
     )
     .map_err(|error| crate::error::Error::new(error.to_string()))?;
@@ -919,13 +918,9 @@ fn forward_client_request(
             symbol: None,
         },
     );
-    if let Err(error) = editor
-        .connection
-        .writer
-        .write_all(&crate::framing::encode_frame(&body))
-    {
+    if let Err(error) = send_godot_body(&mut editor.connection.writer, &body, true) {
         proxy.pending.remove(&bridge_id);
-        return Err(error.into());
+        return Err(error);
     }
     Ok(is_shutdown.then_some(bridge_id))
 }

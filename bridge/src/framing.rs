@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::json::Value;
-use std::io::{Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -33,6 +33,9 @@ pub struct FrameDecoder {
     cap: usize,
     buf: Vec<u8>,
     consumed: usize,
+    header_scan: usize,
+    content_length: Option<usize>,
+    body_start: Option<usize>,
 }
 
 impl FrameDecoder {
@@ -41,6 +44,9 @@ impl FrameDecoder {
             cap,
             buf: Vec::new(),
             consumed: 0,
+            header_scan: 0,
+            content_length: None,
+            body_start: None,
         }
     }
 
@@ -53,63 +59,75 @@ impl FrameDecoder {
             self.compact();
         }
         let input = &self.buf[self.consumed..];
-        let (header_end, delimiter_len) = match (
-            input.windows(4).position(|window| window == b"\r\n\r\n"),
-            input.windows(2).position(|window| window == b"\n\n"),
-        ) {
-            (Some(crlf_end), Some(lf_end)) if lf_end < crlf_end => (lf_end, 2),
-            (Some(crlf_end), _) => (crlf_end, 4),
-            (None, Some(lf_end)) => (lf_end, 2),
-            (None, None) => {
+        if self.body_start.is_none() {
+            let scan_limit = input.len().min(HEADER_CAP + 1);
+            let mut delimiter = None;
+            while self.header_scan < scan_limit {
+                let index = self.header_scan;
+                if input.get(index..index + 4) == Some(b"\r\n\r\n") {
+                    delimiter = Some((index, 4));
+                    break;
+                }
+                if input.get(index..index + 2) == Some(b"\n\n") {
+                    delimiter = Some((index, 2));
+                    break;
+                }
+                self.header_scan += 1;
+            }
+            let Some((header_end, delimiter_len)) = delimiter else {
+                self.header_scan = input.len().saturating_sub(3);
                 if input.len() > HEADER_CAP {
                     return Err(FrameError::Malformed("frame header is too long".to_owned()));
                 }
                 return Ok(None);
-            }
-        };
-
-        if header_end > HEADER_CAP {
-            return Err(FrameError::Malformed("frame header is too long".to_owned()));
-        }
-
-        let header = &input[..header_end];
-        let mut content_length = None;
-        for line in header.split(|byte| *byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let Some(separator) = line.iter().position(|byte| *byte == b':') else {
-                return Err(FrameError::Malformed(
-                    "header line has no colon".to_string(),
-                ));
             };
-            let name = &line[..separator];
-            let value_start = line[separator + 1..]
-                .iter()
-                .position(|byte| !byte.is_ascii_whitespace())
-                .map_or(line.len(), |offset| separator + 1 + offset);
-            let value = &line[value_start..];
-            if name.eq_ignore_ascii_case(b"Content-Length") {
-                if content_length.is_some() {
-                    return Err(FrameError::Malformed(
-                        "duplicate Content-Length header".to_string(),
-                    ));
-                }
-                let value = std::str::from_utf8(value).map_err(|_| {
-                    FrameError::Malformed("Content-Length is not ASCII".to_string())
-                })?;
-                let length = value.trim().parse::<usize>().map_err(|_| {
-                    FrameError::Malformed("Content-Length is not a number".to_string())
-                })?;
-                content_length = Some(length);
+            if header_end > HEADER_CAP {
+                return Err(FrameError::Malformed("frame header is too long".to_owned()));
             }
+
+            let header = &input[..header_end];
+            let mut content_length = None;
+            for line in header.split(|byte| *byte == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+                    return Err(FrameError::Malformed(
+                        "header line has no colon".to_string(),
+                    ));
+                };
+                let name = &line[..separator];
+                let value_start = line[separator + 1..]
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .map_or(line.len(), |offset| separator + 1 + offset);
+                let value = &line[value_start..];
+                if name.eq_ignore_ascii_case(b"Content-Length") {
+                    if content_length.is_some() {
+                        return Err(FrameError::Malformed(
+                            "duplicate Content-Length header".to_string(),
+                        ));
+                    }
+                    let value = std::str::from_utf8(value).map_err(|_| {
+                        FrameError::Malformed("Content-Length is not ASCII".to_string())
+                    })?;
+                    let length = value.trim().parse::<usize>().map_err(|_| {
+                        FrameError::Malformed("Content-Length is not a number".to_string())
+                    })?;
+                    content_length = Some(length);
+                }
+            }
+
+            let length = content_length.ok_or_else(|| {
+                FrameError::Malformed("missing Content-Length header".to_string())
+            })?;
+            if length > self.cap {
+                return Err(FrameError::Oversized(length));
+            }
+            self.content_length = Some(length);
+            self.body_start = Some(header_end + delimiter_len);
         }
 
-        let length = content_length
-            .ok_or_else(|| FrameError::Malformed("missing Content-Length header".to_string()))?;
-        if length > self.cap {
-            return Err(FrameError::Oversized(length));
-        }
-
-        let body_start = header_end + delimiter_len;
+        let length = self.content_length.expect("parsed frame length");
+        let body_start = self.body_start.expect("parsed frame body start");
         let body_end = body_start
             .checked_add(length)
             .ok_or(FrameError::Oversized(usize::MAX))?;
@@ -120,6 +138,9 @@ impl FrameDecoder {
         let body_start = self.consumed + body_start;
         let body_end = self.consumed + body_end;
         self.consumed = body_end;
+        self.header_scan = 0;
+        self.content_length = None;
+        self.body_start = None;
         Ok(Some(&self.buf[body_start..body_end]))
     }
 
@@ -130,6 +151,9 @@ impl FrameDecoder {
     fn compact(&mut self) {
         if self.consumed == self.buf.len() {
             self.buf.clear();
+            if self.buf.capacity() > 1024 * 1024 {
+                self.buf.shrink_to(2 * READ_CHUNK_SIZE);
+            }
         } else {
             self.buf.copy_within(self.consumed.., 0);
             self.buf.truncate(self.buf.len() - self.consumed);
@@ -138,22 +162,11 @@ impl FrameDecoder {
     }
 }
 
-pub struct FrameReader<R: Read> {
-    reader: R,
-    decoder: FrameDecoder,
-}
-
-pub struct ReadChunk {
-    bytes: [u8; READ_CHUNK_SIZE],
-    len: usize,
-}
-
-pub(crate) type ReadEvent = Result<Option<ReadChunk>, std::io::Error>;
+pub(crate) type ReadEvent = Result<Option<Vec<u8>>, std::io::Error>;
 
 pub fn spawn_frame_reader<R: Read + Send + 'static>(
     name: &str,
     mut reader: R,
-    _cap: usize,
     sender: SyncSender<ReadEvent>,
 ) -> std::io::Result<JoinHandle<()>> {
     let name = name.to_owned();
@@ -161,14 +174,11 @@ pub fn spawn_frame_reader<R: Read + Send + 'static>(
         .name(name)
         .stack_size(256 * 1024)
         .spawn(move || loop {
-            let mut chunk = ReadChunk {
-                bytes: [0; READ_CHUNK_SIZE],
-                len: 0,
-            };
-            let event = match reader.read(&mut chunk.bytes) {
+            let mut chunk = vec![0; READ_CHUNK_SIZE];
+            let event = match reader.read(&mut chunk) {
                 Ok(0) => Ok(None),
                 Ok(len) => {
-                    chunk.len = len;
+                    chunk.truncate(len);
                     Ok(Some(chunk))
                 }
                 Err(error) => Err(error),
@@ -219,7 +229,7 @@ impl FrameInput {
                 return Ok(None);
             }
             match self.receiver.recv() {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
                 Ok(Ok(None)) => self.eof = true,
                 Ok(Err(error)) => return Err(FrameError::Io(error)),
                 Err(_) => return Err(FrameError::Io(std::io::Error::other("reader is closed"))),
@@ -242,7 +252,7 @@ impl FrameInput {
                 return Ok(FramePoll::End);
             }
             match self.receiver.try_recv() {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
                 Ok(Ok(None)) => self.eof = true,
                 Ok(Err(error)) => return Err(FrameError::Io(error)),
                 Err(TryRecvError::Empty) => return Ok(FramePoll::Empty),
@@ -269,7 +279,7 @@ impl FrameInput {
                 return Ok(FramePoll::End);
             }
             match self.receiver.recv_timeout(timeout) {
-                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk),
                 Ok(Ok(None)) => self.eof = true,
                 Ok(Err(error)) => return Err(FrameError::Io(error)),
                 Err(RecvTimeoutError::Timeout) => return Ok(FramePoll::Empty),
@@ -277,39 +287,6 @@ impl FrameInput {
                     return Err(FrameError::Io(std::io::Error::other("reader is closed")))
                 }
             }
-        }
-    }
-}
-
-impl<R: Read> FrameReader<R> {
-    pub fn new(reader: R, cap: usize) -> Self {
-        Self {
-            reader,
-            decoder: FrameDecoder::new(cap),
-        }
-    }
-
-    pub fn into_inner(self) -> R {
-        self.reader
-    }
-
-    /// Reads the next body, returning `None` only at a clean frame boundary.
-    pub fn read_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
-        let mut bytes = [0u8; 8192];
-        loop {
-            if let Some(frame) = self.decoder.next_frame()? {
-                return Ok(Some(frame.to_owned()));
-            }
-
-            let count = self.reader.read(&mut bytes).map_err(FrameError::Io)?;
-
-            if count == 0 {
-                if self.decoder.has_pending_bytes() {
-                    return Err(FrameError::Malformed("unexpected EOF".to_string()));
-                }
-                return Ok(None);
-            }
-            self.decoder.push(&bytes[..count]);
         }
     }
 }
@@ -324,11 +301,54 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<
     if body.len() > cap {
         return Err(FrameError::Oversized(body.len()));
     }
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    writer
-        .write_all(header.as_bytes())
-        .map_err(FrameError::Io)?;
-    writer.write_all(body).map_err(FrameError::Io)
+    let mut header = [0u8; 64];
+    let prefix = b"Content-Length: ";
+    header[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 20];
+    let mut value = body.len();
+    let mut digit_count = 0;
+    if value == 0 {
+        digits[0] = b'0';
+        digit_count = 1;
+    } else {
+        while value != 0 {
+            digits[digit_count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            digit_count += 1;
+        }
+        digits[..digit_count].reverse();
+    }
+    let header_end = prefix.len() + digit_count;
+    header[prefix.len()..header_end].copy_from_slice(&digits[..digit_count]);
+    header[header_end..header_end + 4].copy_from_slice(b"\r\n\r\n");
+    let header_len = header_end + 4;
+    let mut header_offset = 0;
+    let mut body_offset = 0;
+    while header_offset < header_len || body_offset < body.len() {
+        let header_remaining = header_len - header_offset;
+        let written = if header_remaining != 0 {
+            let slices = [
+                IoSlice::new(&header[header_offset..header_len]),
+                IoSlice::new(&body[body_offset..]),
+            ];
+            writer.write_vectored(&slices).map_err(FrameError::Io)?
+        } else {
+            writer.write(&body[body_offset..]).map_err(FrameError::Io)?
+        };
+        if written == 0 {
+            return Err(FrameError::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write frame",
+            )));
+        }
+        if written <= header_remaining {
+            header_offset += written;
+        } else {
+            header_offset = header_len;
+            body_offset += written - header_remaining;
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
@@ -362,7 +382,6 @@ pub fn write_json<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn split_frame_across_pushes() {
@@ -421,22 +440,10 @@ mod tests {
     }
 
     #[test]
-    fn eof_mid_frame() {
-        let mut reader = FrameReader::new(Cursor::new(b"Content-Length: 4\r\n\r\nabc"), 64);
-        assert!(matches!(reader.read_frame(), Err(FrameError::Malformed(_))));
-    }
-
-    #[test]
     fn input_eof_mid_frame() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
-        let mut chunk = ReadChunk {
-            bytes: [0; READ_CHUNK_SIZE],
-            len: 0,
-        };
         let body = b"Content-Length: 4\r\n\r\nabc";
-        chunk.bytes[..body.len()].copy_from_slice(body);
-        chunk.len = body.len();
-        sender.send(Ok(Some(chunk))).unwrap();
+        sender.send(Ok(Some(body.to_vec()))).unwrap();
         sender.send(Ok(None)).unwrap();
         let mut input = FrameInput::new(receiver, 64);
         assert!(matches!(
@@ -465,6 +472,7 @@ mod tests {
 
     #[test]
     fn proxy_forwarding_benchmark() {
+        use std::net::TcpListener;
         let frames = [
             (
                 "didChange",
@@ -483,28 +491,40 @@ mod tests {
             ),
         ];
         for (name, body) in frames {
-            let mut output = Vec::new();
-            let mut checksum = 0usize;
-            let start = std::time::Instant::now();
-            for _ in 0..10_000 {
-                let value = parse_json_object(body, "LSP").unwrap();
-                let serialized = crate::json::to_vec(&value);
-                write_frame(&mut output, &serialized, 64 * 1024 * 1024).unwrap();
-                checksum = checksum.wrapping_add(output.len());
-                output.clear();
-            }
-            let reference = start.elapsed().as_nanos() / 10_000;
-            let start = std::time::Instant::now();
-            for _ in 0..10_000 {
-                crate::json::scan_top_level(body).unwrap();
-                write_frame(&mut output, body, 64 * 1024 * 1024).unwrap();
-                checksum = checksum.wrapping_add(output.len());
-                output.clear();
-            }
-            let optimized = start.elapsed().as_nanos() / 10_000;
+            let benchmark = |optimized| {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let address = listener.local_addr().unwrap();
+                let drain = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut bytes = [0; 16 * 1024];
+                    while stream.read(&mut bytes).unwrap_or(0) != 0 {}
+                });
+                let mut writer = std::net::TcpStream::connect(address).unwrap();
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<ReadEvent>(1);
+                let start = std::time::Instant::now();
+                let mut checksum = 0usize;
+                for _ in 0..10_000 {
+                    sender.send(Ok(Some(body.to_vec()))).unwrap();
+                    let body = receiver.recv().unwrap().unwrap().unwrap();
+                    let body = if optimized {
+                        crate::json::scan_top_level(&body).unwrap();
+                        body
+                    } else {
+                        let value = parse_json_object(&body, "LSP").unwrap();
+                        crate::json::to_vec(&value)
+                    };
+                    write_frame(&mut writer, &body, 64 * 1024 * 1024).unwrap();
+                    checksum = checksum.wrapping_add(body.len());
+                }
+                drop(writer);
+                drain.join().unwrap();
+                (start.elapsed().as_nanos() / 10_000, checksum)
+            };
+            let (reference, first_checksum) = benchmark(false);
+            let (optimized, second_checksum) = benchmark(true);
             println!("proxy {name}: reference={reference} ns/frame optimized={optimized} ns/frame");
-            std::hint::black_box(checksum);
-            assert_ne!(checksum, 0);
+            assert_ne!(first_checksum, 0);
+            assert_eq!(first_checksum, second_checksum);
         }
     }
 

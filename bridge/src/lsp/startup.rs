@@ -3,13 +3,8 @@ use super::*;
 pub(super) fn connection_from_stream(stream: TcpStream) -> Connection {
     let reader_stream = stream.try_clone().expect("Godot stream should clone");
     let (sender, receiver) = mpsc::sync_channel(1);
-    let reader_thread = spawn_frame_reader(
-        "godot-bridge-lsp-reader",
-        reader_stream,
-        GODOT_FRAME_CAP,
-        sender,
-    )
-    .expect("Godot reader thread should spawn");
+    let reader_thread = spawn_frame_reader("godot-bridge-lsp-reader", reader_stream, sender)
+        .expect("Godot reader thread should spawn");
     Connection {
         socket: stream.try_clone().expect("Godot stream should clone"),
         reader: Some(FrameInput::new(receiver, GODOT_FRAME_CAP)),
