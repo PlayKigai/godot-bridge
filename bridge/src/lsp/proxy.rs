@@ -219,13 +219,6 @@ fn handle_event(
             absorb_watcher_event(&mut session.watch, Some(result));
         }
         ProxyEvent::Internal(event) => match event {
-            InternalEvent::Document(event) => {
-                schedule_symbol_event(&mut session.proxy, event);
-                let result = send_due_symbol_requests(&mut session.editor, &mut session.proxy);
-                if let Some(code) = guard(session, unmanaged, result)? {
-                    return Ok(Some(code));
-                }
-            }
             InternalEvent::Bulk {
                 generation,
                 document,

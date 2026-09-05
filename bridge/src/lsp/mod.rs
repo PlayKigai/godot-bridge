@@ -143,7 +143,6 @@ struct ProxyState {
 }
 
 enum InternalEvent {
-    Document(DocumentEvent),
     Bulk {
         generation: u64,
         document: docs_state::ScannedDocument,
@@ -591,12 +590,8 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-    let mut documents = DocumentState::new();
+    let documents = DocumentState::new();
     let internal_sender = event_sender.clone();
-    let document_event_sender = event_sender.clone();
-    documents.set_event_hook(Arc::new(move |event| {
-        let _ = document_event_sender.send(ProxyEvent::Internal(InternalEvent::Document(event)));
-    }));
     let mut proxy = ProxyState {
         documents,
         pending: HashMap::new(),
@@ -1394,11 +1389,9 @@ fn process_bulk_document(
     if proxy.documents.open_docs.contains_key(&document.key) {
         return Ok(None);
     }
-    proxy.documents.set_open_change_events(false);
     let action = proxy
         .documents
         .bridge_open_path(&document.path, document.text);
-    proxy.documents.set_open_change_events(true);
     if let Some(action) = action {
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
