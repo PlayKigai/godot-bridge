@@ -88,20 +88,15 @@ pub(crate) struct RequestKeys {
 }
 
 impl RequestKeys {
-    pub(crate) fn insert(
-        &mut self,
-        key: crate::json::RequestKey,
-    ) -> Option<crate::json::RequestKey> {
+    pub(crate) fn insert(&mut self, key: crate::json::RequestKey) {
         if !self.values.insert(key.clone()) {
-            return None;
+            return;
         }
         self.order.push_back(key);
         if self.order.len() > crate::SERVER_REQUEST_CAP {
-            let old = self.order.pop_front()?;
-            self.values.remove(&old);
-            Some(old)
-        } else {
-            None
+            if let Some(old) = self.order.pop_front() {
+                self.values.remove(&old);
+            }
         }
     }
 
@@ -122,7 +117,7 @@ impl RequestKeys {
 
     pub(crate) fn extend(&mut self, keys: impl IntoIterator<Item = crate::json::RequestKey>) {
         for key in keys {
-            let _ = self.insert(key);
+            self.insert(key);
         }
     }
 }
@@ -1355,15 +1350,13 @@ fn rewrite_document_messages(
             if !check_document_size(&uri, "didOpen", text.len()) {
                 return Ok(Vec::new());
             }
-            let planned = proxy.documents.plan_zed_open(&uri, text);
+            let key = proxy.documents.key_for_uri(&uri);
+            let planned = proxy.documents.plan_zed_open_key(&key, text);
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let action_text = match planned {
-                DocumentAction::Open { text, .. } | DocumentAction::Change { text, .. } => text,
-            };
-            let action = proxy.documents.zed_open(&uri, action_text);
-            schedule_document_action(proxy, &action);
+            let (action_uri, version) = proxy.documents.zed_open(&uri, planned);
+            schedule_document(proxy, &action_uri, version);
             return Ok(vec![body]);
         }
         "textDocument/didChange" => {
@@ -1381,7 +1374,8 @@ fn rewrite_document_messages(
             if !check_document_size(&uri, "didChange", text.len()) {
                 return Ok(Vec::new());
             }
-            let Some(planned) = proxy.documents.plan_zed_change(&uri, text) else {
+            let key = proxy.documents.key_for_uri(&uri);
+            let Some(planned) = proxy.documents.plan_zed_change_key(&key, text) else {
                 let body = crate::json::to_vec(&message);
                 if !check_document_size(&uri, "didChange", body.len()) {
                     return Ok(Vec::new());
@@ -1391,14 +1385,10 @@ fn rewrite_document_messages(
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let action_text = match planned {
-                DocumentAction::Change { text, .. } => text,
-                DocumentAction::Open { .. } => unreachable!(),
-            };
-            let Some(action) = proxy.documents.zed_change(&uri, action_text) else {
+            let Some((action_uri, version)) = proxy.documents.zed_change(&uri, planned) else {
                 return Ok(Vec::new());
             };
-            schedule_document_action(proxy, &action);
+            schedule_document(proxy, &action_uri, version);
             return Ok(vec![body]);
         }
         "textDocument/didClose" => {
@@ -1638,13 +1628,12 @@ fn process_watcher_changes(
     output: &mut ClientWriter,
     mut editor: Option<&mut Editor>,
     settings: &Settings,
-    changes: Vec<WatcherChange>,
+    mut changes: Vec<WatcherChange>,
     recovering: bool,
 ) -> Result<()> {
     if !settings.project_diagnostics || !proxy.zed_initialized {
         return Ok(());
     }
-    let mut changes = changes;
     if changes
         .iter()
         .any(|change| change.kind == WatcherChangeKind::Rescan)
@@ -1857,10 +1846,14 @@ fn forget_symbols(proxy: &mut ProxyState, uri: &str) {
 fn schedule_document_action(proxy: &mut ProxyState, action: &DocumentAction) {
     match action {
         DocumentAction::Open { uri, version, .. } | DocumentAction::Change { uri, version, .. } => {
-            if let Some(generation) = proxy.documents.generation_for_uri(uri) {
-                schedule_symbols(proxy, uri, generation, *version);
-            }
+            schedule_document(proxy, uri, *version);
         }
+    }
+}
+
+fn schedule_document(proxy: &mut ProxyState, uri: &str, version: i64) {
+    if let Some(generation) = proxy.documents.generation_for_uri(uri) {
+        schedule_symbols(proxy, uri, generation, version);
     }
 }
 
@@ -2002,7 +1995,11 @@ mod tests {
         let socket = writer.try_clone().unwrap();
         let mut editor = Editor {
             child: None,
-            connection: Connection::with_parts(socket, None, writer),
+            connection: Connection {
+                socket,
+                reader_thread: None,
+                writer,
+            },
             lsp_port: 0,
             dap_port: 0,
         };

@@ -56,23 +56,22 @@ impl DocumentState {
         }
     }
 
-    pub fn zed_open(&mut self, incoming_uri: &str, text: String) -> DocumentAction {
+    pub fn zed_open(&mut self, incoming_uri: &str, action: DocumentAction) -> (String, i64) {
         let key = self.key_for_uri(incoming_uri);
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
         self.register_watcher_path(&key, key.clone());
-        let action = self.plan_zed_open_key(&key, &text);
         match action {
-            DocumentAction::Change { uri, version, .. } => {
+            DocumentAction::Change { uri, version, text } => {
                 let doc = self
                     .open_docs
                     .get_mut(&key)
                     .expect("planned document exists");
-                doc.text = Some(text.clone());
+                doc.text = Some(text);
                 doc.version = version;
                 doc.owner = DocumentOwner::Zed;
-                DocumentAction::Change { uri, version, text }
+                (uri, version)
             }
-            DocumentAction::Open { uri, version, .. } => {
+            DocumentAction::Open { uri, version, text } => {
                 let generation = self.next_generation();
                 self.open_docs.insert(
                     key.clone(),
@@ -80,38 +79,31 @@ impl DocumentState {
                         uri: uri.clone(),
                         version,
                         generation,
-                        text: Some(text.clone()),
+                        text: Some(text),
                         text_hash: 0,
                         owner: DocumentOwner::Zed,
                     },
                 );
                 self.uri_keys.insert(uri.clone(), key.clone());
-                DocumentAction::Open { uri, version, text }
+                (uri, version)
             }
         }
     }
 
-    pub fn zed_change(&mut self, incoming_uri: &str, text: String) -> Option<DocumentAction> {
+    pub fn zed_change(
+        &mut self,
+        incoming_uri: &str,
+        action: DocumentAction,
+    ) -> Option<(String, i64)> {
         let key = self.key_for_uri(incoming_uri);
-        let action = self.plan_zed_change_key(&key, &text)?;
-        let DocumentAction::Change { uri, version, .. } = action else {
+        let DocumentAction::Change { uri, version, text } = action else {
             unreachable!();
         };
         let doc = self.open_docs.get_mut(&key)?;
-        doc.text = Some(text.clone());
+        doc.text = Some(text);
         doc.version = version;
         doc.owner = DocumentOwner::Zed;
-        Some(DocumentAction::Change { uri, version, text })
-    }
-
-    pub(crate) fn plan_zed_open(&self, incoming_uri: &str, text: &str) -> DocumentAction {
-        let key = self.key_for_uri(incoming_uri);
-        self.plan_zed_open_key(&key, text)
-    }
-
-    pub(crate) fn plan_zed_change(&self, incoming_uri: &str, text: &str) -> Option<DocumentAction> {
-        let key = self.key_for_uri(incoming_uri);
-        self.plan_zed_change_key(&key, text)
+        Some((uri, version))
     }
 
     pub fn zed_close(&mut self, incoming_uri: &str) -> Option<(PathBuf, String)> {
@@ -226,7 +218,7 @@ impl DocumentState {
         self.generation
     }
 
-    fn plan_zed_open_key(&self, key: &Path, text: &str) -> DocumentAction {
+    pub(crate) fn plan_zed_open_key(&self, key: &Path, text: &str) -> DocumentAction {
         if let Some(doc) = self.open_docs.get(key) {
             DocumentAction::Change {
                 uri: doc.uri.clone(),
@@ -242,7 +234,7 @@ impl DocumentState {
         }
     }
 
-    fn plan_zed_change_key(&self, key: &Path, text: &str) -> Option<DocumentAction> {
+    pub(crate) fn plan_zed_change_key(&self, key: &Path, text: &str) -> Option<DocumentAction> {
         let doc = self.open_docs.get(key)?;
         Some(DocumentAction::Change {
             uri: doc.uri.clone(),

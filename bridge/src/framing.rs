@@ -171,18 +171,6 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn with_parts(
-        socket: std::net::TcpStream,
-        reader_thread: Option<JoinHandle<()>>,
-        writer: std::net::TcpStream,
-    ) -> Self {
-        Self {
-            socket,
-            reader_thread,
-            writer,
-        }
-    }
-
     pub(crate) fn close(&mut self) {
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
         if let Some(reader_thread) = self.reader_thread.take() {
@@ -211,7 +199,11 @@ where
     let reader_stream = stream.try_clone()?;
     let writer = stream.try_clone()?;
     let reader_thread = spawn_frame_reader(name, reader_stream, sender, map)?;
-    Ok(Connection::with_parts(stream, Some(reader_thread), writer))
+    Ok(Connection {
+        socket: stream,
+        reader_thread: Some(reader_thread),
+        writer,
+    })
 }
 
 pub(crate) fn spawn_frame_reader<R, T, F>(

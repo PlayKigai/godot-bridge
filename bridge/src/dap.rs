@@ -196,9 +196,9 @@ impl ServerRequests {
                     .insert(key.clone(), original)
                     .is_none()
                 {
-                    if let Some(old) = self.keys.insert(key) {
-                        self.original_sequences.remove(&old);
-                    }
+                    self.keys.insert(key);
+                    self.original_sequences
+                        .retain(|key, _| self.keys.contains(key));
                 }
             }
         }

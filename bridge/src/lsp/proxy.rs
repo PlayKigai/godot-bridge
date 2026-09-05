@@ -353,6 +353,51 @@ pub(super) fn receive_godot_frame(
     }
 }
 
+pub(super) fn initialize_loop<T, F, G>(
+    editor: &mut Editor,
+    proxy: &mut ProxyState,
+    project: &Path,
+    input: InitializeInput<'_>,
+    context: &mut T,
+    on_response: F,
+    mut on_other: G,
+) -> Result<()>
+where
+    F: FnOnce(&mut Editor, &mut ProxyState, &mut T, Value, Value) -> Result<()>,
+    G: FnMut(&mut Editor, &mut ProxyState, &mut T, Value) -> Result<()>,
+{
+    let mut initialize = proxy.initialize.clone();
+    let original_id = initialize.get("id").cloned().unwrap_or(Value::Null);
+    let bridge_id = proxy.next_id;
+    proxy.next_id += 1;
+    if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
+        params.remove("initializationOptions");
+    }
+    initialize["id"] = crate::json!(bridge_id);
+    send_godot(&mut editor.connection.writer, &initialize, true)?;
+    loop {
+        let frame = receive_godot_frame(input.events, input.godot, input.deferred)?
+            .ok_or_else(|| crate::error::Error::new("Godot closed during initialize"))?;
+        let message = parse_message(&frame)?;
+        if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
+        {
+            check_workspace(&message, project, Some(editor.lsp_port))?;
+            if let Some(id) = message.get("id") {
+                send_godot(
+                    &mut editor.connection.writer,
+                    &crate::json!({"jsonrpc":"2.0","id":id,"result":null}),
+                    false,
+                )?;
+            }
+            continue;
+        }
+        if message.get("id") == Some(&crate::json!(bridge_id)) {
+            return on_response(editor, proxy, context, message, original_id);
+        }
+        on_other(editor, proxy, context, message)?;
+    }
+}
+
 enum ClientFrame {
     Exit,
     Shutdown(Value),
@@ -499,64 +544,37 @@ pub(super) fn forward_initialize(
     project_diagnostics: bool,
     input: InitializeInput<'_>,
 ) -> std::result::Result<(), String> {
-    let mut initialize = proxy.initialize.clone();
-    let original_id = initialize.get("id").cloned().unwrap_or(Value::Null);
-    let bridge_id = proxy.next_id;
-    proxy.next_id += 1;
-    if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
-        params.remove("initializationOptions");
-    }
-    initialize["id"] = crate::json!(bridge_id);
-    if let Err(error) = send_godot(&mut editor.connection.writer, &initialize, true) {
-        return Err(error.to_string());
-    }
-    loop {
-        let frame = receive_godot_frame(input.events, input.godot, input.deferred)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Godot closed during initialize".to_owned())?;
-        let message = parse_message(&frame)?;
-        if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
-        {
-            if let Err(error) = check_workspace(&message, project, Some(editor.lsp_port)) {
-                return Err(error.to_string());
-            }
-            if message.get("id").is_some()
-                && send_godot(
-                    &mut editor.connection.writer,
-                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
-                    false,
-                )
-                .is_err()
-            {
-                return Err("cannot answer changeWorkspace".to_owned());
-            }
-            continue;
-        }
-        if message.get("id") == Some(&crate::json!(bridge_id)) {
-            let mut response = message;
+    initialize_loop(
+        editor,
+        proxy,
+        project,
+        input,
+        output,
+        |_, proxy, output, mut response, original_id| {
             response["id"] = original_id;
             patch_initialize_response(&mut response);
             send_client(output, &response)
-                .map_err(|_| "cannot forward Godot notification".to_owned())?;
+                .map_err(|_| crate::error::Error::new("cannot forward Godot notification"))?;
             if !project_diagnostics && !proxy.workspace_symbols_notice_sent {
-                if let Err(error) = send_info_message(
+                send_info_message(
                     output,
                     "Project diagnostics are disabled; workspace symbols cover only files open in Zed.",
-                ) {
-                    return Err(error.to_string());
-                }
+                )?;
                 proxy.workspace_symbols_notice_sent = true;
             }
             proxy.initialized_forwarded = true;
-            return Ok(());
-        }
-        if message.get("method").is_some() && message.get("id").is_some() {
-            let Some(id) = message.get("id").and_then(crate::json::value_request_key) else {
-                continue;
-            };
-            proxy.server_requests.insert(id);
-        }
-        send_client(output, &message)
-            .map_err(|_| "cannot forward Godot notification".to_owned())?;
-    }
+            Ok(())
+        },
+        |_, proxy, output, message| {
+            if message.get("method").is_some() && message.get("id").is_some() {
+                let Some(id) = message.get("id").and_then(crate::json::value_request_key) else {
+                    return Ok(());
+                };
+                proxy.server_requests.insert(id);
+            }
+            send_client(output, &message)
+                .map_err(|_| crate::error::Error::new("cannot forward Godot notification"))
+        },
+    )
+    .map_err(|error| error.to_string())
 }

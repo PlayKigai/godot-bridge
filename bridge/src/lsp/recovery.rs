@@ -272,10 +272,6 @@ pub(super) fn queue_recovery_message(
                     return Ok(());
                 }
             }
-            if queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP {
-                crate::warn!("dropping notification from full recovery queue");
-                return Ok(());
-            }
             queue.notifications += 1;
             queue.bytes += size;
             queue
@@ -302,13 +298,7 @@ pub(super) fn replay_initialize(
     godot: &mut FrameState,
     deferred: &mut DeferredQueue,
 ) -> Result<()> {
-    let mut initialize = proxy.initialize.clone();
     let id = proxy.next_id;
-    proxy.next_id += 1;
-    if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
-        params.remove("initializationOptions");
-    }
-    initialize["id"] = crate::json!(id);
     proxy.pending.insert(
         id,
         PendingRequest {
@@ -317,37 +307,19 @@ pub(super) fn replay_initialize(
             symbol: None,
         },
     );
-    send_godot(&mut editor.connection.writer, &initialize, true)?;
-    loop {
-        let body = match receive_godot_frame(events, godot, deferred)? {
-            Some(body) => body,
-            None => {
-                if let Some(child) = editor.child.as_mut() {
-                    crate::debug!(
-                        "recovery Godot status: {:?}; output: {:?}",
-                        child.child.try_wait(),
-                        child.last_lines()
-                    );
-                }
-                return Err(crate::error::Error::new(
-                    "Godot closed during recovery initialize",
-                ));
-            }
-        };
-        let message = parse_message(&body)?;
-        if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
-        {
-            check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;
-            if message.get("id").is_some() {
-                send_godot(
-                    &mut editor.connection.writer,
-                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
-                    false,
-                )?;
-            }
-            continue;
-        }
-        if message.get("id") == Some(&crate::json!(id)) {
+    let project = proxy.project.clone();
+    let mut context = ();
+    initialize_loop(
+        editor,
+        proxy,
+        &project,
+        InitializeInput {
+            events,
+            godot,
+            deferred,
+        },
+        &mut context,
+        move |editor, proxy, _, _, _| {
             proxy.pending.remove(&id);
             if proxy.zed_initialized {
                 send_godot(
@@ -356,14 +328,17 @@ pub(super) fn replay_initialize(
                     false,
                 )?;
             }
-            return Ok(());
-        }
-        if message.get("method").is_some() && message.get("id").is_some() {
-            send_godot(
-                &mut editor.connection.writer,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
-                false,
-            )?;
-        }
-    }
+            Ok(())
+        },
+        |editor, _, _, message| {
+            if message.get("method").is_some() && message.get("id").is_some() {
+                send_godot(
+                    &mut editor.connection.writer,
+                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
+                    false,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }

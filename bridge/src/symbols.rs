@@ -1,4 +1,5 @@
 use crate::json::Value;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
@@ -341,43 +342,28 @@ pub fn search_with_uris<'a>(
     let query_mask = occurrence_mask(&query);
     let mut scratch = Vec::new();
     let mut candidate = Vec::new();
-    let mut target = Vec::new();
     let mut matches = BinaryHeap::with_capacity(200);
     for (uri, symbol) in symbols {
         if symbol.occurrence_mask & query_mask != query_mask {
             continue;
         }
-        let Some((gap, offset)) = (if container_query {
+        let target = if container_query {
             if let Some(target) = symbol
                 .folded
                 .as_ref()
                 .and_then(|folded| folded.container_name.as_deref())
             {
-                if target.len() > 256 && target.chars().count() > 256 {
-                    continue;
-                }
-                best_match_into(target, &query, &mut scratch, &mut candidate)
+                Cow::Borrowed(target)
             } else {
                 let container = symbol
                     .folded
                     .as_ref()
                     .and_then(|folded| folded.inline_container.as_deref())
-                    .unwrap_or_else(|| containers.get(symbol.container))
-                    .as_bytes();
+                    .unwrap_or_else(|| containers.get(symbol.container));
                 if container.is_empty() {
-                    if symbol.name.len() > 256 {
-                        continue;
-                    }
-                    best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
+                    Cow::Borrowed(symbol.name.as_ref())
                 } else {
-                    if container.len() + 1 + symbol.name.len() > 256 {
-                        continue;
-                    }
-                    target.clear();
-                    target.extend_from_slice(container);
-                    target.push(b'.');
-                    target.extend_from_slice(symbol.name.as_bytes());
-                    best_match_ascii(&target, query.as_bytes(), &mut scratch, &mut candidate)
+                    Cow::Owned(format!("{container}.{}", symbol.name))
                 }
             }
         } else if let Some(target) = symbol
@@ -385,16 +371,15 @@ pub fn search_with_uris<'a>(
             .as_ref()
             .and_then(|folded| folded.name.as_deref())
         {
-            if target.len() > 256 && target.chars().count() > 256 {
-                continue;
-            }
-            best_match_into(target, &query, &mut scratch, &mut candidate)
+            Cow::Borrowed(target)
         } else {
-            if symbol.name.len() > 256 {
-                continue;
-            }
-            best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
-        }) else {
+            Cow::Borrowed(symbol.name.as_ref())
+        };
+        if target.len() > 256 && target.chars().count() > 256 {
+            continue;
+        }
+        let Some((gap, offset)) = best_match_into(&target, &query, &mut scratch, &mut candidate)
+        else {
             continue;
         };
         let (boundary, boundary_list) = if container_query {
