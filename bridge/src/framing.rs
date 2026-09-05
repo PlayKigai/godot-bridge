@@ -161,16 +161,15 @@ pub fn spawn_frame_reader<R: Read + Send + 'static>(
         .name(name)
         .stack_size(256 * 1024)
         .spawn(move || {
-            let mut bytes = [0; READ_CHUNK_SIZE];
             loop {
-                let event = match reader.read(&mut bytes) {
+                let mut chunk = ReadChunk {
+                    bytes: [0; READ_CHUNK_SIZE],
+                    len: 0,
+                };
+                let event = match reader.read(&mut chunk.bytes) {
                     Ok(0) => Ok(None),
                     Ok(len) => {
-                        let mut chunk = ReadChunk {
-                            bytes: [0; READ_CHUNK_SIZE],
-                            len,
-                        };
-                        chunk.bytes[..len].copy_from_slice(&bytes[..len]);
+                        chunk.len = len;
                         Ok(Some(chunk))
                     }
                     Err(error) => Err(error),
