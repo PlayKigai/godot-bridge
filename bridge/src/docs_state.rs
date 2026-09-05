@@ -95,32 +95,6 @@ impl DocumentState {
         self.emit_open_change_events = enabled;
     }
 
-    pub fn planned_zed_open(&self, incoming_uri: &str, text: &str) -> DocumentAction {
-        let key = self.key_for_uri(incoming_uri);
-        match self.open_docs.get(&key) {
-            Some(doc) => DocumentAction::Change {
-                uri: doc.uri.clone(),
-                version: doc.version + 1,
-                text: text.to_owned(),
-            },
-            None => DocumentAction::Open {
-                uri: path_to_uri(&key),
-                version: 1,
-                text: text.to_owned(),
-            },
-        }
-    }
-
-    pub fn planned_zed_change(&self, incoming_uri: &str, text: &str) -> Option<DocumentAction> {
-        let key = self.key_for_uri(incoming_uri);
-        let doc = self.open_docs.get(&key)?;
-        Some(DocumentAction::Change {
-            uri: doc.uri.clone(),
-            version: doc.version + 1,
-            text: text.to_owned(),
-        })
-    }
-
     pub fn zed_open(&mut self, incoming_uri: &str, text: String) -> DocumentAction {
         let key = self.key_for_uri(incoming_uri);
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
@@ -358,47 +332,49 @@ fn scan_directory(
     diagnose_addons: bool,
     documents: &mut Vec<ScannedDocument>,
 ) {
-    let mut entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries.flatten().collect::<Vec<_>>(),
-        Err(error) => {
-            crate::warn!(
-                "skipping unreadable diagnostics directory {}: {error}",
-                directory.display()
-            );
-            return;
-        }
-    };
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+    let mut directories = vec![directory.to_owned()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries.flatten().collect::<Vec<_>>(),
             Err(error) => {
                 crate::warn!(
-                    "skipping unreadable diagnostics entry {}: {error}",
-                    path.display()
+                    "skipping unreadable diagnostics directory {}: {error}",
+                    directory.display()
                 );
                 continue;
             }
         };
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            if directory_is_skipped(&path, project, diagnose_addons) {
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    crate::warn!(
+                        "skipping unreadable diagnostics entry {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
                 continue;
             }
-            scan_directory(&path, project, diagnose_addons, documents);
-            continue;
+            if file_type.is_dir() {
+                if !directory_is_skipped(&path, project, diagnose_addons) {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || path.extension() != Some(OsStr::new("gd")) {
+                continue;
+            }
+            let Some(text) = read_document(&path) else {
+                continue;
+            };
+            let key = canonical_or_normalized(&path);
+            documents.push(ScannedDocument { path, key, text });
         }
-        if !file_type.is_file() || path.extension() != Some(OsStr::new("gd")) {
-            continue;
-        }
-        let Some(text) = read_document(&path) else {
-            continue;
-        };
-        let key = canonical_or_normalized(&path);
-        documents.push(ScannedDocument { path, key, text });
     }
 }
 

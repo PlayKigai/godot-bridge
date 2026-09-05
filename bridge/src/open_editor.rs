@@ -56,6 +56,7 @@ fn retry_handoff(files: &ProjectFiles, project: &Path) -> Result<ExitCode> {
         if Instant::now() >= deadline {
             crate::bail!("An owner exists but does not answer");
         }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -206,9 +207,21 @@ fn remove_files(files: &ProjectFiles) {
 }
 
 fn log_tail(path: &Path) -> String {
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return String::new();
     };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let offset = length.saturating_sub(64 * 1024);
+    if std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset)).is_err() {
+        return String::new();
+    }
+    let mut contents = String::new();
+    if std::io::Read::read_to_string(&mut reader, &mut contents).is_err() {
+        return String::new();
+    }
     contents
         .lines()
         .rev()
