@@ -3,3 +3,10 @@ extension/*.wasm
 extension/grammars/
 .env
 .env.*
+.claude/
+.opencode/
+.codex/
+.agents/
+AGENTS.md
+CLAUDE.md
+.DS_Store
