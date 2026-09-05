@@ -21,11 +21,19 @@ fn minimal_project_diagnostics_and_cleanup() {
     }));
     let diagnostics = client.receive_until(Duration::from_secs(60), |message| {
         message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["uri"] == file_uri(&project.join("other.gd"))
     });
-    assert!(!diagnostics["params"]["diagnostics"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        diagnostics["params"]["uri"],
+        file_uri(&project.join("other.gd"))
+    );
+    let diagnostic = &diagnostics["params"]["diagnostics"][0];
+    assert_eq!(diagnostic["severity"], 1);
+    let range = &diagnostic["range"];
+    for position in ["start", "end"] {
+        assert!(range[position]["line"].is_u64());
+        assert!(range[position]["character"].is_u64());
+    }
     close_and_wait(&mut client, runtime.path(), &project);
 }
 

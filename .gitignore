@@ -3,9 +3,3 @@ extension/*.wasm
 extension/grammars/
 .env
 .env.*
-*.pem
-*.key
-*.p12
-*.pfx
-*credentials*.json
-*secret*.json

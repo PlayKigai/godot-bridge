@@ -5,8 +5,8 @@ debugger. Linux only. Godot 4.x.
 
 - Highlighting for GDScript, `.tscn`/`.tres` resources and shaders.
 - Completion, hover, go to definition, rename, symbols from Godot's server.
-- Diagnostics for every script in the project, updated on disk changes.
-- Workspace symbol search across all scripts.
+- Diagnostics and workspace symbols across eligible scripts, skipping hidden
+  paths, addons, symlinks, invalid UTF-8, and files over 2 MiB.
 - Debugging: breakpoints, stepping, variables, launch or attach.
 - Tasks: run project, run current scene, open the Godot editor, class docs.
 - Godot runs headless. `godot: open editor` swaps to the GUI editor with

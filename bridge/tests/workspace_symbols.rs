@@ -32,12 +32,20 @@ fn workspace_symbol_finds_ready_function() {
         message.get("id") == Some(&json!(2))
     });
     let symbols = response["result"].as_array().unwrap();
-    assert!(
-        symbols.iter().any(|symbol| symbol["name"] == "_ready"
-            && symbol["location"]["uri"]
-                .as_str()
-                .unwrap()
-                .ends_with("/main.gd")),
-        "{response}"
-    );
+    let symbol = symbols
+        .iter()
+        .find(|symbol| symbol["name"] == "_ready")
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(symbol["kind"], 6);
+    let range = &symbol["location"]["range"];
+    for position in ["start", "end"] {
+        assert!(range[position]["line"].is_u64());
+        assert!(range[position]["character"].is_u64());
+    }
+    assert!(symbol["location"]["uri"]
+        .as_str()
+        .unwrap()
+        .ends_with("/main.gd"));
+    assert_eq!(symbol["containerName"], "main.gd");
+    close_and_wait(&mut client, runtime.path(), &project);
 }

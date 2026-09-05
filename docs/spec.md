@@ -6,15 +6,16 @@ the DAP (`godot-bridge dap`). Both proxy stdio to the editor's TCP ports.
 
 ```
 Zed ──stdio──► godot-bridge lsp ──tcp──► Godot editor (headless)
-Zed ──stdio──► godot-bridge dap ──tcp──►     ": --lsp-port, --dap-port
-                     │ owns, kills, respawns ─┘
+Zed ──stdio──► godot-bridge dap ──tcp──►   --lsp-port, --dap-port
+                      └── owns, kills, respawns ──┘
 ```
 
 Godot facts the design rests on: Zed extensions cannot spawn processes.
 Godot LSP serves one client, uses full text sync, accepts one
 `Content-Length` header and frames up to 4 MiB, has no `workspace/*`
 methods, publishes diagnostics only for opened documents, and can crash
-under load. `bridge/` depends on `libc` only.
+under load. `bridge/` depends on `libc` at runtime; `serde_json` is a
+dev-dependency only.
 
 ## Subcommands
 

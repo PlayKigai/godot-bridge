@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -13,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub enum Protocol {
     Lsp,
+    #[allow(dead_code)]
     Dap,
 }
 
@@ -98,7 +97,11 @@ impl BridgeClient {
         stdin.flush().unwrap();
     }
 
-    pub fn receive_until(&self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
+    pub fn receive_until(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&Value) -> bool,
+    ) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
@@ -133,12 +136,25 @@ pub fn file_uri(path: &Path) -> String {
 }
 
 pub fn godot_available(test: &str) -> bool {
-    if Path::new("/usr/bin/godot").is_file() {
+    if godot_path().is_some() {
         true
     } else {
-        println!("skipping {test}: /usr/bin/godot is missing");
+        println!("skipping {test}: Godot is missing");
         false
     }
+}
+
+fn godot_path() -> Option<PathBuf> {
+    let mut candidates = std::env::var_os("GODOT")
+        .into_iter()
+        .map(PathBuf::from)
+        .chain(std::env::var_os("PATH").into_iter().flat_map(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("godot"))
+                .collect::<Vec<_>>()
+        }))
+        .chain(std::iter::once(PathBuf::from("/usr/bin/godot")));
+    candidates.find(|path| path.is_file())
 }
 
 pub fn initialize_lsp(client: &mut BridgeClient, project: &Path) -> Value {
@@ -148,7 +164,7 @@ pub fn initialize_lsp(client: &mut BridgeClient, project: &Path) -> Value {
         "method": "initialize",
         "params": {
             "workspaceFolders": [{"uri": file_uri(project), "name": "fixture"}],
-            "initializationOptions": {"godot_path": "/usr/bin/godot", "startup_timeout_s": 60}
+            "initializationOptions": {"godot_path": godot_path().unwrap(), "startup_timeout_s": 60}
         }
     }));
     client.receive_until(Duration::from_secs(60), |message| {
@@ -156,6 +172,7 @@ pub fn initialize_lsp(client: &mut BridgeClient, project: &Path) -> Value {
     })
 }
 
+#[allow(dead_code)]
 pub fn initialize_dap(client: &mut BridgeClient) -> Value {
     client.send(json!({
         "seq": 1,
@@ -178,6 +195,7 @@ fn project_hash(project: &Path) -> String {
     )
 }
 
+#[allow(dead_code)]
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
     let hash = project_hash(project);
     let state = runtime.join("godot-bridge").join(format!("{hash}.json"));
@@ -185,6 +203,7 @@ pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
     (state, value)
 }
 
+#[allow(dead_code)]
 pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path) {
     let (state_path, state) = runtime_state(runtime, project);
     let godot_pid = state["godot_pid"].as_u64().unwrap();
@@ -210,11 +229,13 @@ pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path)
         .exists());
 }
 
+#[allow(dead_code)]
 pub fn runtime_socket(runtime: &Path, project: &Path) -> PathBuf {
     let hash = project_hash(project);
     runtime.join("godot-bridge").join(format!("{hash}.sock"))
 }
 
+#[allow(dead_code)]
 pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     let mut stream = UnixStream::connect(runtime_socket(runtime, project)).ok()?;
     stream
@@ -229,6 +250,7 @@ pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     serde_json::from_str(&line).ok()
 }
 
+#[allow(dead_code)]
 pub fn wait_for_ready(runtime: &Path, project: &Path) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -242,6 +264,7 @@ pub fn wait_for_ready(runtime: &Path, project: &Path) -> Value {
     }
 }
 
+#[allow(dead_code)]
 pub fn child_pids(pid: u64) -> Vec<u32> {
     std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .unwrap_or_default()
@@ -250,6 +273,7 @@ pub fn child_pids(pid: u64) -> Vec<u32> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn copy_directory(source: &Path, destination: &Path) {
     std::fs::create_dir_all(destination).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
@@ -264,6 +288,7 @@ pub fn copy_directory(source: &Path, destination: &Path) {
     }
 }
 
+#[allow(dead_code)]
 pub fn status(runtime: &Path, project: &Path, config: &Path) -> Option<Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
         .arg("status")
@@ -279,6 +304,7 @@ pub fn status(runtime: &Path, project: &Path, config: &Path) -> Option<Value> {
         .find_map(|line| serde_json::from_slice(line).ok())
 }
 
+#[allow(dead_code)]
 pub fn wait_for_status(
     runtime: &Path,
     project: &Path,

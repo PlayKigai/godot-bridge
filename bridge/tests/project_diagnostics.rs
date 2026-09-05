@@ -55,4 +55,5 @@ fn project_diagnostics_scan_create_and_remove() {
         .as_array()
         .unwrap()
         .is_empty());
+    close_and_wait(&mut client, runtime.path(), project.path());
 }

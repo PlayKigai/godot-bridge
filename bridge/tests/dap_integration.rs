@@ -65,23 +65,17 @@ fn dap_with_owner_launches_and_terminates_game() {
         "arguments": {"adapter": "godot", "request": "launch", "scene": "main"}
     }));
     dap.send(json!({"type":"request","seq":3,"command":"configurationDone"}));
-    let first_event = dap.receive_until(Duration::from_secs(60), |message| {
+    let mut seen_process = false;
+    dap.receive_until(Duration::from_secs(60), |message| {
         assert!(
             !(message["type"] == "event"
                 && (message["event"] == "exited" || message["event"] == "terminated"))
         );
-        message["type"] == "event"
-            && (message["event"] == "process" || message["event"] == "output")
+        if message["type"] == "event" && message["event"] == "process" {
+            seen_process = true;
+        }
+        seen_process
     });
-    if first_event["event"] != "process" {
-        dap.receive_until(Duration::from_secs(60), |message| {
-            assert!(
-                !(message["type"] == "event"
-                    && (message["event"] == "exited" || message["event"] == "terminated"))
-            );
-            message["type"] == "event" && message["event"] == "process"
-        });
-    }
     let game_deadline = Instant::now() + Duration::from_secs(60);
     let game_pid = loop {
         if let Some(pid) = child_pids(editor_pid)
