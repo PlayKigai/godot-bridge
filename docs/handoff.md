@@ -1,18 +1,28 @@
 # Handoff
 
-State as of 2026-09-04, commit 8495a58.
+State as of 2026-09-05, after 20b2ae3.
 
 ## Done
 
 - Full implementation per SPEC.md v11, all 22 TASKS.md items ticked.
-  Verified on DieQuest: LSP start, crash recovery, DAP breakpoint hit,
-  1056 diagnostics in 7 s, symbol search 21 ms, GUI hand-off and swap back.
-- Review round 1 (simplicity, performance, security) fixed in the bridge.
-  Agent report with per-item outcomes is summarized in the commit message.
-- Extension fix round done (73983e6). Extension depends on
-  `zed_extension_api` only.
-- Dependency elimination plan agreed by two independent analyses:
-  `docs/deps-plan.md`. Not started.
+  Verified on DieQuest at 8495a58: LSP start, crash recovery, DAP
+  breakpoint hit, GUI hand-off and swap back.
+- Extension depends on `zed_extension_api` only (73983e6).
+- Dependency elimination per `docs/deps-plan.md`, all 12 steps. The bridge
+  depends on `libc` only; `serde_json` stays as a dev dependency for the
+  differential JSON parser test.
+- Performance pass and eight review rounds (simplicity, performance,
+  security), then a final codex review. All said ship. Details in
+  `docs/review-log.md`, round 13 onward.
+
+## Measured at b6eeaac (release, 1056 file project)
+
+- Load: 1056 diagnostics in 3.3 s, bridge CPU 50 ms.
+- RSS: 3.7 MB after initialize, 8.3 MB after load and symbol fill.
+- didChange of 52 KB: about 80 us main thread CPU. Small frames: about 1 us.
+- Symbol search round trip: 0.26 ms for "ready", 0.43 ms for "" on 21.8k
+  symbols.
+- Idle: 0 wakeups on all 7 threads.
 
 ## Checks
 
@@ -22,23 +32,37 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p godot-bridge
 ```
 
-All green at 8495a58: 56 unit tests, 6 integration binaries.
+All green at b6eeaac: 98 unit tests, 6 integration binaries. Five
+concurrent full-suite runs pass.
+
+## Supply chain gates (2026-09-05)
+
+- `deny.toml`: yanked deny, wildcards deny, multiple versions warn, license
+  allowlist, crates.io only. Own crates are `publish = false` and skipped
+  by the license check because the repo has no license yet.
+- `supply-chain/`: cargo vet with six imports (bytecode-alliance, embark,
+  google, isrg, mozilla, zcash). Baseline: 26 audited, 1 partial,
+  61 exempted of 88 crates. New crates fail `cargo vet` until audited or
+  exempted on purpose.
+- `scripts/check_build_scripts.py`: fails when a crate with a build script
+  or proc macro is missing from `scripts/build_scripts.allow` (24 today).
+- CI: `cargo fetch --locked` then every cargo step `--locked --offline`,
+  cargo-deny, cargo-audit, cargo-vet on each push, cargo-geiger weekly
+  (informational, its output is not asserted). Actions pinned to commit
+  SHAs, Dependabot bumps them. Token is read-only except the audit report.
+- The build-script allowlist is name only. A version bump of an allowed
+  crate is caught by cargo vet, which pins exact versions.
+- Local run: `cargo deny check`, `cargo audit`, `cargo vet`,
+  `python3 scripts/check_build_scripts.py`.
 
 ## Next, in order
 
-1. Dependency elimination per `docs/deps-plan.md`, steps 1 to 12, tokio last.
-   One implementer at a time, the whole bridge is one ownership unit.
-   Each step: suite green, commit.
-2. Supply chain gates: `deny.toml` (yanked deny, wildcards deny,
-   multiple-versions warn, license allowlist, crates.io only),
-   `cargo vet init` with imports, CI running cargo-deny, cargo-audit,
-   weekly cargo-geiger, build-script and proc-macro allowlist via
-   `cargo metadata`, `cargo build --locked --offline`.
-   After step 1 the tree is `libc` only, so most of this is a guard against
-   future additions.
-3. Review round 2: simplicity, performance, security lenses again until all
-   three say ship. Then reinstall the bridge, rebuild the extension wasm,
-   restart Zed, re-verify on DieQuest.
+1. Restart Zed and re-verify on DieQuest with the reinstalled bridge and
+   the rebuilt extension wasm (both from HEAD, 2026-09-05).
+2. Pick a license and add `LICENSE`, then drop `private.ignore` in
+   `deny.toml`.
+3. Deferred perf item, opt-in only: the didChange rewrite re-escapes the
+   text (about 20 us of the 80 us). Not worth the code at typing rates.
 
 ## Machine setup
 
@@ -52,9 +76,11 @@ All green at 8495a58: 56 unit tests, 6 integration binaries.
 
 ## Agents
 
-- codex profiles (`run-opencode`) were rate limited all day. Retry first.
-  If still limited, use Claude Opus agents with these rules in every prompt:
-  zero comments, smallest code that passes, no speculative abstractions,
-  plain names over comments.
+- codex profiles (`run-opencode`) work but the wrapper sometimes dies
+  mid-run (exit 143) after the work is staged or committed. Check
+  `git status` and `git log` before rerouting. Fallback: Claude agents with
+  these rules in every prompt: zero comments, smallest code that passes,
+  no speculative abstractions, plain names over comments.
+- Codex shell policy blocks `git commit`; it stages, you commit.
 - Concurrent in-place agents on the same crate see each other's half edits.
   Run bridge work serially or in worktrees.

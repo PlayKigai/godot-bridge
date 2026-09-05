@@ -110,8 +110,17 @@ impl WatcherState {
             if directory_is_skipped(&directory, &self.project, self.diagnose_addons) {
                 continue;
             }
-            if !self.add_watch(&directory)? {
-                continue;
+            match self.add_watch(&directory) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) if directory != root => {
+                    crate::warn!(
+                        "skipping unwatchable diagnostics directory {}: {error}",
+                        directory.display()
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
             let entries = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries,
