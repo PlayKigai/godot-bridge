@@ -39,6 +39,7 @@ fn dap_with_owner_launches_and_terminates_game() {
     if !godot_available("DAP integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut owner = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);

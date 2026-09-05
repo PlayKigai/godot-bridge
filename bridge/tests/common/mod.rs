@@ -7,12 +7,22 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub enum Protocol {
     Lsp,
     Dap,
+}
+
+static GODOT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn lock_godot() -> MutexGuard<'static, ()> {
+    GODOT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct BridgeClient {
@@ -159,7 +169,13 @@ pub fn initialize_dap(client: &mut BridgeClient) -> Value {
 }
 
 fn project_hash(project: &Path) -> String {
-    godot_bridge::fnv::hash_hex(project.canonicalize().unwrap().to_string_lossy().as_bytes())
+    let path = project.canonicalize().unwrap();
+    let path = path.to_string_lossy();
+    format!(
+        "{}-{}",
+        godot_bridge::fnv::hash_hex(path.as_bytes()),
+        path.len()
+    )
 }
 
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {

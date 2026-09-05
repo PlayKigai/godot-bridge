@@ -6,83 +6,110 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::framing::{parse_json_object, spawn_frame_reader, write_json, FrameEvent, FrameReader};
+use crate::framing::{
+    connect_with_reader, parse_json_object, spawn_frame_reader, write_frame, write_json,
+    Connection, FrameDecoder, FrameError, ReadEvent,
+};
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
-use crate::settings_file::{parse_settings, Settings};
+use crate::settings_file::{parse_trusted_settings, Settings};
 use crate::state::{socket_request, try_lock, LockGuard, ProjectFiles};
 
-const FRAME_CAP: usize = 64 * 1024 * 1024;
-const BUFFER_CAP: usize = 64 * 1024 * 1024;
+const FRAME_CAP: usize = 8 * 1024 * 1024;
+const BUFFER_CAP: usize = 8 * 1024 * 1024;
 const SOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 struct Prepared {
     connection: Connection,
-    lock: DapLock,
+    lock: LockGuard,
     project: PathBuf,
     file: Option<PathBuf>,
 }
 
-struct Connection {
-    socket: TcpStream,
-    reader: Option<Receiver<FrameEvent>>,
-    reader_thread: Option<JoinHandle<()>>,
-    writer: TcpStream,
+struct ClientBuffer {
+    messages: VecDeque<Vec<u8>>,
+    bytes: usize,
 }
 
-impl Connection {
-    fn from_stream(stream: TcpStream) -> io::Result<Self> {
-        let reader_stream = stream.try_clone()?;
-        let writer = stream.try_clone()?;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let reader_thread =
-            spawn_frame_reader("godot-bridge-dap-reader", reader_stream, FRAME_CAP, sender)?;
-        Ok(Self {
-            socket: stream,
-            reader: Some(receiver),
-            reader_thread: Some(reader_thread),
-            writer,
-        })
-    }
+#[derive(Clone, Copy)]
+enum DapSide {
+    Client,
+    Godot,
+}
 
-    fn try_read_frame(&self) -> Option<FrameEvent> {
-        self.reader.as_ref()?.try_recv().ok()
-    }
+enum DapReadEvent {
+    Client(ReadEvent),
+    Godot(ReadEvent),
+    Prepared(std::result::Result<Prepared, String>),
+}
 
-    fn close(&mut self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
-        drop(self.reader.take());
-        if let Some(reader_thread) = self.reader_thread.take() {
-            let _ = reader_thread.join();
+enum DapFrame {
+    Body(DapSide, Vec<u8>),
+    End(DapSide),
+    Prepared(std::result::Result<Prepared, String>),
+}
+
+struct DapInput {
+    receiver: Receiver<DapReadEvent>,
+    client_decoder: FrameDecoder,
+    godot_decoder: FrameDecoder,
+    client_eof: bool,
+    godot_eof: bool,
+    pending: VecDeque<DapFrame>,
+}
+
+impl DapInput {
+    fn new(receiver: Receiver<DapReadEvent>) -> Self {
+        Self {
+            receiver,
+            client_decoder: FrameDecoder::new(FRAME_CAP),
+            godot_decoder: FrameDecoder::new(FRAME_CAP),
+            client_eof: false,
+            godot_eof: false,
+            pending: VecDeque::new(),
         }
     }
-}
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.close();
+    fn defer(&mut self, frame: DapFrame) {
+        self.pending.push_back(frame);
     }
-}
 
-struct DapLock {
-    guard: Option<LockGuard>,
-}
-
-impl Drop for DapLock {
-    fn drop(&mut self) {
-        self.guard.take();
+    fn recv_frame(&mut self) -> std::result::Result<DapFrame, FrameError> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Ok(frame);
+            }
+            if let Some(body) = self.client_decoder.next_frame()? {
+                return Ok(DapFrame::Body(DapSide::Client, body.to_owned()));
+            }
+            if let Some(body) = self.godot_decoder.next_frame()? {
+                return Ok(DapFrame::Body(DapSide::Godot, body.to_owned()));
+            }
+            if self.client_eof {
+                return Ok(DapFrame::End(DapSide::Client));
+            }
+            if self.godot_eof {
+                return Ok(DapFrame::End(DapSide::Godot));
+            }
+            match self.receiver.recv() {
+                Ok(DapReadEvent::Client(Ok(Some(chunk)))) => self.client_decoder.push(&chunk),
+                Ok(DapReadEvent::Godot(Ok(Some(chunk)))) => self.godot_decoder.push(&chunk),
+                Ok(DapReadEvent::Client(Ok(None))) => self.client_eof = true,
+                Ok(DapReadEvent::Godot(Ok(None))) => self.godot_eof = true,
+                Ok(DapReadEvent::Client(Err(error))) | Ok(DapReadEvent::Godot(Err(error))) => {
+                    return Err(FrameError::Io(error));
+                }
+                Ok(DapReadEvent::Prepared(result)) => return Ok(DapFrame::Prepared(result)),
+                Err(_) => return Err(FrameError::Io(io::Error::other("reader is closed"))),
+            }
+        }
     }
-}
-
-struct ClientBuffer {
-    messages: VecDeque<Value>,
-    bytes: usize,
 }
 
 impl ClientBuffer {
@@ -93,7 +120,7 @@ impl ClientBuffer {
         }
     }
 
-    fn push(&mut self, body: Vec<u8>) -> std::result::Result<(), ()> {
+    fn push(&mut self, body: &[u8]) -> std::result::Result<(), ()> {
         let size = body.len();
         if self
             .bytes
@@ -102,17 +129,15 @@ impl ClientBuffer {
         {
             return Err(());
         }
-        let message = parse_message(&body).map_err(|_| ())?;
+        crate::json::scan_top_level(body).map_err(|_| ())?;
         self.bytes += size;
-        self.messages.push_back(message);
+        self.messages.push_back(body.to_owned());
         Ok(())
     }
 
-    fn pop(&mut self) -> Option<Value> {
+    fn pop(&mut self) -> Option<Vec<u8>> {
         let message = self.messages.pop_front()?;
-        self.bytes = self
-            .bytes
-            .saturating_sub(crate::json::to_vec(&message).len());
+        self.bytes = self.bytes.saturating_sub(message.len());
         Some(message)
     }
 }
@@ -150,44 +175,55 @@ impl<W: Write> ClientOutput<W> {
 }
 
 struct ServerRequests {
-    original_sequences: HashMap<i64, Value>,
+    original_sequences: HashMap<crate::json::RequestKey, Value>,
+    keys: crate::lsp::RequestKeys,
 }
 
 impl ServerRequests {
     fn new() -> Self {
         Self {
             original_sequences: HashMap::new(),
+            keys: crate::lsp::RequestKeys::default(),
         }
     }
 
     fn rewrite(&mut self, message: &mut Value, bridge_seq: i64) {
         if message.get("type").and_then(Value::as_str) == Some("request") {
             if let Some(original) = message.get("seq").cloned() {
-                self.original_sequences.insert(bridge_seq, original);
+                let key = crate::json::RequestKey::Number(bridge_seq);
+                if self
+                    .original_sequences
+                    .insert(key.clone(), original)
+                    .is_none()
+                {
+                    self.keys.insert(key);
+                    self.original_sequences
+                        .retain(|key, _| self.keys.contains(key));
+                }
             }
         }
-        message["seq"] = crate::json!(bridge_seq);
     }
 
     fn restore_response(&mut self, message: &mut Value) {
         if message.get("type").and_then(Value::as_str) != Some("response") {
             return;
         }
-        let Some(request_seq) = message.get("request_seq").and_then(Value::as_i64) else {
+        let Some(request_seq) = message.get("request_seq") else {
             return;
         };
-        if let Some(original) = self.original_sequences.remove(&request_seq) {
-            message["request_seq"] = original;
+        if let Some(key) = crate::json::value_request_key(request_seq) {
+            if let Some(original) = self.original_sequences.remove(&key) {
+                self.keys.remove(&key);
+                message["request_seq"] = original;
+            }
         }
     }
 }
 
-enum ForwardClient {
-    Failure {
-        request_seq: Value,
-        command: String,
-        message: String,
-    },
+struct RequestFailure {
+    request_seq: Value,
+    command: String,
+    message: String,
 }
 
 enum InitializeWait {
@@ -198,85 +234,120 @@ enum InitializeWait {
 }
 
 pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
-    let mut input_reader = FrameReader::new(std::io::stdin(), FRAME_CAP);
-    let first = match input_reader.read_frame() {
-        Ok(Some(body)) => body,
-        Ok(None) => return Ok(ExitCode::SUCCESS),
-        Err(_) => return Ok(ExitCode::from(1)),
-    };
-    let initialize = match parse_message(&first) {
-        Ok(message)
-            if message.get("type").and_then(Value::as_str) == Some("request")
-                && message.get("command").and_then(Value::as_str) == Some("initialize") =>
-        {
-            message
-        }
-        Ok(_) | Err(_) => return Ok(ExitCode::from(1)),
-    };
-
     let (sender, receiver) = mpsc::sync_channel(1);
     let _input_thread = spawn_frame_reader(
         "godot-bridge-dap-client-reader",
-        input_reader.into_inner(),
-        FRAME_CAP,
-        sender,
+        std::io::stdin(),
+        sender.clone(),
+        DapReadEvent::Client,
     )?;
+    let mut input = DapInput::new(receiver);
+    let initialize = loop {
+        match input.recv_frame()? {
+            DapFrame::Body(DapSide::Client, body) => {
+                let message = match parse_message(&body) {
+                    Ok(message) => message,
+                    Err(_) => return Ok(ExitCode::from(1)),
+                };
+                if message.get("type").and_then(Value::as_str) == Some("request")
+                    && message.get("command").and_then(Value::as_str) == Some("initialize")
+                {
+                    break message;
+                }
+                return Ok(ExitCode::from(1));
+            }
+            DapFrame::Body(side, body) => input.defer(DapFrame::Body(side, body)),
+            DapFrame::End(DapSide::Client) => return Ok(ExitCode::SUCCESS),
+            DapFrame::End(DapSide::Godot) => return Ok(ExitCode::from(1)),
+            DapFrame::Prepared(_) => return Ok(ExitCode::from(1)),
+        }
+    };
+
     let mut output = ClientOutput::new(std::io::stdout());
     let mut buffer = ClientBuffer::new();
+    let mut early_frames = VecDeque::new();
+    let mut early_bytes = 0;
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = Arc::clone(&cancel);
-    let (prepared_sender, prepared_receiver) = mpsc::channel();
+    let prepared_sender = sender.clone();
+    let reader_sender = sender.clone();
     let worker = thread::Builder::new()
         .name("godot-bridge-dap-prepare".to_owned())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let result = prepare(file.as_deref(), &cancel_for_worker);
-            let _ = prepared_sender.send(result);
+            let result = prepare(file.as_deref(), &cancel_for_worker, reader_sender);
+            let _ = prepared_sender.send(DapReadEvent::Prepared(result));
         })?;
     let prepared = loop {
-        match prepared_receiver.try_recv() {
-            Ok(result) => break result,
-            Err(TryRecvError::Disconnected) => {
-                return Ok(ExitCode::from(1));
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-        match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(Some(body))) => {
-                if buffer.push(body).is_err() {
+        match input.recv_frame()? {
+            DapFrame::Body(DapSide::Client, body) => {
+                if buffer.push(&body).is_err() {
                     cancel.store(true, Ordering::Release);
                     return Ok(ExitCode::from(1));
                 }
             }
-            Ok(Ok(None)) => {
-                cancel.store(true, Ordering::Release);
-                return Ok(ExitCode::SUCCESS);
+            DapFrame::Body(side, body) => {
+                if body.len() > BUFFER_CAP {
+                    cancel.store(true, Ordering::Release);
+                    return Ok(ExitCode::from(1));
+                }
+                early_bytes += body.len();
+                early_frames.push_back(DapFrame::Body(side, body));
+                while early_bytes > BUFFER_CAP {
+                    let Some(frame) = early_frames.pop_front() else {
+                        break;
+                    };
+                    if let DapFrame::Body(_, body) = frame {
+                        early_bytes -= body.len();
+                    }
+                }
             }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                cancel.store(true, Ordering::Release);
-                return Ok(ExitCode::from(1));
+            DapFrame::End(side) => {
+                early_frames.push_back(DapFrame::End(side));
+                if matches!(side, DapSide::Client) {
+                    cancel.store(true, Ordering::Release);
+                    return Ok(ExitCode::from(1));
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            DapFrame::Prepared(result) => break result,
         }
     };
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
             output.failure(&initialize, &message)?;
             return Ok(ExitCode::from(1));
         }
     };
-    let result = run_session(initialize, prepared, &mut output, &receiver, &mut buffer);
+    for frame in early_frames {
+        input.defer(frame);
+    }
+    let project = prepared.project.clone();
+    let file = prepared.file.clone();
+    let result = run_session_inner(
+        &initialize,
+        &mut prepared.connection,
+        &mut output,
+        &mut input,
+        &mut buffer,
+        &project,
+        file.as_deref(),
+    );
+    drop(prepared.lock);
     let _ = worker.join();
     result
 }
 
-fn prepare(file: Option<&Path>, cancel: &AtomicBool) -> std::result::Result<Prepared, String> {
+fn prepare(
+    file: Option<&Path>,
+    cancel: &AtomicBool,
+    sender: mpsc::SyncSender<DapReadEvent>,
+) -> std::result::Result<Prepared, String> {
     if cancel.load(Ordering::Acquire) {
         return Err("DAP startup cancelled".to_owned());
     }
-    let settings = read_settings()?;
     let root = cwd_root().map_err(|error| error.to_string())?;
+    let settings = read_settings(&root)?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
     if let Some(file) = file {
@@ -290,7 +361,7 @@ fn prepare(file: Option<&Path>, cancel: &AtomicBool) -> std::result::Result<Prep
     }
     let files = ProjectFiles::new(&project).map_err(|error| error.to_string())?;
     let lock = match try_lock(&files.dap_lock).map_err(|error| error.to_string())? {
-        Some(guard) => DapLock { guard: Some(guard) },
+        Some(guard) => guard,
         None => {
             return Err(format!(
                 "A debug session for {} is already running",
@@ -304,7 +375,13 @@ fn prepare(file: Option<&Path>, cancel: &AtomicBool) -> std::result::Result<Prep
     } else {
         discover_owner(&files, &project, &settings, cancel)?
     };
-    let connection = Connection::from_stream(stream).map_err(|error| error.to_string())?;
+    let connection = connect_with_reader(
+        stream,
+        "godot-bridge-dap-reader",
+        sender,
+        DapReadEvent::Godot,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Prepared {
         connection,
         lock,
@@ -313,7 +390,7 @@ fn prepare(file: Option<&Path>, cancel: &AtomicBool) -> std::result::Result<Prep
     })
 }
 
-fn read_settings() -> std::result::Result<Settings, String> {
+fn read_settings(worktree: &Path) -> std::result::Result<Settings, String> {
     let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
         Ok(contents) if contents.len() <= 1024 * 1024 => crate::json::from_str(&contents)
             .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
@@ -321,7 +398,7 @@ fn read_settings() -> std::result::Result<Settings, String> {
         Err(std::env::VarError::NotPresent) => Value::Null,
         Err(error) => return Err(format!("cannot read GODOT_BRIDGE_SETTINGS: {error}")),
     };
-    parse_settings(&value)
+    parse_trusted_settings(&value, worktree)
 }
 
 fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {
@@ -367,7 +444,7 @@ fn discover_owner(
         }
         let status = socket_request(
             &files.sock,
-            &crate::json!({"cmd": "status", "project": (project.to_string_lossy())}),
+            &crate::json!({"cmd": "status", "project": (project.to_string_lossy().into_owned())}),
             timeout,
         )
         .map_err(|_| no_owner.clone())?;
@@ -400,47 +477,18 @@ fn discover_owner(
     }
 }
 
-fn run_session(
-    initialize: Value,
-    mut prepared: Prepared,
-    output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
-    buffer: &mut ClientBuffer,
-) -> Result<ExitCode> {
-    let project = prepared.project.clone();
-    let file = prepared.file.clone();
-    let result = run_session_inner(
-        &initialize,
-        &mut prepared.connection,
-        output,
-        receiver,
-        buffer,
-        &project,
-        file.as_deref(),
-    );
-    drop(prepared.lock);
-    result
-}
-
 fn run_session_inner(
     initialize: &Value,
     connection: &mut Connection,
     output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
+    input: &mut DapInput,
     buffer: &mut ClientBuffer,
     project: &Path,
     file: Option<&Path>,
 ) -> Result<ExitCode> {
     let mut server_requests = ServerRequests::new();
     send_to_godot(&mut connection.writer, initialize)?;
-    match wait_for_initialize(
-        initialize,
-        connection,
-        output,
-        receiver,
-        buffer,
-        &mut server_requests,
-    )? {
+    match wait_for_initialize(initialize, output, input, buffer, &mut server_requests)? {
         InitializeWait::Ready => {}
         InitializeWait::ClientEof => return Ok(ExitCode::SUCCESS),
         InitializeWait::ClientInvalid | InitializeWait::GodotDead => {
@@ -448,107 +496,36 @@ fn run_session_inner(
         }
     }
 
-    while let Some(message) = buffer.pop() {
+    while let Some(body) = buffer.pop() {
         if let Some(result) =
-            forward_client(message, &mut server_requests, connection, project, file)?
+            forward_client_body(&body, &mut server_requests, connection, project, file)?
         {
-            let ForwardClient::Failure {
-                request_seq,
-                command,
-                message,
-            } = result;
-            send_request_failure(output, request_seq, command, message)?;
+            send_request_failure(output, result)?;
         }
     }
 
     let mut process_seen = false;
-    let mut turn = false;
     loop {
-        let server_event = turn;
-        let event = if server_event {
-            connection.try_read_frame()
-        } else {
-            receiver.try_recv().ok()
-        };
-        turn = !turn;
-        if let Some(event) = event {
-            match event {
-                Ok(Some(body)) => {
-                    if !server_event {
-                        let message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => return Ok(ExitCode::from(1)),
-                        };
-                        if let Some(result) = forward_client(
-                            message,
-                            &mut server_requests,
-                            connection,
-                            project,
-                            file,
-                        )? {
-                            let ForwardClient::Failure {
-                                request_seq,
-                                command,
-                                message,
-                            } = result;
-                            send_request_failure(output, request_seq, command, message)?;
-                        }
-                    } else {
-                        let mut message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => return godot_died(output),
-                        };
-                        if !should_forward_server_event(&message, &mut process_seen) {
-                            continue;
-                        }
-                        server_requests.restore_response(&mut message);
-                        let seq = output.next_seq;
-                        server_requests.rewrite(&mut message, seq);
-                        output.send(message)?;
-                    }
-                }
-                Ok(None) => {
-                    if server_event {
-                        return godot_died(output);
-                    }
-                    return Ok(ExitCode::SUCCESS);
-                }
-                Err(_) => {
-                    return if server_event {
-                        godot_died(output)
-                    } else {
-                        Ok(ExitCode::from(1))
-                    }
+        match input.recv_frame()? {
+            DapFrame::Body(DapSide::Godot, body) => {
+                let mut message = parse_message(&body)?;
+                if should_forward_server_event(&message, &mut process_seen) {
+                    server_requests.restore_response(&mut message);
+                    let seq = output.next_seq;
+                    server_requests.rewrite(&mut message, seq);
+                    output.send(message)?;
                 }
             }
-            continue;
-        }
-        let event = if turn {
-            receiver.recv_timeout(Duration::from_millis(20))
-        } else {
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        };
-        match event {
-            Ok(Ok(Some(body))) => {
-                let message = match parse_message(&body) {
-                    Ok(message) => message,
-                    Err(_) => return Ok(ExitCode::from(1)),
-                };
-                if let Some(result) =
-                    forward_client(message, &mut server_requests, connection, project, file)?
+            DapFrame::Body(DapSide::Client, body) => {
+                if let Some(failure) =
+                    forward_client_body(&body, &mut server_requests, connection, project, file)?
                 {
-                    let ForwardClient::Failure {
-                        request_seq,
-                        command,
-                        message,
-                    } = result;
-                    send_request_failure(output, request_seq, command, message)?;
+                    send_request_failure(output, failure)?;
                 }
             }
-            Ok(Ok(None)) => return Ok(ExitCode::SUCCESS),
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ExitCode::from(1)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            DapFrame::End(DapSide::Godot) => return godot_died(output),
+            DapFrame::End(DapSide::Client) => return Ok(ExitCode::SUCCESS),
+            DapFrame::Prepared(_) => return Ok(ExitCode::from(1)),
         }
     }
 }
@@ -571,84 +548,70 @@ fn should_forward_server_event(message: &Value, process_seen: &mut bool) -> bool
 
 fn wait_for_initialize(
     initialize: &Value,
-    connection: &mut Connection,
     output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
+    input: &mut DapInput,
     buffer: &mut ClientBuffer,
     server_requests: &mut ServerRequests,
 ) -> Result<InitializeWait> {
     let initialize_seq = initialize.get("seq").cloned().unwrap_or(Value::Null);
-    let mut turn = false;
     loop {
-        let server_event = turn;
-        let event = if server_event {
-            connection.try_read_frame()
-        } else {
-            receiver.try_recv().ok()
-        };
-        turn = !turn;
-        if let Some(event) = event {
-            match event {
-                Ok(Some(body)) => {
-                    if !server_event {
-                        if buffer.push(body).is_err() {
-                            return Ok(InitializeWait::ClientInvalid);
-                        }
-                    } else {
-                        let mut message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => {
-                                godot_died(output)?;
-                                return Ok(InitializeWait::GodotDead);
-                            }
-                        };
-                        let is_initialize_response = message.get("type").and_then(Value::as_str)
-                            == Some("response")
-                            && message.get("command") == Some(&crate::json!("initialize"))
-                            && message.get("request_seq") == Some(&initialize_seq);
-                        server_requests.restore_response(&mut message);
-                        let seq = output.next_seq;
-                        server_requests.rewrite(&mut message, seq);
-                        output.send(message)?;
-                        if is_initialize_response {
-                            return Ok(InitializeWait::Ready);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    return if server_event {
-                        Ok(InitializeWait::GodotDead)
-                    } else {
-                        Ok(InitializeWait::ClientEof)
-                    }
-                }
-                Err(_) => {
-                    return if server_event {
-                        Ok(InitializeWait::GodotDead)
-                    } else {
-                        Ok(InitializeWait::ClientInvalid)
-                    }
+        match input.recv_frame()? {
+            DapFrame::Body(DapSide::Client, body) => {
+                if buffer.push(&body).is_err() {
+                    return Ok(InitializeWait::ClientInvalid);
                 }
             }
-            continue;
-        }
-        if turn {
-            match receiver.recv_timeout(Duration::from_millis(20)) {
-                Ok(Ok(Some(body))) => {
-                    if buffer.push(body).is_err() {
-                        return Ok(InitializeWait::ClientInvalid);
-                    }
+            DapFrame::Body(DapSide::Godot, body) => {
+                let mut message = parse_message(&body)?;
+                let is_initialize_response = message.get("type").and_then(Value::as_str)
+                    == Some("response")
+                    && message.get("command") == Some(&crate::json!("initialize"))
+                    && message.get("request_seq") == Some(&initialize_seq);
+                server_requests.restore_response(&mut message);
+                let seq = output.next_seq;
+                server_requests.rewrite(&mut message, seq);
+                output.send(message)?;
+                if is_initialize_response {
+                    return Ok(InitializeWait::Ready);
                 }
-                Ok(Ok(None)) => return Ok(InitializeWait::ClientEof),
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(InitializeWait::ClientInvalid)
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-        } else {
-            thread::sleep(Duration::from_millis(20));
+            DapFrame::End(DapSide::Client) => return Ok(InitializeWait::ClientEof),
+            DapFrame::End(DapSide::Godot) => return Ok(InitializeWait::GodotDead),
+            DapFrame::Prepared(_) => return Ok(InitializeWait::GodotDead),
         }
     }
+}
+
+fn forward_client_body(
+    body: &[u8],
+    server_requests: &mut ServerRequests,
+    connection: &mut Connection,
+    project: &Path,
+    file: Option<&Path>,
+) -> Result<Option<RequestFailure>> {
+    let fields = crate::json::scan_top_level(body)?;
+    if fields.type_.is_none_or(|value| !value.is_string()) {
+        return Err(crate::error::Error::new(
+            "DAP message type must be a string",
+        ));
+    }
+    let rewrite = fields
+        .type_
+        .is_some_and(|value| value.string_eq("response"))
+        || fields
+            .command
+            .is_some_and(|command| command.string_eq("launch") || command.string_eq("attach"));
+    if rewrite {
+        return forward_client(
+            parse_message(body)?,
+            server_requests,
+            connection,
+            project,
+            file,
+        );
+    }
+    send_to_godot_body(&mut connection.writer, body)?;
+    Ok(None)
 }
 
 fn forward_client(
@@ -657,7 +620,7 @@ fn forward_client(
     connection: &mut Connection,
     project: &Path,
     file: Option<&Path>,
-) -> Result<Option<ForwardClient>> {
+) -> Result<Option<RequestFailure>> {
     if message.get("type").and_then(Value::as_str) == Some("response") {
         server_requests.restore_response(&mut message);
     }
@@ -671,7 +634,7 @@ fn forward_client(
             match rewrite_launch_or_attach(&mut message, &command, project, file) {
                 Ok(()) => {}
                 Err((request_seq, message)) => {
-                    return Ok(Some(ForwardClient::Failure {
+                    return Ok(Some(RequestFailure {
                         request_seq,
                         command,
                         message,
@@ -686,16 +649,14 @@ fn forward_client(
 
 fn send_request_failure(
     output: &mut ClientOutput<std::io::Stdout>,
-    request_seq: Value,
-    command: String,
-    message: String,
+    failure: RequestFailure,
 ) -> Result<()> {
     output.send(crate::json!({
         "type": "response",
-        "request_seq": request_seq,
-        "command": command,
+        "request_seq": (failure.request_seq),
+        "command": (failure.command),
         "success": false,
-        "message": message,
+        "message": (failure.message),
     }))
 }
 
@@ -753,6 +714,11 @@ fn rewrite_launch_or_attach(
 fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
     write_json(writer, message, FRAME_CAP, true)?;
     Ok(())
+}
+
+fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<Option<RequestFailure>> {
+    write_frame(writer, body, FRAME_CAP)?;
+    Ok(None)
 }
 
 fn godot_died(output: &mut ClientOutput<std::io::Stdout>) -> Result<ExitCode> {

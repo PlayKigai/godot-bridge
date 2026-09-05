@@ -1,15 +1,18 @@
 use crate::json::{Map, Value};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SOCKET_CLIENT_CAP: usize = 16;
 const SOCKET_LINE_CAP: usize = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn not_found_ok(result: io::Result<()>) -> io::Result<()> {
     match result {
@@ -91,7 +94,11 @@ impl ProjectFiles {
                 format!("project path {} is not valid UTF-8", project.display()),
             )
         })?;
-        let hash = crate::fnv::hash_hex(project_str.as_bytes());
+        let hash = format!(
+            "{}-{}",
+            crate::fnv::hash_hex(project_str.as_bytes()),
+            project_str.len()
+        );
         let mut runtime = runtime_dir()?;
         let socket = runtime.join(format!("{hash}.sock"));
         if socket.as_os_str().len() > 100 {
@@ -178,46 +185,31 @@ pub enum Mode {
 
 impl State {
     pub fn to_value(&self) -> Value {
-        let mut object = Map::new();
-        object.insert("version".to_owned(), self.version.into());
-        object.insert("project".to_owned(), self.project.clone().into());
-        object.insert(
-            "status".to_owned(),
-            match self.status {
-                Status::Starting => "starting",
-                Status::Ready => "ready",
-                Status::Recovering => "recovering",
-            }
-            .into(),
-        );
-        object.insert(
-            "mode".to_owned(),
-            match self.mode {
-                Mode::Headless => "headless",
-                Mode::Gui => "gui",
-                Mode::Unmanaged => "unmanaged",
-            }
-            .into(),
-        );
-        object.insert("godot_pid".to_owned(), self.godot_pid.into());
-        object.insert("godot_pgid".to_owned(), self.godot_pgid.into());
-        object.insert("lsp_port".to_owned(), self.lsp_port.into());
-        object.insert("dap_port".to_owned(), self.dap_port.into());
-        object.insert("owner_pid".to_owned(), self.owner_pid.into());
-        object.insert(
-            "owner_start_ticks".to_owned(),
-            self.owner_start_ticks.into(),
-        );
-        object.insert(
-            "godot_start_ticks".to_owned(),
-            self.godot_start_ticks.into(),
-        );
-        object.insert("started_at".to_owned(), self.started_at.clone().into());
-        object.insert(
-            "bridge_version".to_owned(),
-            self.bridge_version.clone().into(),
-        );
-        Value::Object(object)
+        let status = match self.status {
+            Status::Starting => "starting",
+            Status::Ready => "ready",
+            Status::Recovering => "recovering",
+        };
+        let mode = match self.mode {
+            Mode::Headless => "headless",
+            Mode::Gui => "gui",
+            Mode::Unmanaged => "unmanaged",
+        };
+        crate::json!({
+            "version": (self.version),
+            "project": (self.project.clone()),
+            "status": status,
+            "mode": mode,
+            "godot_pid": (self.godot_pid),
+            "godot_pgid": (self.godot_pgid),
+            "lsp_port": (self.lsp_port),
+            "dap_port": (self.dap_port),
+            "owner_pid": (self.owner_pid),
+            "owner_start_ticks": (self.owner_start_ticks),
+            "godot_start_ticks": (self.godot_start_ticks),
+            "started_at": (self.started_at.clone()),
+            "bridge_version": (self.bridge_version.clone())
+        })
     }
 
     pub fn from_value(value: &Value) -> Result<Self, String> {
@@ -246,11 +238,11 @@ impl State {
             project: string_field(object, "project")?,
             status,
             mode,
-            godot_pid: optional_u32(object, "godot_pid")?,
-            godot_pgid: optional_u32(object, "godot_pgid")?,
-            lsp_port: optional_u16(object, "lsp_port")?,
-            dap_port: optional_u16(object, "dap_port")?,
-            owner_pid: optional_u32(object, "owner_pid")?,
+            godot_pid: optional_int(object, "godot_pid")?,
+            godot_pgid: optional_int(object, "godot_pgid")?,
+            lsp_port: optional_int(object, "lsp_port")?,
+            dap_port: optional_int(object, "dap_port")?,
+            owner_pid: optional_int(object, "owner_pid")?,
             owner_start_ticks: optional_u64(object, "owner_start_ticks")?,
             godot_start_ticks: optional_u64(object, "godot_start_ticks")?,
             started_at: string_field(object, "started_at")?,
@@ -282,18 +274,16 @@ fn optional_u64(object: &Map, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
-fn optional_u32(object: &Map, key: &str) -> Result<Option<u32>, String> {
+fn optional_int<T: TryFrom<u64>>(object: &Map, key: &str) -> Result<Option<T>, String> {
     optional_u64(object, key)?
-        .map(u32::try_from)
+        .map(T::try_from)
         .transpose()
-        .map_err(|_| format!("state.{key} must be a 32-bit integer or null"))
-}
-
-fn optional_u16(object: &Map, key: &str) -> Result<Option<u16>, String> {
-    optional_u64(object, key)?
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|_| format!("state.{key} must be a 16-bit integer or null"))
+        .map_err(|_| {
+            format!(
+                "state.{key} must be a {}-bit integer or null",
+                std::mem::size_of::<T>() * 8
+            )
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -461,13 +451,14 @@ where
     F: Fn(Value) -> Value + Send + Sync + 'static,
 {
     let path = path.as_ref().to_path_buf();
-    not_found_ok(std::fs::remove_file(&path))?;
-    let listener = UnixListener::bind(&path)?;
-    listener.set_nonblocking(true)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let temporary = path.with_extension("tmp");
+    not_found_ok(std::fs::remove_file(&temporary))?;
+    let listener = UnixListener::bind(&temporary)?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temporary, &path)?;
     let handler = Arc::new(handler);
     let stop = Arc::new(AtomicBool::new(false));
-    let clients = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
     let count = Arc::new(AtomicUsize::new(0));
     let stop_for_thread = Arc::clone(&stop);
     let clients_for_thread = Arc::clone(&clients);
@@ -479,10 +470,6 @@ where
             while !stop_for_thread.load(Ordering::Acquire) {
                 let (stream, _) = match listener.accept() {
                     Ok(connection) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
                     Err(_) => break,
                 };
                 if count_for_thread.load(Ordering::Acquire) >= SOCKET_CLIENT_CAP {
@@ -501,6 +488,7 @@ where
                     });
                 if let Ok(client) = client {
                     if let Ok(mut clients) = clients_for_thread.lock() {
+                        clients.retain(|client| !client.is_finished());
                         clients.push(client);
                     }
                 } else {
@@ -516,44 +504,43 @@ where
     })
 }
 
-pub fn unknown_command() -> Value {
-    crate::json!({"error": "unknown cmd"})
-}
-
 fn handle_client<F>(stream: UnixStream, handler: Arc<F>, stop: Arc<AtomicBool>)
 where
     F: Fn(Value) -> Value + Send + Sync + 'static,
 {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let reader_stream = match stream.try_clone() {
         Ok(reader_stream) => reader_stream,
         Err(_) => return,
     };
+    if reader_stream.set_nonblocking(true).is_err() {
+        return;
+    }
     let mut reader = BufReader::new(reader_stream);
     let mut write = stream;
+    let mut partial = Vec::new();
+    let mut idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let line = match read_line_limited(&mut reader) {
+        if reader.buffer().is_empty() {
+            match poll_for_read(reader.get_ref().as_raw_fd(), idle_deadline) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
+            }
+        }
+        let line = match read_line_limited(&mut reader, &mut partial) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                continue;
+            }
             Err(_) => break,
         };
+        idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
         let response = match crate::json::from_slice(&line) {
-            Ok(request) => {
-                let known = matches!(
-                    request.get("cmd").and_then(Value::as_str),
-                    Some("status") | Some("handoff")
-                );
-                if known {
-                    handler(request)
-                } else {
-                    unknown_command()
-                }
-            }
+            Ok(request) => handler(request),
             Err(_) => crate::json!({"error": "invalid json"}),
         };
         let mut bytes = crate::json::to_vec(&response);
@@ -564,8 +551,35 @@ where
     }
 }
 
-fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+fn poll_for_read(fd: RawFd, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let timeout = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result >= 0 {
+            return Ok(result != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
@@ -578,11 +592,9 @@ fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
                 ))
             };
         }
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        let has_newline = available[..take].contains(&b'\n');
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        let has_newline = newline.is_some();
         if line.len() + take > SOCKET_LINE_CAP {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -596,7 +608,7 @@ fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(Some(line));
+            return Ok(Some(std::mem::take(line)));
         }
     }
 }
@@ -610,20 +622,17 @@ pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) ->
     let mut bytes = crate::json::to_vec(req);
     bytes.push(b'\n');
     write.write_all(&bytes)?;
-    let line = read_line_limited(&mut reader)?
+    let mut partial = Vec::new();
+    let line = read_line_limited(&mut reader, &mut partial)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
     crate::json::from_slice(&line).map_err(io::Error::other)
 }
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     fn files(dir: &Path) -> ProjectFiles {
         ProjectFiles {
@@ -662,7 +671,7 @@ mod tests {
 
     #[test]
     fn second_lock_is_rejected() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let first = try_lock(&dir.path().join("lock")).unwrap().unwrap();
         assert!(try_lock(&dir.path().join("lock")).unwrap().is_none());
         drop(first);
@@ -671,7 +680,7 @@ mod tests {
 
     #[test]
     fn dead_owner_state_is_removed() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let project_files = files(dir.path());
         write_state(&project_files.state, &state(Some(u32::MAX), Some(1))).unwrap();
         std::fs::write(&project_files.sock, b"stale").unwrap();
@@ -682,7 +691,7 @@ mod tests {
 
     #[test]
     fn reused_pid_is_ignored_by_ticks() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let project_files = files(dir.path());
         let pid = std::process::id();
         let ticks = start_ticks(pid).unwrap();
@@ -736,7 +745,7 @@ mod tests {
 
     #[test]
     fn handoff_dap_lock_is_rejected_when_held() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let first = try_lock(&dir.path().join("dap.lock")).unwrap().unwrap();
         assert!(try_lock(&dir.path().join("dap.lock")).unwrap().is_none());
         drop(first);
@@ -756,7 +765,7 @@ mod tests {
 
     #[test]
     fn socket_status_round_trip() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("status.sock");
         let handle = serve_socket(&path, |request| {
             if request["cmd"] == "status" {
@@ -766,6 +775,10 @@ mod tests {
             }
         })
         .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let response = socket_request(
             &path,
             &crate::json!({"cmd": "status"}),

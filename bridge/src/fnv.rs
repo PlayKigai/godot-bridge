@@ -1,10 +1,14 @@
-pub fn hash_hex(bytes: &[u8]) -> String {
+pub fn hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
-    format!("{hash:016x}")
+    hash
+}
+
+pub fn hash_hex(bytes: &[u8]) -> String {
+    format!("{:016x}", hash(bytes))
 }
 
 #[cfg(test)]

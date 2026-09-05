@@ -32,7 +32,3 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
-
-pub fn tempdir() -> io::Result<TempDir> {
-    TempDir::new()
-}

@@ -22,3 +22,5 @@ pub mod status;
 pub mod symbols;
 pub mod temp;
 pub mod watch;
+
+pub(crate) const SERVER_REQUEST_CAP: usize = 4096;

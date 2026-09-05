@@ -143,7 +143,7 @@ fn normalize_res_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::fs;
 
     fn script(project: &Path, relative: &str) -> PathBuf {
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn resolves_adjacent_stem() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let file = script(directory.path(), "scripts/player.gd");
         fs::write(directory.path().join("scripts/player.tscn"), "").unwrap();
         assert_eq!(
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn resolves_ext_resource_reference() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let file = script(directory.path(), "scripts/player.gd");
         fs::create_dir_all(directory.path().join("levels")).unwrap();
         fs::write(
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn resolves_lexicographically_first_reference() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let file = script(directory.path(), "scripts/player.gd");
         fs::create_dir_all(directory.path().join("z")).unwrap();
         fs::create_dir_all(directory.path().join("a")).unwrap();
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn reports_no_scene() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let file = script(directory.path(), "scripts/player.gd");
         assert_eq!(
             resolve_scene(directory.path(), &file),
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn passes_through_tscn_input() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let file = directory.path().join("scenes/current.tscn");
         assert_eq!(
             resolve_scene(directory.path(), &file).unwrap(),

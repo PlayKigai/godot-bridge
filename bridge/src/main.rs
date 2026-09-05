@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+    }
     let arguments = std::env::args_os()
         .skip(1)
         .map(|argument| {

@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::state::{remove_if_stale, runtime_dir, socket_request};
+use crate::state::{read_state, remove_if_stale, runtime_dir, socket_request};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -14,7 +14,16 @@ pub fn run() -> crate::error::Result<()> {
 fn run_in(dir: &Path, out: &mut impl Write) -> crate::error::Result<()> {
     for state_path in list_state_files(dir)? {
         let sock_path = state_path.with_extension("sock");
-        match socket_request(&sock_path, &crate::json!({"cmd": "status"}), STATUS_TIMEOUT) {
+        let project = read_state(&state_path)
+            .ok()
+            .flatten()
+            .map(|state| state.project)
+            .unwrap_or_default();
+        match socket_request(
+            &sock_path,
+            &crate::json!({"cmd": "status", "project": (project)}),
+            STATUS_TIMEOUT,
+        ) {
             Ok(response) => writeln!(out, "{response}")?,
             Err(_) => {
                 let _ = remove_if_stale(&state_path, &sock_path);
@@ -42,11 +51,11 @@ mod tests {
     use super::*;
     use crate::json::Value;
     use crate::state::{serve_socket, write_state, Mode, State, Status};
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
 
     #[test]
     fn detached_gui_state_without_socket_is_kept() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         write_state(
             &dir.path().join("gui.json"),
             &crate::state::detached_gui_state(Path::new("/project"), Status::Ready),
@@ -60,7 +69,7 @@ mod tests {
 
     #[test]
     fn stale_state_is_removed_and_live_status_is_printed() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let stale = State {
             version: 1,
             project: "/stale".to_owned(),

@@ -1,21 +1,25 @@
 use super::*;
 
-pub(super) fn start_recovery(session: &mut Session) -> Result<RecoveryQueue> {
-    reset_for_recovery(session)?;
-    fail_in_flight(session)?;
-    Ok(RecoveryQueue::default())
-}
-
-fn reset_for_recovery(session: &mut Session) -> Result<()> {
-    session.proxy.documents.set_open_change_events(false);
+pub(super) fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.symbol_cache.clear();
+    session.proxy.symbol_containers.clear();
     session.proxy.symbol_scheduled.clear();
+    session.proxy.bulk_documents.clear();
+    session.proxy.bulk_batch_uris.clear();
+    session.proxy.bulk_complete = false;
+    session.proxy.bulk_active = false;
+    session.proxy.bulk_replay = false;
+    session.proxy.bulk_deadline = None;
+    session.proxy.rescan_generation += 1;
+    session.proxy.rescan_keys.clear();
+    session.proxy.rescan_active = false;
+    session.godot = FrameState::new(GODOT_FRAME_CAP);
     session.proxy.bulk_generation += 1;
     session.proxy.project_diagnostics_started = false;
     set_recovering(&session.runtime)
 }
 
-fn fail_in_flight(session: &mut Session) -> Result<()> {
+pub(super) fn fail_in_flight(session: &mut Session) -> Result<()> {
     for pending in session.proxy.pending.drain().map(|(_, pending)| pending) {
         if !pending.internal {
             send_error(
@@ -26,13 +30,11 @@ fn fail_in_flight(session: &mut Session) -> Result<()> {
             )?;
         }
     }
-    for queued in session.proxy.queued.drain(..) {
-        if let Some(id) = queued.get("id") {
-            send_error(&mut session.output, id, -32803, "RequestFailed")?;
-        }
+    for (_, zed_id, _) in session.proxy.queued.drain(..) {
+        send_error(&mut session.output, &zed_id, -32803, "RequestFailed")?;
     }
     session.proxy.queued_bytes = 0;
-    let served = session.proxy.server_requests.drain().collect::<Vec<_>>();
+    let served = session.proxy.server_requests.drain();
     session.proxy.stale_server_ids.extend(served);
     Ok(())
 }
@@ -90,7 +92,6 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     let deadline = startup_deadline(session.settings.startup_timeout_s);
     let mut candidate = None;
     let mut last_error = None;
-    let mut recovery_queue = RecoveryQueue::default();
     let project = session.proxy.project.clone();
     for _ in 0..STARTUP_ATTEMPTS {
         match spawn_one(
@@ -98,6 +99,7 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
             &session.settings,
             &project,
             &session.runtime,
+            &session.proxy.internal_sender,
             deadline,
         ) {
             Ok(editor) => {
@@ -131,18 +133,21 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
             true,
         )?;
     }
-    replay_initialize(&mut replacement, &mut session.proxy)?;
+    replay_initialize(
+        &mut replacement,
+        &mut session.proxy,
+        &session.events,
+        &mut session.godot,
+        &mut session.deferred,
+    )?;
     session.editor = replacement;
-    finish_recovery(session, &mut recovery_queue)?;
+    finish_recovery(session, &mut RecoveryQueue::default())?;
     Ok(())
 }
 
-pub(super) fn absorb_watcher_event(
-    watch: &mut Watch,
-    result: Option<std::io::Result<WatcherChange>>,
-) {
+pub(super) fn absorb_watcher_event(watch: &mut Watch, result: std::io::Result<WatcherChange>) {
     match result {
-        Some(Ok(change)) => {
+        Ok(change) => {
             watch.pending.push(change);
             if watch.pending.len() > WATCHER_PENDING_CAP {
                 watch.pending = coalesce_watcher_changes(std::mem::take(&mut watch.pending));
@@ -161,27 +166,22 @@ pub(super) fn absorb_watcher_event(
             }
             watch.deadline = Some(Instant::now() + Duration::from_millis(300));
         }
-        Some(Err(error)) => crate::warn!("project diagnostics watcher error: {error}"),
-        None => watch.watcher = None,
+        Err(error) => crate::warn!("project diagnostics watcher error: {error}"),
     }
 }
 
 pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) -> Result<()> {
     replay_open_documents(session)?;
-    session.proxy.documents.set_open_change_events(true);
-    start_project_diagnostics(&mut session.proxy, &session.settings);
+    if !session.proxy.bulk_replay {
+        start_project_diagnostics(&mut session.proxy, &session.settings);
+    }
     set_ready(&session.runtime, &session.editor)?;
     while let Some(item) = queue.items.pop_front() {
         let message = match item {
-            RecoveryItem::Request(message) | RecoveryItem::Notification(message) => message,
-            RecoveryItem::Response(message) => {
-                if message
-                    .get("id")
-                    .is_some_and(|id| session.proxy.stale_server_ids.contains(&id.to_string()))
-                {
-                    crate::debug!("dropping response to stale Godot request");
-                    continue;
-                }
+            RecoveryItem::Request(message, size)
+            | RecoveryItem::Notification(message, size)
+            | RecoveryItem::Response(message, size) => {
+                queue.bytes = queue.bytes.saturating_sub(size);
                 message
             }
         };
@@ -193,49 +193,43 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
             message,
         )?;
     }
-    flush_queued(&mut session.output, &mut session.editor, &mut session.proxy)
+    flush_queued(
+        &mut session.output,
+        &mut session.editor.connection.writer,
+        &mut session.proxy,
+    )
 }
 
 fn replay_open_documents(session: &mut Session) -> Result<()> {
-    let messages = session
-        .proxy
-        .documents
-        .open_docs
-        .values_mut()
-        .map(|doc| {
-            doc.version = 1;
-            crate::json!({
-                "jsonrpc": "2.0",
-                "method": "textDocument/didOpen",
-                "params": {"textDocument": {"uri": (doc.uri.clone()), "languageId": "gdscript", "version": 1, "text": (doc.text.clone())}}
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut deadline = Instant::now();
-    for (index, message) in messages.into_iter().enumerate() {
-        send_godot(&mut session.editor.connection.writer, &message, false)?;
-        if (index + 1) % BULK_DOCUMENTS == 0 {
-            deadline += Duration::from_millis(BULK_INTERVAL_MS);
-            if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                thread::sleep(remaining);
-            }
-        }
+    session.proxy.bulk_generation += 1;
+    session.proxy.bulk_documents.clear();
+    session.proxy.bulk_batch_uris.clear();
+    session.proxy.bulk_complete = true;
+    session.proxy.bulk_active = true;
+    session.proxy.bulk_replay = true;
+    session.proxy.bulk_deadline = None;
+    for (key, doc) in &mut session.proxy.documents.open_docs {
+        doc.version = 1;
+        session
+            .proxy
+            .bulk_documents
+            .push_back(docs_state::ScannedDocument {
+                path: key.clone(),
+                key: key.clone(),
+                text: None,
+            });
     }
     let replayed = session
         .proxy
         .documents
         .open_docs
         .values()
-        .map(|doc| DocumentEvent::Open {
-            uri: doc.uri.clone(),
-            generation: doc.generation,
-            version: doc.version,
-        })
+        .map(|doc| (doc.uri.clone(), doc.generation, doc.version))
         .collect::<Vec<_>>();
-    for event in replayed {
-        schedule_symbol_event(&mut session.proxy, event);
+    for (uri, generation, version) in replayed {
+        schedule_symbols(&mut session.proxy, &uri, generation, version);
     }
-    Ok(())
+    pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
 }
 
 pub(super) fn queue_recovery_message(
@@ -244,7 +238,7 @@ pub(super) fn queue_recovery_message(
     body: &[u8],
 ) -> Result<()> {
     let message = parse_message(body)?;
-    let size = crate::json::to_vec(&message).len();
+    let size = body.len();
     if message.get("method").is_some() {
         if message.get("id").is_some() {
             if queue.requests >= RECOVERY_QUEUE_CAP
@@ -257,18 +251,19 @@ pub(super) fn queue_recovery_message(
             }
             queue.requests += 1;
             queue.bytes += size;
-            queue.items.push_back(RecoveryItem::Request(message));
+            queue.items.push_back(RecoveryItem::Request(message, size));
         } else {
-            if queue.notifications >= RECOVERY_QUEUE_CAP
+            while queue.notifications >= RECOVERY_QUEUE_CAP
                 || queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP
             {
                 if let Some(index) = queue
                     .items
                     .iter()
-                    .position(|item| matches!(item, RecoveryItem::Notification(_)))
+                    .position(|item| matches!(item, RecoveryItem::Notification(_, _)))
                 {
-                    if let Some(RecoveryItem::Notification(old)) = queue.items.remove(index) {
-                        queue.bytes = queue.bytes.saturating_sub(crate::json::to_vec(&old).len());
+                    if let Some(RecoveryItem::Notification(_, old_size)) = queue.items.remove(index)
+                    {
+                        queue.bytes = queue.bytes.saturating_sub(old_size);
                     }
                     queue.notifications -= 1;
                     crate::warn!("dropping oldest notification from recovery queue");
@@ -279,7 +274,9 @@ pub(super) fn queue_recovery_message(
             }
             queue.notifications += 1;
             queue.bytes += size;
-            queue.items.push_back(RecoveryItem::Notification(message));
+            queue
+                .items
+                .push_back(RecoveryItem::Notification(message, size));
         }
     } else if message.get("id").is_some() {
         if queue.bytes.saturating_add(size) > QUEUE_BYTES_CAP {
@@ -287,21 +284,21 @@ pub(super) fn queue_recovery_message(
             return Ok(());
         }
         queue.bytes += size;
-        queue.items.push_back(RecoveryItem::Response(message));
+        queue.items.push_back(RecoveryItem::Response(message, size));
     } else {
         crate::warn!("dropping invalid message from recovery queue");
     }
     Ok(())
 }
 
-pub(super) fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyState) -> Result<()> {
-    let mut initialize = proxy.initialize.clone();
+pub(super) fn replay_initialize(
+    editor: &mut Editor,
+    proxy: &mut ProxyState,
+    events: &Receiver<ProxyEvent>,
+    godot: &mut FrameState,
+    deferred: &mut DeferredQueue,
+) -> Result<()> {
     let id = proxy.next_id;
-    proxy.next_id += 1;
-    if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
-        params.remove("initializationOptions");
-    }
-    initialize["id"] = crate::json!(id);
     proxy.pending.insert(
         id,
         PendingRequest {
@@ -310,26 +307,19 @@ pub(super) fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyState) -> 
             symbol: None,
         },
     );
-    send_godot(&mut editor.connection.writer, &initialize, true)?;
-    loop {
-        let body = editor
-            .connection
-            .read_frame()?
-            .ok_or_else(|| crate::error::Error::new("Godot closed during recovery initialize"))?;
-        let message = parse_message(&body)?;
-        if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
-        {
-            check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;
-            if message.get("id").is_some() {
-                send_godot(
-                    &mut editor.connection.writer,
-                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
-                    false,
-                )?;
-            }
-            continue;
-        }
-        if message.get("id") == Some(&crate::json!(id)) {
+    let project = proxy.project.clone();
+    let mut context = ();
+    initialize_loop(
+        editor,
+        proxy,
+        &project,
+        InitializeInput {
+            events,
+            godot,
+            deferred,
+        },
+        &mut context,
+        move |editor, proxy, _, _, _| {
             proxy.pending.remove(&id);
             if proxy.zed_initialized {
                 send_godot(
@@ -338,14 +328,17 @@ pub(super) fn replay_initialize(editor: &mut Editor, proxy: &mut ProxyState) -> 
                     false,
                 )?;
             }
-            return Ok(());
-        }
-        if message.get("method").is_some() && message.get("id").is_some() {
-            send_godot(
-                &mut editor.connection.writer,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
-                false,
-            )?;
-        }
-    }
+            Ok(())
+        },
+        |editor, _, _, message| {
+            if message.get("method").is_some() && message.get("id").is_some() {
+                send_godot(
+                    &mut editor.connection.writer,
+                    &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":null}),
+                    false,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }

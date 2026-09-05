@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -6,10 +6,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crate::state::{pid_alive_with_ticks, process_start_ticks};
 
 const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
@@ -30,7 +31,7 @@ pub struct GodotChild {
     pub start_ticks: u64,
     pub child: Child,
     pub tail: Arc<Mutex<VecDeque<String>>>,
-    output_thread: Option<JoinHandle<()>>,
+    output_threads: Vec<JoinHandle<()>>,
 }
 
 impl GodotChild {
@@ -44,15 +45,26 @@ impl GodotChild {
     }
 
     pub fn wait_output(&mut self) {
-        if let Some(thread) = self.output_thread.take() {
+        for thread in self.output_threads.drain(..) {
             let _ = thread.join();
         }
     }
 }
 
 pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
+    let start = *range.start();
+    let end = *range.end();
+    if start > end {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "port range is empty",
+        ));
+    }
+    let count = usize::from(end - start) + 1;
+    let offset = std::process::id() as usize % count;
     let mut last_error = None;
-    for port in range {
+    for index in 0..count {
+        let port = start + ((offset + index) % count) as u16;
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => {
                 drop(listener);
@@ -64,6 +76,50 @@ pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
 
     Err(last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "port range is empty")))
+}
+
+pub fn port_listener_belongs_to_process(pid: u32, port: u16) -> io::Result<bool> {
+    let mut inodes = HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let contents = std::fs::read_to_string(path)?;
+        for line in contents.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() <= 9 || fields[3] != "0A" {
+                continue;
+            }
+            let Some((_, port_hex)) = fields[1].split_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(port_hex, 16).ok() == Some(port) {
+                if let Ok(inode) = fields[9].parse::<u64>() {
+                    inodes.insert(inode);
+                }
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        let target = match std::fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(inode) = target
+            .to_str()
+            .and_then(|target| target.strip_prefix("socket:["))
+            .and_then(|target| target.strip_suffix(']'))
+            .and_then(|inode| inode.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if inodes.contains(&inode) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn spawn_godot(
@@ -118,7 +174,7 @@ pub fn spawn_godot(
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LIMIT)));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let output_thread = spawn_output_task(
+    let output_threads = spawn_output_task(
         stdout,
         stderr,
         log_path.as_ref().to_owned(),
@@ -131,7 +187,7 @@ pub fn spawn_godot(
         start_ticks,
         child,
         tail,
-        output_thread,
+        output_threads,
     })
 }
 
@@ -247,7 +303,7 @@ pub fn kill_group(mut child: GodotChild) -> io::Result<()> {
 
 pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
     validate_ids(pid, pgid)?;
-    if process_start_ticks(pid).ok() != Some(ticks) {
+    if !pid_alive_with_ticks(pid, ticks) {
         return Ok(());
     }
 
@@ -261,14 +317,10 @@ pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
     if !signal_group(pid, pgid, ticks, libc::SIGKILL)? {
         return Ok(());
     }
-    while process_start_ticks(pid).ok() == Some(ticks) {
-        thread::sleep(Duration::from_millis(50));
+    if !wait_for_process_to_disappear(pid, ticks, GROUP_WAIT) {
+        crate::warn!("process {pid} did not exit after SIGKILL");
     }
     Ok(())
-}
-
-fn process_start_ticks(pid: u32) -> io::Result<u64> {
-    crate::state::process_start_ticks(pid)
 }
 
 fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
@@ -289,7 +341,7 @@ fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
 
 fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Result<bool> {
     validate_ids(pid, pgid)?;
-    if process_start_ticks(pid).ok() != Some(ticks) {
+    if !pid_alive_with_ticks(pid, ticks) {
         return Ok(false);
     }
     if unsafe { libc::kill(-pgid, signal) } == 0 {
@@ -306,7 +358,7 @@ fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Res
 fn wait_for_process_to_disappear(pid: u32, ticks: u64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if process_start_ticks(pid).ok() != Some(ticks) {
+        if !pid_alive_with_ticks(pid, ticks) {
             return true;
         }
         let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -322,43 +374,32 @@ fn spawn_output_task(
     stderr: Option<std::process::ChildStderr>,
     log_path: PathBuf,
     tail: Arc<Mutex<VecDeque<String>>>,
-) -> Option<JoinHandle<()>> {
-    thread::Builder::new()
-        .name("godot-bridge-output".to_owned())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let mut writer = match LogWriter::open(log_path) {
-                Ok(writer) => writer,
-                Err(error) => {
-                    crate::warn!("cannot open Godot log: {error}");
-                    LogWriter::disabled()
-                }
-            };
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let mut readers = Vec::new();
-            if let Some(stream) = stdout {
-                readers.push(spawn_output_reader(stream, 0, sender.clone()));
-            }
-            if let Some(stream) = stderr {
-                readers.push(spawn_output_reader(stream, 1, sender));
-            }
-            copy_output(receiver, &mut writer, tail, readers.len());
-            for reader in readers {
-                let _ = reader.join();
-            }
-        })
-        .ok()
-}
-
-enum OutputEvent {
-    Bytes(usize, Vec<u8>),
-    End,
+) -> Vec<JoinHandle<()>> {
+    let writer = Arc::new(Mutex::new(match LogWriter::open(log_path) {
+        Ok(writer) => writer,
+        Err(error) => {
+            crate::warn!("cannot open Godot log: {error}");
+            LogWriter::disabled()
+        }
+    }));
+    let mut readers = Vec::new();
+    if let Some(stream) = stdout {
+        readers.push(spawn_output_reader(
+            stream,
+            Arc::clone(&writer),
+            Arc::clone(&tail),
+        ));
+    }
+    if let Some(stream) = stderr {
+        readers.push(spawn_output_reader(stream, writer, tail));
+    }
+    readers
 }
 
 fn spawn_output_reader<R: Read + Send + 'static>(
     stream: R,
-    index: usize,
-    sender: SyncSender<OutputEvent>,
+    writer: Arc<Mutex<LogWriter>>,
+    tail: Arc<Mutex<VecDeque<String>>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("godot-bridge-output-reader".to_owned())
@@ -366,67 +407,38 @@ fn spawn_output_reader<R: Read + Send + 'static>(
         .spawn(move || {
             let mut reader = stream;
             let mut bytes = [0u8; 8192];
+            let mut line = Vec::new();
             loop {
                 match reader.read(&mut bytes) {
-                    Ok(0) => {
-                        let _ = sender.send(OutputEvent::End);
-                        return;
-                    }
+                    Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if sender
-                            .send(OutputEvent::Bytes(index, bytes[..count].to_vec()))
-                            .is_err()
+                        if let Err(error) = writer
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .write(&bytes[..count])
                         {
-                            return;
+                            crate::warn!("cannot write Godot log: {error}");
+                            writer
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .disable();
+                        }
+                        for &byte in &bytes[..count] {
+                            if byte == b'\n' {
+                                append_tail(&tail, &line);
+                                line.clear();
+                            } else if line.len() < TAIL_LINE_LIMIT {
+                                line.push(byte);
+                            }
                         }
                     }
-                    Err(_) => {
-                        let _ = sender.send(OutputEvent::End);
-                        return;
-                    }
                 }
+            }
+            if !line.is_empty() {
+                append_tail(&tail, &line);
             }
         })
         .expect("output reader thread should spawn")
-}
-
-fn copy_output(
-    receiver: Receiver<OutputEvent>,
-    writer: &mut LogWriter,
-    tail: Arc<Mutex<VecDeque<String>>>,
-    reader_count: usize,
-) {
-    let mut lines = [Vec::new(), Vec::new()];
-    let mut ended = 0;
-    while ended < reader_count {
-        let event = match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        match event {
-            OutputEvent::End => ended += 1,
-            OutputEvent::Bytes(index, bytes) => {
-                if let Err(error) = writer.write(&bytes) {
-                    crate::warn!("cannot write Godot log: {error}");
-                    writer.disable();
-                }
-                for byte in bytes {
-                    if byte == b'\n' {
-                        append_tail(&tail, &lines[index]);
-                        lines[index].clear();
-                    } else if lines[index].len() < TAIL_LINE_LIMIT {
-                        lines[index].push(byte);
-                    }
-                }
-            }
-        }
-    }
-    for line in lines {
-        if !line.is_empty() {
-            append_tail(&tail, &line);
-        }
-    }
 }
 
 const TAIL_LINE_LIMIT: usize = 16 * 1024;
@@ -522,7 +534,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
 
     #[test]
     fn picked_port_can_be_bound_again() {
@@ -536,8 +548,15 @@ mod tests {
     }
 
     #[test]
+    fn listener_owner_matches_process() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_listener_belongs_to_process(std::process::id(), port).unwrap());
+    }
+
+    #[test]
     fn readiness_reports_child_exit() {
-        let directory = tempdir().expect("temporary directory");
+        let directory = TempDir::new().expect("temporary directory");
         let args = vec!["-c".to_owned(), "exit 0".to_owned()];
         let mut child = spawn_godot(
             Path::new("/bin/sh"),
@@ -560,7 +579,7 @@ mod tests {
 
     #[test]
     fn group_kill_terminates_grandchild() {
-        let directory = tempdir().expect("temporary directory");
+        let directory = TempDir::new().expect("temporary directory");
         let script = "/bin/sleep 30 & printf '%s\\n' \"$!\" >&2; wait";
         let args = vec!["-c".to_owned(), script.to_owned()];
         let child = spawn_godot(

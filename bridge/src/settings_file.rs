@@ -17,6 +17,7 @@ const KNOWN_KEYS: [&str; 8] = [
     "diagnose_addons",
     "extra_args",
 ];
+const PROJECT_UNTRUSTED_KEYS: [&str; 3] = ["godot_path", "project_dir", "extra_args"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -46,30 +47,37 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn from_value(value: &Value) -> Result<Self, String> {
-        let Some(object) = value.as_object() else {
-            return Err("initializationOptions must be an object".to_owned());
-        };
-        Self::from_object(object)
-    }
-
     fn from_object(object: &Map) -> Result<Self, String> {
-        let settings = Self {
+        let mut settings = Self {
             godot_path: optional_string(object, "godot_path")?,
             project_dir: optional_string(object, "project_dir")?,
-            lsp_port: optional_u64(object, "lsp_port")?
-                .map(|value| u16::try_from(value).map_err(|_| "lsp_port must be a 16-bit integer"))
-                .transpose()?,
-            dap_port: default_u64(object, "dap_port", 6006)?
-                .try_into()
-                .map_err(|_| "dap_port must be a 16-bit integer")?,
-            startup_timeout_s: default_u64(object, "startup_timeout_s", 600)?
-                .try_into()
-                .map_err(|_| "startup_timeout_s must be a 32-bit integer")?,
-            project_diagnostics: bool_value(object, "project_diagnostics", true)?,
-            diagnose_addons: bool_value(object, "diagnose_addons", false)?,
-            extra_args: string_array(object, "extra_args")?.unwrap_or_default(),
+            ..Self::default()
         };
+        if object.contains_key("lsp_port") {
+            settings.lsp_port = optional_u64(object, "lsp_port")?
+                .map(|value| u16::try_from(value).map_err(|_| "lsp_port must be a 16-bit integer"))
+                .transpose()?;
+        }
+        if object.contains_key("dap_port") {
+            settings.dap_port = default_u64(object, "dap_port", u64::from(settings.dap_port))?
+                .try_into()
+                .map_err(|_| "dap_port must be a 16-bit integer")?;
+        }
+        if object.contains_key("startup_timeout_s") {
+            settings.startup_timeout_s = default_u64(
+                object,
+                "startup_timeout_s",
+                u64::from(settings.startup_timeout_s),
+            )?
+            .try_into()
+            .map_err(|_| "startup_timeout_s must be a 32-bit integer")?;
+        }
+        settings.project_diagnostics =
+            bool_value(object, "project_diagnostics", settings.project_diagnostics)?;
+        settings.diagnose_addons = bool_value(object, "diagnose_addons", settings.diagnose_addons)?;
+        if let Some(extra_args) = string_array(object, "extra_args")? {
+            settings.extra_args = extra_args;
+        }
         Ok(settings)
     }
 }
@@ -142,7 +150,10 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
             crate::warn!("ignoring unknown key {key} in lsp.godot.settings");
         }
     }
-    deserialize_settings(value)
+    let settings = Settings::from_object(object)
+        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    Ok(settings)
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
@@ -160,11 +171,54 @@ fn load_zed_settings_with(worktree: &Path, user_path: &Path) -> Result<Settings,
         validate_section(user_path, &section)?;
         merged.extend(section);
     }
-    if let Some(section) = project_section {
+    if let Some(mut section) = project_section {
+        remove_untrusted_project_keys(&project_path, &mut section);
         validate_section(&project_path, &section)?;
         merged.extend(section);
     }
     parse_settings(&Value::Object(merged))
+}
+
+pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings, String> {
+    let empty = Map::new();
+    let object = match value.as_object() {
+        Some(object) => object,
+        None if value.is_null() => &empty,
+        None => return parse_settings(value),
+    };
+    let user_path = user_settings_path();
+    let user_section = read_settings_section(&user_path)?;
+    if let Some(section) = &user_section {
+        validate_section(&user_path, section)?;
+    }
+
+    let project_path = worktree.join(".zed").join("settings.json");
+    if let Some(project_section) = read_settings_section(&project_path)? {
+        for key in PROJECT_UNTRUSTED_KEYS {
+            if project_section.contains_key(key) {
+                crate::warn!(
+                    "ignoring project setting {key} in {}",
+                    project_path.display()
+                );
+            }
+        }
+    }
+
+    let mut merged = user_section.unwrap_or_default();
+    for (key, value) in object {
+        if !PROJECT_UNTRUSTED_KEYS.contains(&key.as_str()) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    parse_settings(&Value::Object(merged))
+}
+
+fn remove_untrusted_project_keys(path: &Path, section: &mut Map) {
+    for key in PROJECT_UNTRUSTED_KEYS {
+        if section.remove(key).is_some() {
+            crate::warn!("ignoring project setting {key} in {}", path.display());
+        }
+    }
 }
 
 fn validate_section(path: &Path, section: &Map) -> Result<(), String> {
@@ -172,13 +226,6 @@ fn validate_section(path: &Path, section: &Map) -> Result<(), String> {
         Settings::from_object(section).map_err(|error| format!("{}: {error}", path.display()))?;
     validate_settings(&settings).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(())
-}
-
-fn deserialize_settings(value: &Value) -> Result<Settings, String> {
-    let settings = Settings::from_value(value)
-        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    Ok(settings)
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), String> {
@@ -204,14 +251,15 @@ fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     if metadata.len() > SETTINGS_FILE_CAP {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut text = String::new();
     use std::io::Read;
-    file.read_to_string(&mut text)
+    file.take(SETTINGS_FILE_CAP + 1)
+        .read_to_string(&mut text)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     if text.len() > SETTINGS_FILE_CAP as usize {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
@@ -251,7 +299,7 @@ fn user_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::fs;
 
     fn user_settings_path_in(config_dir: &Path) -> PathBuf {
@@ -306,7 +354,7 @@ mod tests {
 
     #[test]
     fn project_settings_override_user_per_key() {
-        let config_dir = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
         write_user_settings(
             config_dir.path(),
             r#"{
@@ -322,16 +370,17 @@ mod tests {
                 }
             }"#,
         );
-        let worktree = tempdir().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{
                 "lsp": {
                     "godot": {
                         "settings": {
-                            "godot_path": "/bin/true",
-                            "project_diagnostics": false,
-                            "extra_args": ["--verbose"],
+                             "godot_path": "/not-an-executable",
+                             "project_dir": "/not-a-project",
+                             "project_diagnostics": false,
+                             "extra_args": ["--editor"],
                             "startup_timeout_s": 30
                         }
                     }
@@ -341,20 +390,34 @@ mod tests {
         let settings =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap();
-        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/sh"));
         assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
         assert_eq!(settings.lsp_port, None);
         assert_eq!(settings.dap_port, 5555);
         assert_eq!(settings.startup_timeout_s, 30);
         assert!(!settings.project_diagnostics);
         assert!(settings.diagnose_addons);
-        assert_eq!(settings.extra_args, ["--verbose"]);
+        assert!(settings.extra_args.is_empty());
+    }
+
+    #[test]
+    fn duplicate_project_untrusted_setting_is_removed() {
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+        write_project_settings(
+            worktree.path(),
+            r#"{"lsp":{"godot":{"settings":{"godot_path":"/bin/true","godot_path":"/bin/sh"}}}}"#,
+        );
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path, None);
     }
 
     #[test]
     fn comment_bearing_settings_file_parses() {
-        let config_dir = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{
@@ -372,22 +435,22 @@ mod tests {
         let settings =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap();
-        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-        assert_eq!(settings.extra_args, ["--verbose"]);
+        assert_eq!(settings.godot_path, None);
+        assert!(settings.extra_args.is_empty());
     }
 
     #[test]
     fn validation_error_names_the_file() {
-        let config_dir = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
-            r#"{"lsp": {"godot": {"settings": {"extra_args": ["--editor"]}}}}"#,
+            r#"{"lsp": {"godot": {"settings": {"dap_port": "bad"}}}}"#,
         );
         let error =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap_err();
         assert!(error.contains(".zed/settings.json"), "{error}");
-        assert!(error.contains("--editor"), "{error}");
+        assert!(error.contains("dap_port"), "{error}");
     }
 }
