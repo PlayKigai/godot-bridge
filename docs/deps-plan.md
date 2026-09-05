@@ -46,7 +46,7 @@ Total added: about 1,600 lines of code plus 500 of tests.
 
 ## Order
 
-Each step ships alone with the integration suite green.
+Done at eb2bfeb (2026-09-05). Each step shipped alone with the integration suite green.
 
 1. delete nix
 2. tracing to log.rs
@@ -61,7 +61,7 @@ Each step ships alone with the integration suite green.
 11. tokio to threads
 12. tempfile to tests/support
 
-## Known bugs in the current code that the port must fix
+## Known bugs the port fixed
 
 - `shutdown` handling reads one Godot frame and treats it as the response; a
   notification arriving first is mistaken for it.

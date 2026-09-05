@@ -139,3 +139,39 @@ the whole swap.
 ## Round 12 (codex-thinker, 2026-09-04)
 
 Raw output: `review-12-raw.txt`. All phases ready. Verdict: READY.
+
+## Rounds 13 to 20 (2026-09-04 to 2026-09-05)
+
+Whole-diff reviews of the dependency elimination and performance work,
+`700fb88..b6eeaac`. Three lenses per round: simplicity (Claude Opus),
+security (Claude security reviewer), performance (Claude Fable, measured on
+a 1056 file project). Fixes per round are single commits, see `git log`.
+
+Accepted, by theme:
+
+- Correctness: thread port crash recovery never polled the Godot reader;
+  queued requests answered with the wrong id; Godot to Zed latency 100 ms
+  from a stdin-only loop (merged event channel, now 5 ms); duplicate JSON
+  keys bypassed the settings trust filter (last wins at parse); missing
+  `project` on the owner socket skipped the identity check; port pick race
+  across bridges (listener inode matched against the child, also on GUI
+  reconnect); directory moves now trigger a rescan.
+- Bounds: request keys 4096 with eviction by order, ids over 256 bytes
+  dropped on both parse paths with one canonical form, inbound frames,
+  deferred queue and DAP buffers 8 MiB (a 63 MiB frame parsed to 1 GiB),
+  PortMismatch respawns capped at 3, SIGKILL wait bounded, settings read
+  bounded, didClose reopen gated by project containment, IN_DONT_FOLLOW and
+  symlink skips on every watcher path.
+- Performance: symbol search 21 ms to 0.3 ms (occurrence mask prefilter,
+  compact 72 byte Symbol, bounded top 200, lazy compare); load 7 s to
+  3.3 s (bulk pacing, deferred symbol requests); per proxied frame about
+  1 us (raw frame scan and forward, early stop at intercepted methods);
+  52 KB didChange 140 us to 80 us (dead hash and text copies removed);
+  RSS 15.3 MB to 8.3 MB after load; idle 0 wakeups.
+- Simplicity: shared initialize loop, one project scan starter, one
+  oversized frame helper, single plan document updates, shared FNV hash,
+  many one-use wrappers inlined.
+
+Final gate (codex-thinker, 2026-09-05): two medium findings, both fixed in
+b6eeaac. Deferred: didChange raw text splice (about 20 us), not worth the
+code.
