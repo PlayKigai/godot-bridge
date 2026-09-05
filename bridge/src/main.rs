@@ -1,135 +1,48 @@
-use clap::{Args, Parser, Subcommand};
+use godot_bridge::cli::{self, Command, Invocation};
+use godot_bridge::{dap, doc, lsp, open_editor, run, status};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-mod dap;
-mod doc;
-mod docs_state;
-mod framing;
-mod godot_bin;
-mod lsp;
-mod open_editor;
-mod process;
-mod root;
-mod run;
-mod scene;
-mod settings_file;
-mod state;
-mod status;
-mod symbols;
+fn main() -> ExitCode {
+    let arguments = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|argument| format!("argument is not valid UTF-8: {argument:?}"))
+        })
+        .collect::<Result<Vec<String>, String>>();
 
-#[derive(Parser)]
-#[command(name = "godot-bridge")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Args)]
-struct FileArgs {
-    #[arg(long)]
-    file: String,
-    #[arg(trailing_var_arg = true)]
-    extra_args: Vec<String>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Lsp {
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    Dap {
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    ProjectDir(FileArgs),
-    Run {
-        #[arg(long)]
-        file: String,
-        #[arg(long)]
-        scene: Option<String>,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    OpenEditor(FileArgs),
-    Status {
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-    Doc {
-        symbol: String,
-        #[arg(trailing_var_arg = true)]
-        extra_args: Vec<String>,
-    },
-}
-
-#[tokio::main]
-async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("GODOT_BRIDGE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    match Cli::parse().command {
-        Command::Lsp { extra_args } => match lsp::run(extra_args).await {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("lsp: {error:#}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Dap { file, extra_args } => {
-            match dap::run(file.map(std::path::PathBuf::from), extra_args).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("dap: {error:#}");
-                    ExitCode::from(1)
-                }
-            }
+    let command = match arguments.and_then(cli::parse) {
+        Ok(Invocation::Help) => {
+            print!("{}", cli::HELP);
+            return ExitCode::SUCCESS;
         }
-        Command::Status { .. } => match status::run().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("status: {error:#}");
-                ExitCode::from(1)
-            }
-        },
-        Command::Run { file, scene, .. } => {
-            match run::run(std::path::Path::new(&file), scene.as_deref()) {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("run: {error:#}");
-                    ExitCode::from(1)
-                }
-            }
+        Ok(Invocation::Command(command)) => command,
+        Err(message) => {
+            eprintln!("godot-bridge: {message}\n\n{}", cli::HELP);
+            return ExitCode::from(2);
         }
-        Command::ProjectDir(args) => match run::project_dir(std::path::Path::new(&args.file)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{error:#}");
-                ExitCode::from(1)
-            }
-        },
-        Command::OpenEditor(args) => {
-            match open_editor::run(std::path::Path::new(&args.file), args.extra_args).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("open-editor: {error:#}");
-                    ExitCode::from(1)
-                }
-            }
+    };
+
+    let (label, result): (&str, godot_bridge::error::Result<ExitCode>) = match command {
+        Command::Lsp => ("lsp: ", lsp::run()),
+        Command::Dap { file } => ("dap: ", dap::run(file.map(PathBuf::from))),
+        Command::Status => ("status: ", status::run().map(|()| ExitCode::SUCCESS)),
+        Command::Run { file, scene } => ("run: ", run::run(Path::new(&file), scene.as_deref())),
+        Command::ProjectDir { file } => (
+            "",
+            run::project_dir(Path::new(&file)).map(|()| ExitCode::SUCCESS),
+        ),
+        Command::OpenEditor { file } => ("open-editor: ", open_editor::run(Path::new(&file))),
+        Command::Doc { symbol } => ("doc: ", doc::open_doc(&symbol).map(|()| ExitCode::SUCCESS)),
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{label}{error}");
+            ExitCode::from(1)
         }
-        Command::Doc { symbol, .. } => match doc::open_doc(&symbol) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("doc: {error:#}");
-                ExitCode::from(1)
-            }
-        },
     }
 }

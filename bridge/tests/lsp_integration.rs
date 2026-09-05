@@ -1,8 +1,8 @@
 mod common;
 use common::*;
+use godot_bridge::temp::TempDir;
 use serde_json::json;
 use std::time::Duration;
-use tempfile::TempDir;
 
 #[test]
 fn minimal_project_diagnostics_and_cleanup() {

@@ -1,17 +1,17 @@
-use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use crate::error::{Error, Result};
+use crate::json::Value;
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{kill_recorded, pick_free_port, spawn_gui};
 use crate::root::{cwd_root, find_project_dir};
 use crate::settings_file::{load_zed_settings, Settings};
 use crate::state::{
-    detached_gui_state, gui_process_alive, read_state, socket_request, try_lock, write_state, Mode,
-    ProjectFiles, State, Status,
+    detached_gui_state, gui_process_alive, matches_project, read_state, socket_request, try_lock,
+    write_state, Mode, ProjectFiles, State, Status,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,53 +23,53 @@ enum PortReadiness {
     Deadline,
 }
 
-pub async fn run(file: &Path, trailing: Vec<String>) -> Result<ExitCode> {
-    let _ = trailing;
-    let root = cwd_root().map_err(|error| anyhow!(error.to_string()))?;
-    let settings = load_zed_settings(&root).map_err(|error| anyhow!(error))?;
+pub fn run(file: &Path) -> Result<ExitCode> {
+    let root = cwd_root()?;
+    let settings = load_zed_settings(&root)?;
     let project = find_project_dir(
         &root,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
-    )
-    .map_err(|error| anyhow!(error.to_string()))?;
+    )?;
     let files = ProjectFiles::new(&project)?;
 
-    if let Some(response) = try_handoff(&files).await {
+    if let Some(response) = try_handoff_with_timeout(&files, &project, SOCKET_TIMEOUT) {
         return print_response(response);
     }
 
     let lock = match try_lock(&files.lock)? {
         Some(lock) => lock,
-        None => return retry_handoff(&files).await,
+        None => return retry_handoff(&files, &project),
     };
-    let result = launch_or_reuse(&files, &project, &settings).await;
+    let result = launch_or_reuse(&files, &project, &settings);
     drop(lock);
     result
 }
 
-async fn try_handoff(files: &ProjectFiles) -> Option<Value> {
-    socket_request(&files.sock, &json!({"cmd": "handoff"}), SOCKET_TIMEOUT)
-        .await
-        .ok()
-}
-
-async fn retry_handoff(files: &ProjectFiles) -> Result<ExitCode> {
+fn retry_handoff(files: &ProjectFiles, project: &Path) -> Result<ExitCode> {
     let deadline = Instant::now() + SOCKET_TIMEOUT;
     loop {
-        if let Some(response) = try_handoff_with_timeout(files, Duration::from_millis(250)).await {
+        if let Some(response) = try_handoff_with_timeout(files, project, Duration::from_millis(250))
+        {
             return print_response(response);
         }
         if Instant::now() >= deadline {
-            return Err(anyhow!("An owner exists but does not answer"));
+            crate::bail!("An owner exists but does not answer");
         }
     }
 }
 
-async fn try_handoff_with_timeout(files: &ProjectFiles, timeout: Duration) -> Option<Value> {
-    socket_request(&files.sock, &json!({"cmd": "handoff"}), timeout)
-        .await
-        .ok()
+fn try_handoff_with_timeout(
+    files: &ProjectFiles,
+    project: &Path,
+    timeout: Duration,
+) -> Option<Value> {
+    socket_request(
+        &files.sock,
+        &crate::json!({"cmd": "handoff", "project": (project.to_string_lossy())}),
+        timeout,
+    )
+    .ok()
 }
 
 fn print_response(response: Value) -> Result<ExitCode> {
@@ -85,16 +85,15 @@ fn print_response(response: Value) -> Result<ExitCode> {
     }
 }
 
-async fn launch_or_reuse(
-    files: &ProjectFiles,
-    project: &Path,
-    settings: &Settings,
-) -> Result<ExitCode> {
+fn launch_or_reuse(files: &ProjectFiles, project: &Path, settings: &Settings) -> Result<ExitCode> {
     let existing = read_state(&files.state)?;
     if let Some(mut state) = existing {
+        if !matches_project(&state, project) {
+            crate::bail!("project mismatch");
+        }
         if state.mode == Mode::Gui && gui_process_alive(&state) {
             let (pid, ticks, lsp_port, dap_port) = recorded_gui(&state)?;
-            match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s).await {
+            match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s) {
                 PortReadiness::Ready => {
                     state.status = Status::Ready;
                     state.owner_pid = None;
@@ -107,16 +106,15 @@ async fn launch_or_reuse(
                     state.owner_pid = None;
                     state.owner_start_ticks = None;
                     write_state(&files.state, &state)?;
-                    return Err(anyhow!("GUI editor {pid} is not answering on its ports"));
+                    crate::bail!("GUI editor {pid} is not answering on its ports");
                 }
             }
         }
         remove_files(files);
     }
 
-    let binary = resolve_godot(settings.godot_path.as_deref().map(Path::new))
-        .map_err(|error| anyhow!(error))?;
-    check_version(&binary).map_err(|error| anyhow!(error))?;
+    let binary = resolve_godot(settings.godot_path.as_deref().map(Path::new))?;
+    check_version(&binary)?;
     let lsp_port = pick_free_port(6005..=6999)?;
     let dap_port = pick_free_port(7005..=7999)?;
     let (pid, pgid, ticks) = spawn_gui(
@@ -135,21 +133,21 @@ async fn launch_or_reuse(
     state.dap_port = Some(dap_port);
     write_state(&files.state, &state)?;
 
-    match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s).await {
+    match wait_for_ports(pid, ticks, lsp_port, dap_port, settings.startup_timeout_s) {
         PortReadiness::Ready => {
             state.status = Status::Ready;
             write_state(&files.state, &state)?;
             print_state(state)
         }
         PortReadiness::Dead | PortReadiness::Deadline => {
-            let _ = kill_recorded(pid, pgid, ticks).await;
+            let _ = kill_recorded(pid, pgid, ticks);
             let tail = log_tail(&files.state.with_extension("gui.log"));
             remove_files(files);
             let message = match state.status {
                 Status::Starting => "GUI editor did not start",
                 Status::Ready | Status::Recovering => "GUI editor exited",
             };
-            Err(anyhow!("{message}: {tail}"))
+            crate::bail!("{message}: {tail}")
         }
     }
 }
@@ -157,20 +155,20 @@ async fn launch_or_reuse(
 fn recorded_gui(state: &State) -> Result<(u32, u64, u16, u16)> {
     let pid = state
         .godot_pid
-        .ok_or_else(|| anyhow!("detached GUI state has no process id"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no process id"))?;
     let ticks = state
         .godot_start_ticks
-        .ok_or_else(|| anyhow!("detached GUI state has no process identity"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no process identity"))?;
     let lsp_port = state
         .lsp_port
-        .ok_or_else(|| anyhow!("detached GUI state has no LSP port"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no LSP port"))?;
     let dap_port = state
         .dap_port
-        .ok_or_else(|| anyhow!("detached GUI state has no DAP port"))?;
+        .ok_or_else(|| Error::new("detached GUI state has no DAP port"))?;
     Ok((pid, ticks, lsp_port, dap_port))
 }
 
-async fn wait_for_ports(
+fn wait_for_ports(
     pid: u32,
     ticks: u64,
     lsp_port: u16,
@@ -183,20 +181,22 @@ async fn wait_for_ports(
         if !crate::state::pid_alive_with_ticks(pid, ticks) {
             return PortReadiness::Dead;
         }
-        if TcpStream::connect(("127.0.0.1", lsp_port)).await.is_ok()
-            && TcpStream::connect(("127.0.0.1", dap_port)).await.is_ok()
+        let lsp = SocketAddr::from(([127, 0, 0, 1], lsp_port));
+        let dap = SocketAddr::from(([127, 0, 0, 1], dap_port));
+        if TcpStream::connect_timeout(&lsp, POLL_INTERVAL).is_ok()
+            && TcpStream::connect_timeout(&dap, POLL_INTERVAL).is_ok()
         {
             return PortReadiness::Ready;
         }
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
             return PortReadiness::Deadline;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 fn print_state(state: State) -> Result<ExitCode> {
-    println!("{}", serde_json::to_string(&state)?);
+    println!("{}", state.to_value());
     Ok(ExitCode::SUCCESS)
 }
 

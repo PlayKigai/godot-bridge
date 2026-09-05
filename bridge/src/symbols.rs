@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use crate::json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
@@ -180,7 +180,7 @@ fn range_start(range: &Value) -> (u64, u64) {
 }
 
 pub fn symbol_information(symbol: &Symbol) -> Value {
-    json!({"name": symbol.name, "kind": symbol.kind, "containerName": symbol.container, "location": {"uri": symbol.uri, "range": symbol.range}})
+    crate::json!({"name": (symbol.name.clone()), "kind": (symbol.kind.clone()), "containerName": (symbol.container.clone()), "location": {"uri": (symbol.uri.clone()), "range": (symbol.range.clone())}})
 }
 
 #[cfg(test)]
@@ -191,10 +191,10 @@ mod tests {
         Symbol {
             name: name.to_owned(),
             folded_name: name.to_lowercase(),
-            kind: json!(12),
+            kind: crate::json!(12),
             container: String::new(),
             uri: uri.to_owned(),
-            range: json!({"start":{"line":line,"character":0},"end":{"line":line,"character":1}}),
+            range: crate::json!({"start":{"line":line,"character":0},"end":{"line":line,"character":1}}),
         }
     }
 
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn flattens_nested_document_symbols() {
-        let result = json!([{"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[{"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}}]}]);
+        let result = crate::json!([{"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[{"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}}]}]);
         let flattened = flatten(&result, "file:///tmp/main.gd");
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].container, "");

@@ -2,9 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use percent_encoding::percent_decode_str;
-use serde_json::Value;
-use url::Url;
+use crate::json::Value;
 
 const ROOT_MESSAGE: &str =
     "godot-bridge: cannot determine a local worktree root from initialize params";
@@ -67,15 +65,10 @@ pub fn worktree_root_from_initialize(params: &Value) -> Result<PathBuf, RootErro
                 .as_str()
                 .or_else(|| workspace.get("uri").and_then(Value::as_str));
             if let Some(uri) = uri {
-                if Url::parse(uri)
-                    .map(|parsed| parsed.scheme().eq_ignore_ascii_case("file"))
-                    .unwrap_or(false)
-                {
-                    if let Ok(path) = uri_to_path(uri) {
-                        return path
-                            .canonicalize()
-                            .map_err(|_| RootError::CannotDetermineRoot);
-                    }
+                if let Ok(path) = uri_to_path(uri) {
+                    return path
+                        .canonicalize()
+                        .map_err(|_| RootError::CannotDetermineRoot);
                 }
             }
         }
@@ -159,7 +152,7 @@ pub fn find_project_dir(
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                tracing::warn!(path = %dir.display(), %error, "skipping unreadable directory");
+                crate::warn!("skipping unreadable directory {}: {error}", dir.display());
                 continue;
             }
         };
@@ -168,7 +161,10 @@ pub fn find_project_dir(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "skipping unreadable directory entry");
+                    crate::warn!(
+                        "skipping unreadable directory entry {}: {error}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -193,30 +189,13 @@ pub fn find_project_dir(
 }
 
 pub fn path_to_uri(path: &Path) -> String {
-    let path = canonical_or_normalized(path);
-    Url::from_file_path(path)
-        .expect("absolute paths can be represented as file URIs")
-        .to_string()
+    crate::file_uri::path_to_uri(&canonical_or_normalized(path))
 }
 
 pub fn uri_to_path(uri: &str) -> Result<PathBuf, RootError> {
-    let parsed = Url::parse(uri).map_err(|_| RootError::CannotDetermineRoot)?;
-    if !parsed.scheme().eq_ignore_ascii_case("file")
-        || parsed
-            .host_str()
-            .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
-    {
-        return Err(RootError::CannotDetermineRoot);
-    }
-    let decoded = percent_decode_str(parsed.path())
-        .decode_utf8()
-        .map_err(|_| RootError::CannotDetermineRoot)?;
-    let path = normalize_absolute(Path::new(decoded.as_ref()));
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(RootError::CannotDetermineRoot)
-    }
+    Ok(normalize_absolute(
+        &crate::file_uri::uri_to_path(uri).ok_or(RootError::CannotDetermineRoot)?,
+    ))
 }
 
 pub fn doc_key(uri_or_path: &str) -> PathBuf {

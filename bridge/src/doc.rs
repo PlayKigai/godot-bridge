@@ -2,19 +2,19 @@ use std::process::Command;
 
 const DOC_BASE: &str = "https://docs.godotengine.org/en/stable/classes/";
 
-pub fn open_doc(symbol: &str) -> anyhow::Result<()> {
-    let root = crate::root::cwd_root().map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    crate::settings_file::load_zed_settings(&root).map_err(anyhow::Error::msg)?;
+pub fn open_doc(symbol: &str) -> crate::error::Result<()> {
+    let root = crate::root::cwd_root()?;
+    crate::settings_file::load_zed_settings(&root)?;
     let status = Command::new("xdg-open").arg(doc_url(symbol)?).status()?;
     if !status.success() {
-        anyhow::bail!("xdg-open exited {status}");
+        crate::bail!("xdg-open exited {status}");
     }
     Ok(())
 }
 
-pub fn doc_url(symbol: &str) -> anyhow::Result<String> {
+pub fn doc_url(symbol: &str) -> crate::error::Result<String> {
     if symbol.len() > 256 {
-        anyhow::bail!("invalid documentation symbol");
+        crate::bail!("invalid documentation symbol");
     }
     let mut parts = symbol.split('.');
     let class = parts.next().unwrap_or_default();
@@ -23,7 +23,7 @@ pub fn doc_url(symbol: &str) -> anyhow::Result<String> {
         || !valid_identifier(class)
         || (!member.is_empty() && !valid_identifier(member))
     {
-        anyhow::bail!("invalid documentation symbol");
+        crate::bail!("invalid documentation symbol");
     }
     let class = class.to_ascii_lowercase();
     if member.is_empty() {

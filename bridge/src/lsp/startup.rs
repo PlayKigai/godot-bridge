@@ -1,12 +1,20 @@
 use super::*;
 
-use nix::unistd::getpid;
-
 pub(super) fn connection_from_stream(stream: TcpStream) -> Connection {
-    let (read, write) = stream.into_split();
+    let reader_stream = stream.try_clone().expect("Godot stream should clone");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader_thread = spawn_frame_reader(
+        "godot-bridge-lsp-reader",
+        reader_stream,
+        GODOT_FRAME_CAP,
+        sender,
+    )
+    .expect("Godot reader thread should spawn");
     Connection {
-        reader: FrameReader::new(read, GODOT_FRAME_CAP),
-        writer: write,
+        socket: stream.try_clone().expect("Godot stream should clone"),
+        reader: Some(receiver),
+        reader_thread: Some(reader_thread),
+        writer: stream,
     }
 }
 
@@ -14,28 +22,31 @@ pub(super) fn startup_deadline(seconds: u32) -> Option<Instant> {
     (seconds != 0).then(|| Instant::now() + Duration::from_secs(u64::from(seconds)))
 }
 
-pub(super) async fn terminate_editor(mut editor: Editor) {
+pub(super) fn terminate_editor(mut editor: Editor) {
     if let Some(child) = editor.child.take() {
-        terminate_editor_child(child).await;
+        terminate_editor_child(child);
     }
 }
 
-pub(super) async fn terminate_editor_child(child: GodotChild) {
-    if let Err(error) = kill_group(child).await {
-        tracing::warn!(%error, "cannot terminate Godot process group");
+pub(super) fn terminate_editor_child(child: GodotChild) {
+    if let Err(error) = kill_group(child) {
+        crate::warn!("cannot terminate Godot process group: {error}");
     }
 }
 
-pub(super) async fn cleanup_runtime(runtime: &mut Runtime, child: Option<GodotChild>) {
+pub(super) fn cleanup_runtime(runtime: &mut Runtime, child: Option<GodotChild>) {
     if runtime.mode == Mode::Unmanaged {
         return;
     }
     if runtime.mode == Mode::Gui {
         {
-            let mut state = runtime.state.write().await;
+            let mut state = runtime
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             clear_owner_identity(&mut state);
         }
-        let _ = publish(runtime).await;
+        let _ = publish(runtime);
         runtime.socket.take();
         if let Some(lock) = runtime.lock.take() {
             drop(lock);
@@ -43,7 +54,7 @@ pub(super) async fn cleanup_runtime(runtime: &mut Runtime, child: Option<GodotCh
         return;
     }
     if let Some(child) = child {
-        terminate_editor_child(child).await;
+        terminate_editor_child(child);
     }
     runtime.socket.take();
     cleanup_files(&runtime.files);
@@ -52,18 +63,21 @@ pub(super) async fn cleanup_runtime(runtime: &mut Runtime, child: Option<GodotCh
     }
 }
 
-pub(super) async fn stale_cleanup(files: &ProjectFiles) {
+pub(super) fn stale_cleanup(files: &ProjectFiles, project: &Path) {
     if let Ok(Some(state)) = read_state(&files.state) {
         if state.mode == Mode::Gui {
             let _ = std::fs::remove_file(&files.sock);
+            return;
+        }
+        if !matches_project(&state, project) {
             return;
         }
         if let (Some(pid), Some(pgid), Some(ticks)) =
             (state.godot_pid, state.godot_pgid, state.godot_start_ticks)
         {
             if crate::state::pid_alive_with_ticks(pid, ticks) {
-                if let Err(error) = kill_recorded(pid, pgid as i32, ticks).await {
-                    tracing::warn!(%error, "cannot terminate stale Godot editor");
+                if let Err(error) = kill_recorded(pid, pgid as i32, ticks) {
+                    crate::warn!("cannot terminate stale Godot editor: {error}");
                 }
             }
         }
@@ -77,26 +91,32 @@ pub(super) fn cleanup_files(files: &ProjectFiles) {
     let _ = std::fs::remove_file(&files.sock);
 }
 
-pub(super) async fn update_state_spawned(
+pub(super) fn update_state_spawned(
     runtime: &Runtime,
     child: &GodotChild,
     lsp_port: u16,
     dap_port: u16,
 ) -> Result<()> {
     {
-        let mut state = runtime.state.write().await;
+        let mut state = runtime
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.godot_pid = Some(child.pid);
         state.godot_pgid = Some(child.pgid as u32);
         state.lsp_port = Some(lsp_port);
         state.dap_port = Some(dap_port);
         state.godot_start_ticks = Some(child.start_ticks);
     }
-    publish(runtime).await
+    publish(runtime)
 }
 
-pub(super) async fn set_ready(runtime: &Runtime, editor: &Editor) -> Result<()> {
+pub(super) fn set_ready(runtime: &Runtime, editor: &Editor) -> Result<()> {
     {
-        let mut state = runtime.state.write().await;
+        let mut state = runtime
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.status = Status::Ready;
         if let Some(child) = editor.child.as_ref() {
             state.godot_pid = Some(child.pid);
@@ -106,23 +126,31 @@ pub(super) async fn set_ready(runtime: &Runtime, editor: &Editor) -> Result<()> 
         state.lsp_port = Some(editor.lsp_port);
         state.dap_port = Some(editor.dap_port);
     }
-    publish(runtime).await
+    publish(runtime)
 }
 
-pub(super) async fn set_recovering(runtime: &Runtime) -> Result<()> {
-    runtime.state.write().await.status = Status::Recovering;
-    publish(runtime).await
+pub(super) fn set_recovering(runtime: &Runtime) -> Result<()> {
+    runtime
+        .state
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .status = Status::Recovering;
+    publish(runtime)
 }
 
-pub(super) async fn publish(runtime: &Runtime) -> Result<()> {
-    let state = runtime.state.read().await.clone();
+pub(super) fn publish(runtime: &Runtime) -> Result<()> {
+    let state = runtime
+        .state
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     crate::state::write_state(&runtime.files.state, &state)
         .context("cannot publish bridge state")?;
     Ok(())
 }
 
 pub(super) fn new_state(project: &Path, mode: Mode) -> State {
-    let owner_pid = getpid().as_raw() as u32;
+    let owner_pid = std::process::id();
     State {
         version: 1,
         project: project.to_string_lossy().into_owned(),
@@ -135,9 +163,7 @@ pub(super) fn new_state(project: &Path, mode: Mode) -> State {
         owner_pid: Some(owner_pid),
         owner_start_ticks: start_ticks(owner_pid),
         godot_start_ticks: None,
-        started_at: OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_default(),
+        started_at: crate::clock::now_rfc3339(),
         bridge_version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
@@ -164,7 +190,7 @@ pub(super) fn startup_failure_message(error: Option<&StartupError>, seconds: u32
     }
 }
 
-pub(super) async fn spawn_one(
+pub(super) fn spawn_one(
     binary: &Path,
     settings: &Settings,
     project: &Path,
@@ -185,30 +211,30 @@ pub(super) async fn spawn_one(
         log_path,
     )
     .map_err(|error| StartupError::Io(error.to_string()))?;
-    if let Err(error) = update_state_spawned(runtime, &child, lsp_port, dap_port).await {
-        terminate_editor_child(child).await;
+    if let Err(error) = update_state_spawned(runtime, &child, lsp_port, dap_port) {
+        terminate_editor_child(child);
         return Err(StartupError::Io(error.to_string()));
     }
-    let stream = match wait_for_port(&mut child, lsp_port, deadline).await {
+    let stream = match wait_for_port(&mut child, lsp_port, deadline) {
         Ok(Readiness::Ready(stream)) => stream,
         Ok(Readiness::ChildExited(_status)) => {
             return Err(StartupError::ChildExited(child.last_lines()))
         }
         Ok(Readiness::Deadline) => {
             let lines = child.last_lines();
-            terminate_editor_child(child).await;
+            terminate_editor_child(child);
             return Err(StartupError::Deadline(lines));
         }
         Err(error) => {
             let lines = child.last_lines();
-            terminate_editor_child(child).await;
+            terminate_editor_child(child);
             return Err(StartupError::Io(format!(
                 "cannot wait for Godot LSP: {error}; {}",
                 lines.join("\n")
             )));
         }
     };
-    match wait_for_port(&mut child, dap_port, deadline).await {
+    match wait_for_port(&mut child, dap_port, deadline) {
         Ok(Readiness::Ready(_)) => Ok(Editor {
             child: Some(child),
             connection: connection_from_stream(stream),
@@ -218,12 +244,12 @@ pub(super) async fn spawn_one(
         Ok(Readiness::ChildExited(_status)) => Err(StartupError::ChildExited(child.last_lines())),
         Ok(Readiness::Deadline) => {
             let lines = child.last_lines();
-            terminate_editor_child(child).await;
+            terminate_editor_child(child);
             Err(StartupError::Deadline(lines))
         }
         Err(error) => {
             let lines = child.last_lines();
-            terminate_editor_child(child).await;
+            terminate_editor_child(child);
             Err(StartupError::Io(format!(
                 "cannot wait for Godot DAP: {error}; {}",
                 lines.join("\n")

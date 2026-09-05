@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::{io, os::unix::fs::OpenOptionsExt};
 
-use serde::Deserialize;
-use serde_json::{Map, Value};
+use crate::json::{Map, Value};
 
 use crate::godot_bin::validate_extra_args;
 
@@ -19,8 +18,7 @@ const KNOWN_KEYS: [&str; 8] = [
     "extra_args",
 ];
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub godot_path: Option<String>,
     pub project_dir: Option<String>,
@@ -47,6 +45,91 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    fn from_value(value: &Value) -> Result<Self, String> {
+        let Some(object) = value.as_object() else {
+            return Err("initializationOptions must be an object".to_owned());
+        };
+        Self::from_object(object)
+    }
+
+    fn from_object(object: &Map) -> Result<Self, String> {
+        let settings = Self {
+            godot_path: optional_string(object, "godot_path")?,
+            project_dir: optional_string(object, "project_dir")?,
+            lsp_port: optional_u64(object, "lsp_port")?
+                .map(|value| u16::try_from(value).map_err(|_| "lsp_port must be a 16-bit integer"))
+                .transpose()?,
+            dap_port: default_u64(object, "dap_port", 6006)?
+                .try_into()
+                .map_err(|_| "dap_port must be a 16-bit integer")?,
+            startup_timeout_s: default_u64(object, "startup_timeout_s", 600)?
+                .try_into()
+                .map_err(|_| "startup_timeout_s must be a 32-bit integer")?,
+            project_diagnostics: bool_value(object, "project_diagnostics", true)?,
+            diagnose_addons: bool_value(object, "diagnose_addons", false)?,
+            extra_args: string_array(object, "extra_args")?.unwrap_or_default(),
+        };
+        Ok(settings)
+    }
+}
+
+fn optional_string(object: &Map, key: &str) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a string or null")),
+    }
+}
+
+fn optional_u64(object: &Map, key: &str) -> Result<Option<u64>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be an unsigned integer"))
+            .map(Some),
+    }
+}
+
+fn default_u64(object: &Map, key: &str, default: u64) -> Result<u64, String> {
+    object.get(key).map_or(Ok(default), |value| {
+        value
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be an unsigned integer"))
+    })
+}
+
+fn bool_value(object: &Map, key: &str, default: bool) -> Result<bool, String> {
+    object.get(key).map_or(Ok(default), |value| {
+        value
+            .as_bool()
+            .ok_or_else(|| format!("{key} must be a boolean"))
+    })
+}
+
+fn string_array(object: &Map, key: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("{key} must be an array of strings"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{key} must be an array of strings"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 pub fn parse_settings(value: &Value) -> Result<Settings, String> {
     if value.is_null() {
         return Ok(Settings::default());
@@ -56,22 +139,25 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
     };
     for key in object.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            tracing::warn!(key = %key, "ignoring unknown key in lsp.godot.settings");
+            crate::warn!("ignoring unknown key {key} in lsp.godot.settings");
         }
     }
     deserialize_settings(value)
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
-    let user_path = user_settings_path();
+    load_zed_settings_with(worktree, &user_settings_path())
+}
+
+fn load_zed_settings_with(worktree: &Path, user_path: &Path) -> Result<Settings, String> {
     let project_path = worktree.join(".zed").join("settings.json");
 
-    let user_section = read_settings_section(&user_path)?;
+    let user_section = read_settings_section(user_path)?;
     let project_section = read_settings_section(&project_path)?;
 
     let mut merged = Map::new();
     if let Some(section) = user_section {
-        validate_section(&user_path, &section)?;
+        validate_section(user_path, &section)?;
         merged.extend(section);
     }
     if let Some(section) = project_section {
@@ -81,23 +167,29 @@ pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
     parse_settings(&Value::Object(merged))
 }
 
-fn validate_section(path: &Path, section: &Map<String, Value>) -> Result<(), String> {
-    deserialize_settings(&Value::Object(section.clone()))
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+fn validate_section(path: &Path, section: &Map) -> Result<(), String> {
+    let settings =
+        Settings::from_object(section).map_err(|error| format!("{}: {error}", path.display()))?;
+    validate_settings(&settings).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(())
 }
 
 fn deserialize_settings(value: &Value) -> Result<Settings, String> {
-    let settings: Settings = serde_json::from_value(value.clone())
+    let settings = Settings::from_value(value)
         .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    Ok(settings)
+}
+
+fn validate_settings(settings: &Settings) -> Result<(), String> {
     if let Some(path) = settings.godot_path.as_deref() {
         crate::godot_bin::validate_godot_path(Path::new(path))?;
     }
     validate_extra_args(&settings.extra_args)?;
-    Ok(settings)
+    Ok(())
 }
 
-fn read_settings_section(path: &Path) -> Result<Option<Map<String, Value>>, String> {
+fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -124,8 +216,8 @@ fn read_settings_section(path: &Path) -> Result<Option<Map<String, Value>>, Stri
     if text.len() > SETTINGS_FILE_CAP as usize {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
     }
-    let value: Value =
-        json5::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let value: Value = crate::json::from_str_relaxed(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     let Some(settings) = value
         .get("lsp")
         .and_then(|lsp| lsp.get("godot"))
@@ -159,20 +251,11 @@ fn user_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use crate::temp::tempdir;
     use std::fs;
-    use tempfile::tempdir;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_config_dir(dir: &Path, run: impl FnOnce()) {
-        let old = env::var_os("XDG_CONFIG_HOME");
-        env::set_var("XDG_CONFIG_HOME", dir);
-        run();
-        match old {
-            Some(value) => env::set_var("XDG_CONFIG_HOME", value),
-            None => env::remove_var("XDG_CONFIG_HOME"),
-        }
+    fn user_settings_path_in(config_dir: &Path) -> PathBuf {
+        config_dir.join("zed").join("settings.json")
     }
 
     fn write_user_settings(config_dir: &Path, contents: &str) {
@@ -201,7 +284,7 @@ mod tests {
     #[test]
     fn unknown_key_does_not_fail() {
         let value: Value =
-            serde_json::from_str(r#"{"project_diagnostics": false, "made_up_key": 42}"#).unwrap();
+            crate::json::from_str(r#"{"project_diagnostics": false, "made_up_key": 42}"#).unwrap();
         let settings = parse_settings(&value).unwrap();
         assert!(!settings.project_diagnostics);
         assert_eq!(settings.dap_port, 6006);
@@ -210,9 +293,9 @@ mod tests {
     #[test]
     fn non_object_is_an_error() {
         for value in [
-            serde_json::from_str(r#"["lsp"]"#).unwrap(),
-            serde_json::from_str(r#""string""#).unwrap(),
-            serde_json::from_str("42").unwrap(),
+            crate::json::from_str(r#"["lsp"]"#).unwrap(),
+            crate::json::from_str(r#""string""#).unwrap(),
+            crate::json::from_str("42").unwrap(),
         ] {
             assert_eq!(
                 parse_settings(&value).unwrap_err(),
@@ -223,7 +306,6 @@ mod tests {
 
     #[test]
     fn project_settings_override_user_per_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         write_user_settings(
             config_dir.path(),
@@ -256,22 +338,21 @@ mod tests {
                 }
             }"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-            assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
-            assert_eq!(settings.lsp_port, None);
-            assert_eq!(settings.dap_port, 5555);
-            assert_eq!(settings.startup_timeout_s, 30);
-            assert!(!settings.project_diagnostics);
-            assert!(settings.diagnose_addons);
-            assert_eq!(settings.extra_args, ["--verbose"]);
-        });
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
+        assert_eq!(settings.lsp_port, None);
+        assert_eq!(settings.dap_port, 5555);
+        assert_eq!(settings.startup_timeout_s, 30);
+        assert!(!settings.project_diagnostics);
+        assert!(settings.diagnose_addons);
+        assert_eq!(settings.extra_args, ["--verbose"]);
     }
 
     #[test]
     fn comment_bearing_settings_file_parses() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         let worktree = tempdir().unwrap();
         write_project_settings(
@@ -288,26 +369,25 @@ mod tests {
                 },
             }"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let settings = load_zed_settings(worktree.path()).unwrap();
-            assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-            assert_eq!(settings.extra_args, ["--verbose"]);
-        });
+        let settings =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap();
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.extra_args, ["--verbose"]);
     }
 
     #[test]
     fn validation_error_names_the_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempdir().unwrap();
         let worktree = tempdir().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{"lsp": {"godot": {"settings": {"extra_args": ["--editor"]}}}}"#,
         );
-        with_config_dir(config_dir.path(), || {
-            let error = load_zed_settings(worktree.path()).unwrap_err();
-            assert!(error.contains(".zed/settings.json"), "{error}");
-            assert!(error.contains("--editor"), "{error}");
-        });
+        let error =
+            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
+                .unwrap_err();
+        assert!(error.contains(".zed/settings.json"), "{error}");
+        assert!(error.contains("--editor"), "{error}");
     }
 }

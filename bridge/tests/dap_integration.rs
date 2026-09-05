@@ -1,10 +1,10 @@
 mod common;
 use common::*;
+use godot_bridge::temp::TempDir;
 use serde_json::json;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 
 #[test]
 fn dap_without_owner_returns_initialize_failure() {

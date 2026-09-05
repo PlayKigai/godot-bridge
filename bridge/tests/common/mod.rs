@@ -9,7 +9,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use url::Url;
 
 pub enum Protocol {
     Lsp,
@@ -44,10 +43,10 @@ impl BridgeClient {
             .current_dir(project)
             .env("XDG_RUNTIME_DIR", runtime)
             .env("XDG_CONFIG_HOME", &config)
-            .env("GODOT_BRIDGE_LOG", "error")
+            .env("GODOT_BRIDGE_LOG", "debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         if let Some(settings) = settings {
             process.env("GODOT_BRIDGE_SETTINGS", settings);
         }
@@ -120,9 +119,7 @@ pub fn fixture(name: &str) -> PathBuf {
 }
 
 pub fn file_uri(path: &Path) -> String {
-    Url::from_file_path(path.canonicalize().unwrap())
-        .unwrap()
-        .to_string()
+    godot_bridge::file_uri::path_to_uri(&path.canonicalize().unwrap())
 }
 
 pub fn godot_available(test: &str) -> bool {
@@ -161,14 +158,13 @@ pub fn initialize_dap(client: &mut BridgeClient) -> Value {
     })
 }
 
+fn project_hash(project: &Path) -> String {
+    godot_bridge::fnv::hash_hex(project.canonicalize().unwrap().to_string_lossy().as_bytes())
+}
+
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
-    let canonical = project.canonicalize().unwrap();
-    let hash = blake3::hash(canonical.to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
-    let state = runtime
-        .join("godot-bridge")
-        .join(format!("{}.json", &hash[..16]));
+    let hash = project_hash(project);
+    let state = runtime.join("godot-bridge").join(format!("{hash}.json"));
     let value: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     (state, value)
 }
@@ -187,26 +183,20 @@ pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path)
     let _ = client.child.wait();
     assert!(!Path::new(&format!("/proc/{godot_pid}")).exists());
     assert!(!state_path.exists());
-    let hash = blake3::hash(project.canonicalize().unwrap().to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
+    let hash = project_hash(project);
     assert!(runtime
         .join("godot-bridge")
-        .join(format!("{}.lock", &hash[..16]))
+        .join(format!("{hash}.lock"))
         .exists());
     assert!(!runtime
         .join("godot-bridge")
-        .join(format!("{}.sock", &hash[..16]))
+        .join(format!("{hash}.sock"))
         .exists());
 }
 
 pub fn runtime_socket(runtime: &Path, project: &Path) -> PathBuf {
-    let hash = blake3::hash(project.canonicalize().unwrap().to_string_lossy().as_bytes())
-        .to_hex()
-        .to_string();
-    runtime
-        .join("godot-bridge")
-        .join(format!("{}.sock", &hash[..16]))
+    let hash = project_hash(project);
+    runtime.join("godot-bridge").join(format!("{hash}.sock"))
 }
 
 pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
@@ -214,7 +204,9 @@ pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    stream.write_all(b"{\"cmd\":\"status\"}\n").ok()?;
+    let canonical = project.canonicalize().unwrap();
+    let request = serde_json::json!({"cmd": "status", "project": canonical.to_string_lossy()});
+    stream.write_all(format!("{request}\n").as_bytes()).ok()?;
     stream.shutdown(Shutdown::Write).ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;

@@ -1,15 +1,17 @@
-use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use crate::error::Result;
+use crate::json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, BufWriter, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncWrite, BufWriter};
-use tokio::net::{tcp::OwnedWriteHalf, TcpStream};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
-use crate::framing::{parse_json_object, write_json, FrameReader};
+use crate::framing::{parse_json_object, spawn_frame_reader, write_json, FrameEvent, FrameReader};
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
 use crate::settings_file::{parse_settings, Settings};
@@ -28,8 +30,44 @@ struct Prepared {
 }
 
 struct Connection {
-    reader: FrameReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    socket: TcpStream,
+    reader: Option<Receiver<FrameEvent>>,
+    reader_thread: Option<JoinHandle<()>>,
+    writer: TcpStream,
+}
+
+impl Connection {
+    fn from_stream(stream: TcpStream) -> io::Result<Self> {
+        let reader_stream = stream.try_clone()?;
+        let writer = stream.try_clone()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader_thread =
+            spawn_frame_reader("godot-bridge-dap-reader", reader_stream, FRAME_CAP, sender)?;
+        Ok(Self {
+            socket: stream,
+            reader: Some(receiver),
+            reader_thread: Some(reader_thread),
+            writer,
+        })
+    }
+
+    fn try_read_frame(&self) -> Option<FrameEvent> {
+        self.reader.as_ref()?.try_recv().ok()
+    }
+
+    fn close(&mut self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        drop(self.reader.take());
+        if let Some(reader_thread) = self.reader_thread.take() {
+            let _ = reader_thread.join();
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 struct DapLock {
@@ -40,12 +78,6 @@ impl Drop for DapLock {
     fn drop(&mut self) {
         self.guard.take();
     }
-}
-
-enum InputEvent {
-    Frame(Vec<u8>),
-    Eof,
-    Error,
 }
 
 struct ClientBuffer {
@@ -80,17 +112,17 @@ impl ClientBuffer {
         let message = self.messages.pop_front()?;
         self.bytes = self
             .bytes
-            .saturating_sub(serde_json::to_vec(&message).map_or(0, |bytes| bytes.len()));
+            .saturating_sub(crate::json::to_vec(&message).len());
         Some(message)
     }
 }
 
-struct ClientOutput<W> {
+struct ClientOutput<W: Write> {
     writer: BufWriter<W>,
     next_seq: i64,
 }
 
-impl<W: AsyncWrite + Unpin> ClientOutput<W> {
+impl<W: Write> ClientOutput<W> {
     fn new(writer: W) -> Self {
         Self {
             writer: BufWriter::new(writer),
@@ -98,25 +130,22 @@ impl<W: AsyncWrite + Unpin> ClientOutput<W> {
         }
     }
 
-    async fn send(&mut self, mut message: Value) -> Result<()> {
+    fn send(&mut self, mut message: Value) -> Result<()> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        message["seq"] = json!(seq);
-        write_json(&mut self.writer, &message, FRAME_CAP, true)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+        message["seq"] = crate::json!(seq);
+        write_json(&mut self.writer, &message, FRAME_CAP, true)?;
         Ok(())
     }
 
-    async fn failure(&mut self, initialize: &Value, message: &str) -> Result<()> {
-        self.send(json!({
+    fn failure(&mut self, initialize: &Value, message: &str) -> Result<()> {
+        self.send(crate::json!({
             "type": "response",
-            "request_seq": initialize.get("seq").cloned().unwrap_or(Value::Null),
+            "request_seq": (initialize.get("seq").cloned().unwrap_or(Value::Null)),
             "command": "initialize",
             "success": false,
             "message": message,
         }))
-        .await
     }
 }
 
@@ -137,7 +166,7 @@ impl ServerRequests {
                 self.original_sequences.insert(bridge_seq, original);
             }
         }
-        message["seq"] = json!(bridge_seq);
+        message["seq"] = crate::json!(bridge_seq);
     }
 
     fn restore_response(&mut self, message: &mut Value) {
@@ -168,10 +197,9 @@ enum InitializeWait {
     GodotDead,
 }
 
-pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> anyhow::Result<ExitCode> {
-    let _ = trailing;
-    let mut input = FrameReader::new(tokio::io::stdin(), FRAME_CAP);
-    let first = match input.read_frame().await {
+pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
+    let mut input_reader = FrameReader::new(std::io::stdin(), FRAME_CAP);
+    let first = match input_reader.read_frame() {
         Ok(Some(body)) => body,
         Ok(None) => return Ok(ExitCode::SUCCESS),
         Err(_) => return Ok(ExitCode::from(1)),
@@ -186,56 +214,67 @@ pub async fn run(file: Option<PathBuf>, trailing: Vec<String>) -> anyhow::Result
         Ok(_) | Err(_) => return Ok(ExitCode::from(1)),
     };
 
-    let (sender, mut receiver) = mpsc::channel(1);
-    let reader_task = tokio::spawn(read_client_frames(input, sender));
-    let mut output = ClientOutput::new(tokio::io::stdout());
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _input_thread = spawn_frame_reader(
+        "godot-bridge-dap-client-reader",
+        input_reader.into_inner(),
+        FRAME_CAP,
+        sender,
+    )?;
+    let mut output = ClientOutput::new(std::io::stdout());
     let mut buffer = ClientBuffer::new();
-    let mut preparing = Box::pin(prepare(file.as_deref()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_worker = Arc::clone(&cancel);
+    let (prepared_sender, prepared_receiver) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("godot-bridge-dap-prepare".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let result = prepare(file.as_deref(), &cancel_for_worker);
+            let _ = prepared_sender.send(result);
+        })?;
     let prepared = loop {
-        tokio::select! {
-            result = &mut preparing => break result,
-            event = receiver.recv() => {
-                match event {
-                    Some(InputEvent::Frame(body)) => {
-                        if buffer.push(body).is_err() {
-                            stop_reader(reader_task).await;
-                            return Ok(ExitCode::from(1));
-                        }
-                    }
-                    Some(InputEvent::Eof) | None => {
-                        stop_reader(reader_task).await;
-                        return Ok(ExitCode::SUCCESS);
-                    }
-                    Some(InputEvent::Error) => {
-                        stop_reader(reader_task).await;
-                        return Ok(ExitCode::from(1));
-                    }
+        match prepared_receiver.try_recv() {
+            Ok(result) => break result,
+            Err(TryRecvError::Disconnected) => {
+                return Ok(ExitCode::from(1));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        match receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(Ok(Some(body))) => {
+                if buffer.push(body).is_err() {
+                    cancel.store(true, Ordering::Release);
+                    return Ok(ExitCode::from(1));
                 }
             }
+            Ok(Ok(None)) => {
+                cancel.store(true, Ordering::Release);
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancel.store(true, Ordering::Release);
+                return Ok(ExitCode::from(1));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
-            stop_reader(reader_task).await;
-            output.failure(&initialize, &message).await?;
+            output.failure(&initialize, &message)?;
             return Ok(ExitCode::from(1));
         }
     };
-
-    let result = run_session(
-        initialize,
-        prepared,
-        &mut output,
-        &mut receiver,
-        &mut buffer,
-    )
-    .await;
-    stop_reader(reader_task).await;
+    let result = run_session(initialize, prepared, &mut output, &receiver, &mut buffer);
+    let _ = worker.join();
     result
 }
 
-async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
+fn prepare(file: Option<&Path>, cancel: &AtomicBool) -> std::result::Result<Prepared, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("DAP startup cancelled".to_owned());
+    }
     let settings = read_settings()?;
     let root = cwd_root().map_err(|error| error.to_string())?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
@@ -261,16 +300,13 @@ async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
     };
 
     let stream = if settings.lsp_port.is_some() {
-        connect_dap(settings.dap_port).await?
+        connect_dap(settings.dap_port)?
     } else {
-        discover_owner(&files, &project, &settings).await?
+        discover_owner(&files, &project, &settings, cancel)?
     };
-    let (read, write) = stream.into_split();
+    let connection = Connection::from_stream(stream).map_err(|error| error.to_string())?;
     Ok(Prepared {
-        connection: Connection {
-            reader: FrameReader::new(read, FRAME_CAP),
-            writer: write,
-        },
+        connection,
         lock,
         project,
         file: file.map(crate::root::canonical_or_normalized),
@@ -279,7 +315,7 @@ async fn prepare(file: Option<&Path>) -> std::result::Result<Prepared, String> {
 
 fn read_settings() -> std::result::Result<Settings, String> {
     let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
-        Ok(contents) if contents.len() <= 1024 * 1024 => serde_json::from_str(&contents)
+        Ok(contents) if contents.len() <= 1024 * 1024 => crate::json::from_str(&contents)
             .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
         Ok(_) => return Err("GODOT_BRIDGE_SETTINGS exceeds 1 MiB".to_owned()),
         Err(std::env::VarError::NotPresent) => Value::Null,
@@ -288,27 +324,24 @@ fn read_settings() -> std::result::Result<Settings, String> {
     parse_settings(&value)
 }
 
-async fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {
-    match tokio::time::timeout(
-        SOCKET_REQUEST_TIMEOUT,
-        TcpStream::connect(("127.0.0.1", port)),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(format!(
-            "cannot connect to Godot DAP on port {port}: {error}"
-        )),
-        Err(_) => Err(format!(
+fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&address, SOCKET_REQUEST_TIMEOUT) {
+        Ok(stream) => Ok(stream),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(format!(
             "cannot connect to Godot DAP on port {port}: timed out"
+        )),
+        Err(error) => Err(format!(
+            "cannot connect to Godot DAP on port {port}: {error}"
         )),
     }
 }
 
-async fn discover_owner(
+fn discover_owner(
     files: &ProjectFiles,
     project: &Path,
     settings: &Settings,
+    cancel: &AtomicBool,
 ) -> std::result::Result<TcpStream, String> {
     let no_owner = format!(
         "No Godot language server runs for {}. Open a .gd file of the project in Zed first.",
@@ -317,6 +350,9 @@ async fn discover_owner(
     let deadline = (settings.startup_timeout_s != 0)
         .then(|| Instant::now() + Duration::from_secs(u64::from(settings.startup_timeout_s)));
     loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("DAP startup cancelled".to_owned());
+        }
         let timeout = deadline.map_or(SOCKET_REQUEST_TIMEOUT, |limit| {
             limit
                 .checked_duration_since(Instant::now())
@@ -329,9 +365,12 @@ async fn discover_owner(
                 settings.startup_timeout_s
             ));
         }
-        let status = socket_request(&files.sock, &json!({"cmd": "status"}), timeout)
-            .await
-            .map_err(|_| no_owner.clone())?;
+        let status = socket_request(
+            &files.sock,
+            &crate::json!({"cmd": "status", "project": (project.to_string_lossy())}),
+            timeout,
+        )
+        .map_err(|_| no_owner.clone())?;
         match status.get("status").and_then(Value::as_str) {
             Some("ready") => {
                 let port = status
@@ -339,7 +378,7 @@ async fn discover_owner(
                     .and_then(Value::as_u64)
                     .and_then(|port| u16::try_from(port).ok())
                     .ok_or_else(|| "Godot owner has no DAP port".to_owned())?;
-                return connect_dap(port).await;
+                return connect_dap(port);
             }
             Some("starting") | Some("recovering") => {
                 if deadline.is_some_and(|limit| Instant::now() >= limit) {
@@ -354,18 +393,18 @@ async fn discover_owner(
                         .unwrap_or(Duration::ZERO)
                         .min(POLL_INTERVAL)
                 });
-                tokio::time::sleep(sleep_for).await;
+                thread::sleep(sleep_for);
             }
             _ => return Err(no_owner),
         }
     }
 }
 
-async fn run_session(
+fn run_session(
     initialize: Value,
     mut prepared: Prepared,
-    output: &mut ClientOutput<tokio::io::Stdout>,
-    receiver: &mut mpsc::Receiver<InputEvent>,
+    output: &mut ClientOutput<std::io::Stdout>,
+    receiver: &Receiver<FrameEvent>,
     buffer: &mut ClientBuffer,
 ) -> Result<ExitCode> {
     let project = prepared.project.clone();
@@ -378,23 +417,22 @@ async fn run_session(
         buffer,
         &project,
         file.as_deref(),
-    )
-    .await;
+    );
     drop(prepared.lock);
     result
 }
 
-async fn run_session_inner(
+fn run_session_inner(
     initialize: &Value,
     connection: &mut Connection,
-    output: &mut ClientOutput<tokio::io::Stdout>,
-    receiver: &mut mpsc::Receiver<InputEvent>,
+    output: &mut ClientOutput<std::io::Stdout>,
+    receiver: &Receiver<FrameEvent>,
     buffer: &mut ClientBuffer,
     project: &Path,
     file: Option<&Path>,
 ) -> Result<ExitCode> {
     let mut server_requests = ServerRequests::new();
-    send_to_godot(&mut connection.writer, initialize).await?;
+    send_to_godot(&mut connection.writer, initialize)?;
     match wait_for_initialize(
         initialize,
         connection,
@@ -402,9 +440,7 @@ async fn run_session_inner(
         receiver,
         buffer,
         &mut server_requests,
-    )
-    .await?
-    {
+    )? {
         InitializeWait::Ready => {}
         InitializeWait::ClientEof => return Ok(ExitCode::SUCCESS),
         InitializeWait::ClientInvalid | InitializeWait::GodotDead => {
@@ -414,23 +450,31 @@ async fn run_session_inner(
 
     while let Some(message) = buffer.pop() {
         if let Some(result) =
-            forward_client(message, &mut server_requests, connection, project, file).await?
+            forward_client(message, &mut server_requests, connection, project, file)?
         {
             let ForwardClient::Failure {
                 request_seq,
                 command,
                 message,
             } = result;
-            send_request_failure(output, request_seq, command, message).await?;
+            send_request_failure(output, request_seq, command, message)?;
         }
     }
 
     let mut process_seen = false;
+    let mut turn = false;
     loop {
-        tokio::select! {
-            event = receiver.recv() => {
-                match event {
-                    Some(InputEvent::Frame(body)) => {
+        let server_event = turn;
+        let event = if server_event {
+            connection.try_read_frame()
+        } else {
+            receiver.try_recv().ok()
+        };
+        turn = !turn;
+        if let Some(event) = event {
+            match event {
+                Ok(Some(body)) => {
+                    if !server_event {
                         let message = match parse_message(&body) {
                             Ok(message) => message,
                             Err(_) => return Ok(ExitCode::from(1)),
@@ -441,21 +485,18 @@ async fn run_session_inner(
                             connection,
                             project,
                             file,
-                        ).await? {
-                            let ForwardClient::Failure { request_seq, command, message } = result;
-                            send_request_failure(output, request_seq, command, message).await?;
+                        )? {
+                            let ForwardClient::Failure {
+                                request_seq,
+                                command,
+                                message,
+                            } = result;
+                            send_request_failure(output, request_seq, command, message)?;
                         }
-                    }
-                    Some(InputEvent::Eof) | None => return Ok(ExitCode::SUCCESS),
-                    Some(InputEvent::Error) => return Ok(ExitCode::from(1)),
-                }
-            }
-            server = connection.reader.read_frame() => {
-                match server {
-                    Ok(Some(body)) => {
+                    } else {
                         let mut message = match parse_message(&body) {
                             Ok(message) => message,
-                            Err(_) => return godot_died(output).await,
+                            Err(_) => return godot_died(output),
                         };
                         if !should_forward_server_event(&message, &mut process_seen) {
                             continue;
@@ -463,11 +504,51 @@ async fn run_session_inner(
                         server_requests.restore_response(&mut message);
                         let seq = output.next_seq;
                         server_requests.rewrite(&mut message, seq);
-                        output.send(message).await?;
+                        output.send(message)?;
                     }
-                    Ok(None) | Err(_) => return godot_died(output).await,
+                }
+                Ok(None) => {
+                    if server_event {
+                        return godot_died(output);
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(_) => {
+                    return if server_event {
+                        godot_died(output)
+                    } else {
+                        Ok(ExitCode::from(1))
+                    }
                 }
             }
+            continue;
+        }
+        let event = if turn {
+            receiver.recv_timeout(Duration::from_millis(20))
+        } else {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        match event {
+            Ok(Ok(Some(body))) => {
+                let message = match parse_message(&body) {
+                    Ok(message) => message,
+                    Err(_) => return Ok(ExitCode::from(1)),
+                };
+                if let Some(result) =
+                    forward_client(message, &mut server_requests, connection, project, file)?
+                {
+                    let ForwardClient::Failure {
+                        request_seq,
+                        command,
+                        message,
+                    } = result;
+                    send_request_failure(output, request_seq, command, message)?;
+                }
+            }
+            Ok(Ok(None)) => return Ok(ExitCode::SUCCESS),
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ExitCode::from(1)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -482,66 +563,95 @@ fn should_forward_server_event(message: &Value, process_seen: &mut bool) -> bool
         return true;
     }
     if !*process_seen && (event == Some("exited") || event == Some("terminated")) {
-        tracing::debug!(?event, "dropping stale DAP lifecycle event before process");
+        crate::debug!("dropping stale DAP lifecycle event before process: {event:?}");
         return false;
     }
     true
 }
 
-async fn wait_for_initialize(
+fn wait_for_initialize(
     initialize: &Value,
     connection: &mut Connection,
-    output: &mut ClientOutput<tokio::io::Stdout>,
-    receiver: &mut mpsc::Receiver<InputEvent>,
+    output: &mut ClientOutput<std::io::Stdout>,
+    receiver: &Receiver<FrameEvent>,
     buffer: &mut ClientBuffer,
     server_requests: &mut ServerRequests,
 ) -> Result<InitializeWait> {
     let initialize_seq = initialize.get("seq").cloned().unwrap_or(Value::Null);
+    let mut turn = false;
     loop {
-        tokio::select! {
-            event = receiver.recv() => {
-                match event {
-                    Some(InputEvent::Frame(body)) => {
+        let server_event = turn;
+        let event = if server_event {
+            connection.try_read_frame()
+        } else {
+            receiver.try_recv().ok()
+        };
+        turn = !turn;
+        if let Some(event) = event {
+            match event {
+                Ok(Some(body)) => {
+                    if !server_event {
                         if buffer.push(body).is_err() {
                             return Ok(InitializeWait::ClientInvalid);
                         }
-                    }
-                    Some(InputEvent::Eof) | None => return Ok(InitializeWait::ClientEof),
-                    Some(InputEvent::Error) => return Ok(InitializeWait::ClientInvalid),
-                }
-            }
-            server = connection.reader.read_frame() => {
-                match server {
-                    Ok(Some(body)) => {
+                    } else {
                         let mut message = match parse_message(&body) {
                             Ok(message) => message,
                             Err(_) => {
-                                godot_died(output).await?;
+                                godot_died(output)?;
                                 return Ok(InitializeWait::GodotDead);
                             }
                         };
-                        let is_initialize_response = message.get("type").and_then(Value::as_str) == Some("response")
-                            && message.get("command") == Some(&json!("initialize"))
+                        let is_initialize_response = message.get("type").and_then(Value::as_str)
+                            == Some("response")
+                            && message.get("command") == Some(&crate::json!("initialize"))
                             && message.get("request_seq") == Some(&initialize_seq);
                         server_requests.restore_response(&mut message);
                         let seq = output.next_seq;
                         server_requests.rewrite(&mut message, seq);
-                        output.send(message).await?;
+                        output.send(message)?;
                         if is_initialize_response {
                             return Ok(InitializeWait::Ready);
                         }
                     }
-                    Ok(None) | Err(_) => {
-                        godot_died(output).await?;
-                        return Ok(InitializeWait::GodotDead);
+                }
+                Ok(None) => {
+                    return if server_event {
+                        Ok(InitializeWait::GodotDead)
+                    } else {
+                        Ok(InitializeWait::ClientEof)
+                    }
+                }
+                Err(_) => {
+                    return if server_event {
+                        Ok(InitializeWait::GodotDead)
+                    } else {
+                        Ok(InitializeWait::ClientInvalid)
                     }
                 }
             }
+            continue;
+        }
+        if turn {
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ok(Some(body))) => {
+                    if buffer.push(body).is_err() {
+                        return Ok(InitializeWait::ClientInvalid);
+                    }
+                }
+                Ok(Ok(None)) => return Ok(InitializeWait::ClientEof),
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(InitializeWait::ClientInvalid)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-async fn forward_client(
+fn forward_client(
     mut message: Value,
     server_requests: &mut ServerRequests,
     connection: &mut Connection,
@@ -570,25 +680,23 @@ async fn forward_client(
             }
         }
     }
-    send_to_godot(&mut connection.writer, &message).await?;
+    send_to_godot(&mut connection.writer, &message)?;
     Ok(None)
 }
 
-async fn send_request_failure(
-    output: &mut ClientOutput<tokio::io::Stdout>,
+fn send_request_failure(
+    output: &mut ClientOutput<std::io::Stdout>,
     request_seq: Value,
     command: String,
     message: String,
 ) -> Result<()> {
-    output
-        .send(json!({
-            "type": "response",
-            "request_seq": request_seq,
-            "command": command,
-            "success": false,
-            "message": message,
-        }))
-        .await
+    output.send(crate::json!({
+        "type": "response",
+        "request_seq": request_seq,
+        "command": command,
+        "success": false,
+        "message": message,
+    }))
 }
 
 fn rewrite_launch_or_attach(
@@ -610,11 +718,10 @@ fn rewrite_launch_or_attach(
         }
         return Ok(());
     }
-    let Some(arguments) = object
-        .entry("arguments")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-    else {
+    if object.get("arguments").is_none() {
+        object.insert("arguments".to_owned(), crate::json!({}));
+    }
+    let Some(arguments) = object.get_mut("arguments").and_then(Value::as_object_mut) else {
         return Err((request_seq, "DAP arguments must be an object".to_owned()));
     };
     arguments.remove("adapter");
@@ -643,49 +750,15 @@ fn rewrite_launch_or_attach(
     Ok(())
 }
 
-async fn send_to_godot(writer: &mut OwnedWriteHalf, message: &Value) -> Result<()> {
-    write_json(writer, message, FRAME_CAP, true)
-        .await
-        .map_err(|error| anyhow!(error.to_string()))?;
+fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
+    write_json(writer, message, FRAME_CAP, true)?;
     Ok(())
 }
 
-async fn godot_died(output: &mut ClientOutput<tokio::io::Stdout>) -> Result<ExitCode> {
-    output
-        .send(json!({"type": "event", "event": "terminated"}))
-        .await?;
-    output
-        .send(json!({"type": "event", "event": "exited"}))
-        .await?;
+fn godot_died(output: &mut ClientOutput<std::io::Stdout>) -> Result<ExitCode> {
+    output.send(crate::json!({"type": "event", "event": "terminated"}))?;
+    output.send(crate::json!({"type": "event", "event": "exited"}))?;
     Ok(ExitCode::from(1))
-}
-
-async fn read_client_frames(
-    mut input: FrameReader<tokio::io::Stdin>,
-    sender: mpsc::Sender<InputEvent>,
-) {
-    loop {
-        match input.read_frame().await {
-            Ok(Some(body)) => {
-                if sender.send(InputEvent::Frame(body)).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => {
-                let _ = sender.send(InputEvent::Eof).await;
-                return;
-            }
-            Err(_error) => {
-                let _ = sender.send(InputEvent::Error).await;
-                return;
-            }
-        }
-    }
-}
-
-async fn stop_reader(reader: JoinHandle<()>) {
-    reader.abort();
-    let _ = reader.await;
 }
 
 fn parse_message(body: &[u8]) -> std::result::Result<Value, String> {
@@ -698,7 +771,7 @@ mod tests {
 
     #[test]
     fn rewrites_launch_arguments() {
-        let mut message = json!({
+        let mut message = crate::json!({
             "type": "request",
             "seq": 4,
             "command": "launch",
@@ -720,7 +793,7 @@ mod tests {
 
     #[test]
     fn missing_current_file_has_exact_error() {
-        let mut message = json!({
+        let mut message = crate::json!({
             "type": "request",
             "seq": 2,
             "command": "launch",
@@ -728,16 +801,16 @@ mod tests {
         });
         assert_eq!(
             rewrite_launch_or_attach(&mut message, "launch", Path::new("/project"), None),
-            Err((json!(2), "scene current requires --file".to_owned()))
+            Err((crate::json!(2), "scene current requires --file".to_owned()))
         );
     }
 
     #[test]
     fn server_request_sequence_is_restored() {
         let mut requests = ServerRequests::new();
-        let mut request = json!({"type":"request","seq":17});
+        let mut request = crate::json!({"type":"request","seq":17});
         requests.rewrite(&mut request, 1);
-        let mut response = json!({"type":"response","request_seq":1});
+        let mut response = crate::json!({"type":"response","request_seq":1});
         requests.restore_response(&mut response);
         assert_eq!(response["request_seq"], 17);
     }
@@ -745,11 +818,11 @@ mod tests {
     #[test]
     fn drops_lifecycle_events_before_process() {
         let messages = [
-            json!({"type":"event","event":"exited"}),
-            json!({"type":"event","event":"terminated"}),
-            json!({"type":"event","event":"process"}),
-            json!({"type":"event","event":"exited"}),
-            json!({"type":"event","event":"terminated"}),
+            crate::json!({"type":"event","event":"exited"}),
+            crate::json!({"type":"event","event":"terminated"}),
+            crate::json!({"type":"event","event":"process"}),
+            crate::json!({"type":"event","event":"exited"}),
+            crate::json!({"type":"event","event":"terminated"}),
         ];
         let mut process_seen = false;
         let forwarded = messages
@@ -759,7 +832,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             forwarded,
-            [json!("process"), json!("exited"), json!("terminated")]
+            [
+                crate::json!("process"),
+                crate::json!("exited"),
+                crate::json!("terminated"),
+            ]
         );
     }
 }

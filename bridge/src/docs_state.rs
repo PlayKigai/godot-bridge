@@ -5,10 +5,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use notify::event::{ModifyKind, RenameMode};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc::{self, Receiver};
-
 use crate::root::{canonical_or_normalized, doc_key, path_to_uri};
 
 pub use crate::root::normalize_absolute as normalize_path;
@@ -365,7 +361,10 @@ fn scan_directory(
     let mut entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries.flatten().collect::<Vec<_>>(),
         Err(error) => {
-            tracing::warn!(path = %directory.display(), %error, "skipping unreadable diagnostics directory");
+            crate::warn!(
+                "skipping unreadable diagnostics directory {}: {error}",
+                directory.display()
+            );
             return;
         }
     };
@@ -375,7 +374,10 @@ fn scan_directory(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "skipping unreadable diagnostics entry");
+                crate::warn!(
+                    "skipping unreadable diagnostics entry {}: {error}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -408,7 +410,10 @@ pub fn read_document(path: &Path) -> Option<String> {
     {
         Ok(file) => file,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "skipping unreadable diagnostics file");
+            crate::warn!(
+                "skipping unreadable diagnostics file {}: {error}",
+                path.display()
+            );
             return None;
         }
     };
@@ -418,17 +423,20 @@ pub fn read_document(path: &Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .is_err()
     {
-        tracing::warn!(path = %path.display(), "skipping unreadable diagnostics file");
+        crate::warn!("skipping unreadable diagnostics file {}", path.display());
         return None;
     }
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        tracing::warn!(path = %path.display(), "skipping diagnostics file over 2 MiB");
+        crate::warn!("skipping diagnostics file over 2 MiB {}", path.display());
         return None;
     }
     match String::from_utf8(bytes) {
         Ok(text) => Some(text),
         Err(_) => {
-            tracing::warn!(path = %path.display(), "skipping diagnostics file with invalid UTF-8");
+            crate::warn!(
+                "skipping diagnostics file with invalid UTF-8 {}",
+                path.display()
+            );
             None
         }
     }
@@ -462,6 +470,7 @@ pub enum WatcherChangeKind {
     Created,
     Modified,
     Removed,
+    Rescan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,95 +479,7 @@ pub struct WatcherChange {
     pub path: PathBuf,
 }
 
-pub fn watcher_changes(event: Event) -> Vec<WatcherChange> {
-    match event.kind {
-        EventKind::Create(_) => event
-            .paths
-            .into_iter()
-            .map(|path| WatcherChange {
-                kind: WatcherChangeKind::Created,
-                path,
-            })
-            .collect(),
-        EventKind::Remove(_) => event
-            .paths
-            .into_iter()
-            .map(|path| WatcherChange {
-                kind: WatcherChangeKind::Removed,
-                path,
-            })
-            .collect(),
-        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => event
-            .paths
-            .into_iter()
-            .map(|path| WatcherChange {
-                kind: WatcherChangeKind::Removed,
-                path,
-            })
-            .collect(),
-        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
-            .paths
-            .into_iter()
-            .map(|path| WatcherChange {
-                kind: WatcherChangeKind::Created,
-                path,
-            })
-            .collect(),
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-            let mut paths = event.paths.into_iter();
-            let Some(old) = paths.next() else {
-                return Vec::new();
-            };
-            let Some(new) = paths.next() else {
-                return vec![WatcherChange {
-                    kind: WatcherChangeKind::Removed,
-                    path: old,
-                }];
-            };
-            vec![
-                WatcherChange {
-                    kind: WatcherChangeKind::Removed,
-                    path: old,
-                },
-                WatcherChange {
-                    kind: WatcherChangeKind::Created,
-                    path: new,
-                },
-            ]
-        }
-        EventKind::Modify(_) => event
-            .paths
-            .into_iter()
-            .map(|path| WatcherChange {
-                kind: WatcherChangeKind::Modified,
-                path,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-pub struct ProjectWatcher {
-    pub(crate) _watcher: RecommendedWatcher,
-    pub(crate) receiver: Receiver<notify::Result<Event>>,
-}
-
-pub fn watch_project(project: &Path) -> notify::Result<ProjectWatcher> {
-    let (sender, receiver) = mpsc::channel(1024);
-    let mut watcher = RecommendedWatcher::new(
-        move |result| {
-            let _ = sender.try_send(result);
-        },
-        Config::default(),
-    )?;
-    watcher.watch(project, RecursiveMode::Recursive)?;
-    Ok(ProjectWatcher {
-        _watcher: watcher,
-        receiver,
-    })
-}
-
-fn directory_is_skipped(path: &Path, project: &Path, diagnose_addons: bool) -> bool {
+pub(crate) fn directory_is_skipped(path: &Path, project: &Path, diagnose_addons: bool) -> bool {
     let Ok(relative) = path.strip_prefix(project) else {
         return true;
     };
@@ -575,9 +496,9 @@ fn directory_is_skipped(path: &Path, project: &Path, diagnose_addons: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp::tempdir;
     use std::fs;
     use std::sync::Mutex;
-    use tempfile::tempdir;
 
     #[test]
     fn scan_filters_project_diagnostics_files() {

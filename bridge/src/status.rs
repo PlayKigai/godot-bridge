@@ -2,21 +2,19 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::json;
-
 use crate::state::{remove_if_stale, runtime_dir, socket_request};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn run() -> anyhow::Result<()> {
+pub fn run() -> crate::error::Result<()> {
     let stdout = io::stdout();
-    run_in(&runtime_dir()?, &mut stdout.lock()).await
+    run_in(&runtime_dir()?, &mut stdout.lock())
 }
 
-async fn run_in(dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+fn run_in(dir: &Path, out: &mut impl Write) -> crate::error::Result<()> {
     for state_path in list_state_files(dir)? {
         let sock_path = state_path.with_extension("sock");
-        match socket_request(&sock_path, &json!({"cmd": "status"}), STATUS_TIMEOUT).await {
+        match socket_request(&sock_path, &crate::json!({"cmd": "status"}), STATUS_TIMEOUT) {
             Ok(response) => writeln!(out, "{response}")?,
             Err(_) => {
                 let _ = remove_if_stale(&state_path, &sock_path);
@@ -42,13 +40,12 @@ fn list_state_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
-
+    use crate::json::Value;
     use crate::state::{serve_socket, write_state, Mode, State, Status};
-    use tempfile::tempdir;
+    use crate::temp::tempdir;
 
-    #[tokio::test]
-    async fn detached_gui_state_without_socket_is_kept() {
+    #[test]
+    fn detached_gui_state_without_socket_is_kept() {
         let dir = tempdir().unwrap();
         write_state(
             &dir.path().join("gui.json"),
@@ -56,13 +53,13 @@ mod tests {
         )
         .unwrap();
         let mut output = Vec::new();
-        run_in(dir.path(), &mut output).await.unwrap();
+        run_in(dir.path(), &mut output).unwrap();
         assert!(dir.path().join("gui.json").exists());
         assert!(output.is_empty());
     }
 
-    #[tokio::test]
-    async fn stale_state_is_removed_and_live_status_is_printed() {
+    #[test]
+    fn stale_state_is_removed_and_live_status_is_printed() {
         let dir = tempdir().unwrap();
         let stale = State {
             version: 1,
@@ -82,19 +79,19 @@ mod tests {
         write_state(&dir.path().join("stale.json"), &stale).unwrap();
         std::fs::write(dir.path().join("stale.sock"), b"dead").unwrap();
         std::fs::write(dir.path().join("live.json"), b"{}").unwrap();
-        let _handle = serve_socket(dir.path().join("live.sock"), |_request| async move {
-            json!({"status": "ready", "project": "/live"})
-        })
-        .await
+        let _handle = serve_socket(
+            dir.path().join("live.sock"),
+            |_request| crate::json!({"status": "ready", "project": "/live"}),
+        )
         .unwrap();
         let mut output = Vec::new();
-        run_in(dir.path(), &mut output).await.unwrap();
+        run_in(dir.path(), &mut output).unwrap();
         assert!(!dir.path().join("stale.json").exists());
         assert!(!dir.path().join("stale.sock").exists());
         assert!(dir.path().join("live.json").exists());
         let lines: Vec<&str> = std::str::from_utf8(&output).unwrap().lines().collect();
         assert_eq!(lines.len(), 1);
-        let response: Value = serde_json::from_str(lines[0]).unwrap();
+        let response: Value = crate::json::from_str(lines[0]).unwrap();
         assert_eq!(response["status"], "ready");
         assert_eq!(response["project"], "/live");
     }

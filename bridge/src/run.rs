@@ -6,23 +6,22 @@ use crate::root;
 use crate::scene;
 use crate::settings_file;
 
-pub fn run(file: &Path, scene: Option<&str>) -> anyhow::Result<ExitCode> {
+pub fn run(file: &Path, scene: Option<&str>) -> crate::error::Result<ExitCode> {
     let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree).map_err(anyhow::Error::msg)?;
+    let settings = settings_file::load_zed_settings(&worktree)?;
     let project = root::find_project_dir(
         &worktree,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
     )?;
-    let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))
-        .map_err(anyhow::Error::msg)?;
-    godot_bin::check_version(&godot).map_err(anyhow::Error::msg)?;
+    let godot = godot_bin::resolve_godot(settings.godot_path.as_deref().map(Path::new))?;
+    godot_bin::check_version(&godot)?;
 
     let scene = match scene {
         None | Some("main") => None,
         Some("current") => Some(scene::resolve_scene(&project, file)?),
         Some(passed) if !passed.starts_with('-') => Some(passed.to_owned()),
-        Some(passed) => anyhow::bail!("scene value cannot start with '-': {passed}"),
+        Some(passed) => crate::bail!("scene value cannot start with '-': {passed}"),
     };
 
     let mut command = Command::new(&godot);
@@ -38,9 +37,9 @@ pub fn run(file: &Path, scene: Option<&str>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-pub fn project_dir(file: &Path) -> anyhow::Result<()> {
+pub fn project_dir(file: &Path) -> crate::error::Result<()> {
     let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree).map_err(anyhow::Error::msg)?;
+    let settings = settings_file::load_zed_settings(&worktree)?;
     let project = root::find_project_dir(
         &worktree,
         Some(file),

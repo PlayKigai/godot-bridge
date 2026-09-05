@@ -1,9 +1,9 @@
 mod common;
 use common::*;
+use godot_bridge::temp::TempDir;
 use serde_json::json;
 use std::thread;
 use std::time::Duration;
-use tempfile::TempDir;
 
 #[test]
 fn workspace_symbol_finds_ready_function() {
