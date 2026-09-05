@@ -417,16 +417,14 @@ pub fn search_with_uris<'a>(
                 indices: scratch.clone(),
                 ..matched
             }));
-        } else {
-            if matches.peek().is_some_and(|worst| {
-                compare_match_parts(&matched, &scratch, &worst.0) == Ordering::Less
-            }) {
-                matches.pop();
-                matches.push(HeapMatch(Match {
-                    indices: scratch.clone(),
-                    ..matched
-                }));
-            }
+        } else if matches.peek().is_some_and(|worst| {
+            compare_match_parts(&matched, &scratch, &worst.0) == Ordering::Less
+        }) {
+            matches.pop();
+            matches.push(HeapMatch(Match {
+                indices: scratch.clone(),
+                ..matched
+            }));
         }
     }
     let mut matches = matches.into_vec();
@@ -477,7 +475,7 @@ fn best_match_ascii(
     indices: &mut Vec<usize>,
     candidate: &mut Vec<usize>,
 ) -> Option<(usize, usize)> {
-    if !is_subsequence_bytes(name, query) {
+    if !is_subsequence(name, query, &u8::eq_ignore_ascii_case) {
         return None;
     }
     best_match(name, query, indices, candidate, |left, right| {
@@ -550,10 +548,6 @@ where
         }
     }
     false
-}
-
-fn is_subsequence_bytes(name: &[u8], query: &[u8]) -> bool {
-    is_subsequence(name, query, &u8::eq_ignore_ascii_case)
 }
 
 fn range_values(range: &Value) -> [u32; 4] {
@@ -769,13 +763,23 @@ mod tests {
             let query_mask = occurrence_mask(query);
             let expected = items
                 .iter()
-                .filter(|symbol| is_subsequence_bytes(symbol.name.as_bytes(), query.as_bytes()))
+                .filter(|symbol| {
+                    is_subsequence(
+                        symbol.name.as_bytes(),
+                        query.as_bytes(),
+                        &u8::eq_ignore_ascii_case,
+                    )
+                })
                 .count();
             let masked = items
                 .iter()
                 .filter(|symbol| {
                     symbol.occurrence_mask & query_mask == query_mask
-                        && is_subsequence_bytes(symbol.name.as_bytes(), query.as_bytes())
+                        && is_subsequence(
+                            symbol.name.as_bytes(),
+                            query.as_bytes(),
+                            &u8::eq_ignore_ascii_case,
+                        )
                 })
                 .count();
             assert_eq!(masked, expected);

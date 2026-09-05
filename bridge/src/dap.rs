@@ -266,6 +266,7 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let mut output = ClientOutput::new(std::io::stdout());
     let mut buffer = ClientBuffer::new();
     let mut early_frames = VecDeque::new();
+    let mut early_bytes = 0;
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = Arc::clone(&cancel);
     let prepared_sender = sender.clone();
@@ -285,7 +286,22 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             }
-            DapFrame::Body(side, body) => early_frames.push_back(DapFrame::Body(side, body)),
+            DapFrame::Body(side, body) => {
+                if body.len() > BUFFER_CAP {
+                    cancel.store(true, Ordering::Release);
+                    return Ok(ExitCode::from(1));
+                }
+                early_bytes += body.len();
+                early_frames.push_back(DapFrame::Body(side, body));
+                while early_bytes > BUFFER_CAP {
+                    let Some(frame) = early_frames.pop_front() else {
+                        break;
+                    };
+                    if let DapFrame::Body(_, body) = frame {
+                        early_bytes -= body.len();
+                    }
+                }
+            }
             DapFrame::End(side) => {
                 early_frames.push_back(DapFrame::End(side));
                 if matches!(side, DapSide::Client) {

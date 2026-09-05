@@ -53,6 +53,14 @@ const RECOVERY_QUEUE_CAP: usize = 1000;
 const QUEUE_BYTES_CAP: usize = 8 * 1024 * 1024;
 const WATCHER_PENDING_CAP: usize = 4096;
 const STARTUP_ATTEMPTS: usize = 3;
+const INTERCEPTED_METHODS: [&str; 6] = [
+    "workspace/symbol",
+    "initialized",
+    "textDocument/didOpen",
+    "textDocument/didChange",
+    "textDocument/didClose",
+    "$/cancelRequest",
+];
 
 type ClientWriter = BufWriter<StdoutFile>;
 
@@ -379,19 +387,13 @@ fn reconnect_gui(
     timeout_seconds: u32,
     event_sender: &mpsc::SyncSender<ProxyEvent>,
 ) -> Result<GuiReconnect> {
-    let Some(pid) = state.godot_pid else {
-        cleanup_files(files);
-        return Ok(GuiReconnect::Dead);
-    };
-    let Some(ticks) = state.godot_start_ticks else {
-        cleanup_files(files);
-        return Ok(GuiReconnect::Dead);
-    };
-    let Some(lsp_port) = state.lsp_port else {
-        cleanup_files(files);
-        return Ok(GuiReconnect::Dead);
-    };
-    let Some(dap_port) = state.dap_port else {
+    let Some((pid, ticks, lsp_port, dap_port)) = state
+        .godot_pid
+        .zip(state.godot_start_ticks)
+        .zip(state.lsp_port)
+        .zip(state.dap_port)
+        .map(|(((pid, ticks), lsp_port), dap_port)| (pid, ticks, lsp_port, dap_port))
+    else {
         cleanup_files(files);
         return Ok(GuiReconnect::Dead);
     };
@@ -890,7 +892,6 @@ pub fn run() -> Result<ExitCode> {
                     },
                 ) {
                     Ok(()) => {
-                        proxy.initialized_forwarded = true;
                         editor = Some(candidate);
                         break;
                     }
@@ -971,24 +972,13 @@ fn forward_client_body(
 }
 
 fn client_method_intercepted(method: crate::json::RawJson<'_>) -> bool {
-    method.string_eq("workspace/symbol")
-        || method.string_eq("initialized")
-        || method.string_eq("textDocument/didOpen")
-        || method.string_eq("textDocument/didChange")
-        || method.string_eq("textDocument/didClose")
-        || method.string_eq("$/cancelRequest")
+    INTERCEPTED_METHODS
+        .iter()
+        .any(|value| method.string_eq(value))
 }
 
 fn client_method_intercepted_str(method: &str) -> bool {
-    matches!(
-        method,
-        "workspace/symbol"
-            | "initialized"
-            | "textDocument/didOpen"
-            | "textDocument/didChange"
-            | "textDocument/didClose"
-            | "$/cancelRequest"
-    )
+    INTERCEPTED_METHODS.contains(&method)
 }
 
 fn forward_client_message(
@@ -1170,14 +1160,10 @@ fn forward_server_message<W: Write>(
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
-    let (fields, _) = crate::json::scan_top_level_until_method(body, |method| {
+    let (fields, intercepted) = crate::json::scan_top_level_until_method(body, |method| {
         method.string_eq("textDocument/publishDiagnostics")
             || method.string_eq("gdscript_client/changeWorkspace")
     })?;
-    let intercepted = fields.method.is_some_and(|method| {
-        method.string_eq("textDocument/publishDiagnostics")
-            || method.string_eq("gdscript_client/changeWorkspace")
-    });
     if !intercepted && fields.method.is_some() && fields.id.is_none() {
         send_client_body(output, body)?;
         return Ok(());
@@ -1355,7 +1341,7 @@ fn rewrite_document_messages(
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let (action_uri, version) = proxy.documents.zed_open(&uri, planned);
+            let (action_uri, version) = proxy.documents.zed_open(&uri, &key, planned);
             schedule_document(proxy, &action_uri, version);
             return Ok(vec![body]);
         }
@@ -1385,7 +1371,7 @@ fn rewrite_document_messages(
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let Some((action_uri, version)) = proxy.documents.zed_change(&uri, planned) else {
+            let Some((action_uri, version)) = proxy.documents.zed_change(&key, planned) else {
                 return Ok(Vec::new());
             };
             schedule_document(proxy, &action_uri, version);

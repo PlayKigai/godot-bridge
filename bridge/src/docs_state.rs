@@ -22,6 +22,7 @@ pub struct OpenDoc {
     pub generation: u64,
     pub text: Option<String>,
     text_hash: u64,
+    text_len: usize,
     pub owner: DocumentOwner,
 }
 
@@ -56,16 +57,20 @@ impl DocumentState {
         }
     }
 
-    pub fn zed_open(&mut self, incoming_uri: &str, action: DocumentAction) -> (String, i64) {
-        let key = self.key_for_uri(incoming_uri);
+    pub fn zed_open(
+        &mut self,
+        incoming_uri: &str,
+        key: &Path,
+        action: DocumentAction,
+    ) -> (String, i64) {
+        let key = key.to_path_buf();
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
         self.register_watcher_path(&key, key.clone());
         match action {
             DocumentAction::Change { uri, version, text } => {
-                let doc = self
-                    .open_docs
-                    .get_mut(&key)
-                    .expect("planned document exists");
+                let Some(doc) = self.open_docs.get_mut(&key) else {
+                    return (uri, version);
+                };
                 doc.text = Some(text);
                 doc.version = version;
                 doc.owner = DocumentOwner::Zed;
@@ -81,6 +86,7 @@ impl DocumentState {
                         generation,
                         text: Some(text),
                         text_hash: 0,
+                        text_len: 0,
                         owner: DocumentOwner::Zed,
                     },
                 );
@@ -90,14 +96,10 @@ impl DocumentState {
         }
     }
 
-    pub fn zed_change(
-        &mut self,
-        incoming_uri: &str,
-        action: DocumentAction,
-    ) -> Option<(String, i64)> {
-        let key = self.key_for_uri(incoming_uri);
+    pub fn zed_change(&mut self, key: &Path, action: DocumentAction) -> Option<(String, i64)> {
+        let key = key.to_path_buf();
         let DocumentAction::Change { uri, version, text } = action else {
-            unreachable!();
+            return None;
         };
         let doc = self.open_docs.get_mut(&key)?;
         doc.text = Some(text);
@@ -135,6 +137,7 @@ impl DocumentState {
                 generation,
                 text: None,
                 text_hash: crate::fnv::hash(text.as_bytes()),
+                text_len: text.len(),
                 owner: DocumentOwner::Bridge,
             },
         );
@@ -147,10 +150,13 @@ impl DocumentState {
         self.register_watcher_path(path, key.clone());
         let hash = crate::fnv::hash(text.as_bytes());
         let doc = self.open_docs.get_mut(&key)?;
-        if doc.owner != DocumentOwner::Bridge || doc.text_hash == hash {
+        if doc.owner != DocumentOwner::Bridge
+            || (doc.text_hash == hash && doc.text_len == text.len())
+        {
             return None;
         }
         doc.text_hash = hash;
+        doc.text_len = text.len();
         doc.version += 1;
         let uri = doc.uri.clone();
         let version = doc.version;

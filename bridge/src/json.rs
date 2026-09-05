@@ -757,9 +757,9 @@ impl<'a> Parser<'a> {
             return self.error("expected a value");
         };
         match byte {
-            b'n' => self.keyword(b"null", Value::Null),
-            b't' => self.keyword(b"true", Value::Bool(true)),
-            b'f' => self.keyword(b"false", Value::Bool(false)),
+            b'n' if self.take_keyword(b"null") => Ok(Value::Null),
+            b't' if self.take_keyword(b"true") => Ok(Value::Bool(true)),
+            b'f' if self.take_keyword(b"false") => Ok(Value::Bool(false)),
             b'"' => self.parse_string().map(Value::String),
             b'[' => self.parse_array(depth),
             b'{' => self.parse_object(depth),
@@ -1010,33 +1010,18 @@ impl<'a> Parser<'a> {
                 b'"' => {
                     let end = self.index;
                     if let Some(mut output) = output {
-                        append_utf8(
-                            &mut output,
-                            &self.input[run_start..end],
-                            self.index,
-                            self.validated,
-                        )?;
+                        append_utf8(&mut output, &self.input[run_start..end]);
                         self.index += 1;
                         return Ok(output);
                     }
-                    let value = if self.validated {
-                        unsafe { str::from_utf8_unchecked(&self.input[run_start..end]) }.to_owned()
-                    } else {
-                        str::from_utf8(&self.input[run_start..end])
-                            .map_err(|_| Error::new(self.index, "string is not UTF-8"))?
-                            .to_owned()
-                    };
+                    let value =
+                        unsafe { str::from_utf8_unchecked(&self.input[run_start..end]) }.to_owned();
                     self.index += 1;
                     return Ok(value);
                 }
                 b'\\' => {
                     let current = output.get_or_insert_with(String::new);
-                    append_utf8(
-                        current,
-                        &self.input[run_start..self.index],
-                        self.index,
-                        self.validated,
-                    )?;
+                    append_utf8(current, &self.input[run_start..self.index]);
                     self.index += 1;
                     self.parse_escape(Some(current))?;
                     run_start = self.index;
@@ -1107,15 +1092,6 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn keyword(&mut self, keyword: &[u8], value: Value) -> Result<Value, Error> {
-        if self.input.get(self.index..self.index + keyword.len()) == Some(keyword) {
-            self.index += keyword.len();
-            Ok(value)
-        } else {
-            self.error("invalid literal")
-        }
-    }
-
     fn skip_space(&mut self) -> Result<(), Error> {
         loop {
             while self
@@ -1168,19 +1144,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn append_utf8(
-    output: &mut String,
-    bytes: &[u8],
-    offset: usize,
-    validated: bool,
-) -> Result<(), Error> {
-    if validated {
-        output.push_str(unsafe { str::from_utf8_unchecked(bytes) });
-    } else {
-        let value = str::from_utf8(bytes).map_err(|_| Error::new(offset, "string is not UTF-8"))?;
-        output.push_str(value);
-    }
-    Ok(())
+fn append_utf8(output: &mut String, bytes: &[u8]) {
+    output.push_str(unsafe { str::from_utf8_unchecked(bytes) });
 }
 
 #[macro_export]
