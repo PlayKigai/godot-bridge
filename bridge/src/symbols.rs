@@ -1,32 +1,58 @@
 use crate::json::Value;
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
     pub name: String,
-    folded_name: String,
-    folded_container_name: String,
+    folded_name: Option<String>,
+    folded_container_name: Option<String>,
     boundary_positions: BoundaryPositions,
     container_boundary_positions: BoundaryPositions,
     pub kind: u8,
-    pub container: String,
+    pub container: u32,
     pub range: [u32; 4],
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum BoundaryPositions {
     Mask(u64),
-    List(Vec<u8>),
+    List(Box<[u64]>),
 }
 
 impl BoundaryPositions {
     fn contains(&self, position: usize) -> bool {
         match self {
             Self::Mask(mask) => position < 64 && mask & (1 << position) != 0,
-            Self::List(positions) => u8::try_from(position)
+            Self::List(positions) => u64::try_from(position)
                 .ok()
                 .is_some_and(|position| positions.binary_search(&position).is_ok()),
         }
+    }
+}
+
+#[derive(Default)]
+pub struct ContainerTable {
+    names: Vec<String>,
+    indices: HashMap<String, u32>,
+}
+
+impl ContainerTable {
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&index) = self.indices.get(name) {
+            return index;
+        }
+        let index = self.names.len() as u32;
+        self.names.push(name.to_owned());
+        self.indices.insert(name.to_owned(), index);
+        index
+    }
+
+    fn get(&self, index: u32) -> &str {
+        self.names
+            .get(index as usize)
+            .map(String::as_str)
+            .unwrap_or_default()
     }
 }
 
@@ -41,7 +67,33 @@ struct Match<'a> {
     boundary_count: usize,
 }
 
-pub fn flatten(result: &Value, default_uri: &str) -> Vec<(String, Symbol)> {
+struct HeapMatch<'a>(Match<'a>);
+
+impl PartialEq for HeapMatch<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        compare_matches(&self.0, &other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapMatch<'_> {}
+
+impl PartialOrd for HeapMatch<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapMatch<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_matches(&self.0, &other.0)
+    }
+}
+
+pub fn flatten(
+    result: &Value,
+    default_uri: &str,
+    containers: &mut ContainerTable,
+) -> Vec<(String, Symbol)> {
     let Some(items) = result.as_array() else {
         return Vec::new();
     };
@@ -54,28 +106,26 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<(String, Symbol)> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let folded_name = name.to_lowercase();
             let container = item
                 .get("containerName")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let container_name = if container.is_empty() {
-                name.clone()
-            } else {
-                format!("{container}.{name}")
-            };
+            let container_index = containers.intern(&container);
             let uri = location
                 .get("uri")
                 .and_then(Value::as_str)
                 .map(normalize_uri)
                 .unwrap_or_else(|| default_uri.clone());
+            let folded_name = (!name.is_ascii()).then(|| name.to_lowercase());
+            let folded_container_name = (!container.is_ascii() || !name.is_ascii())
+                .then(|| format!("{container}.{name}").to_lowercase());
             output.push((
                 uri,
                 Symbol {
                     boundary_positions: boundary_positions(&name),
-                    container_boundary_positions: boundary_positions(&container_name),
-                    folded_container_name: container_name.to_lowercase(),
+                    container_boundary_positions: boundary_positions_parts(&container, &name),
+                    folded_container_name,
                     name,
                     folded_name,
                     kind: item
@@ -83,25 +133,30 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<(String, Symbol)> {
                         .and_then(Value::as_u64)
                         .and_then(|kind| u8::try_from(kind).ok())
                         .unwrap_or_default(),
-                    container,
+                    container: container_index,
                     range: range_values(location.get("range").unwrap_or(&Value::Null)),
                 },
             ));
         } else {
-            flatten_document(item, &default_uri, "", &mut output);
+            flatten_document(item, &default_uri, "", &mut output, containers);
         }
     }
     output
 }
 
-fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<(String, Symbol)>) {
+fn flatten_document(
+    item: &Value,
+    uri: &str,
+    container: &str,
+    output: &mut Vec<(String, Symbol)>,
+    containers: &mut ContainerTable,
+) {
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
     let uri = item
         .get("uri")
         .and_then(Value::as_str)
         .map(normalize_uri)
         .unwrap_or_else(|| uri.to_owned());
-    let folded_name = name.to_lowercase();
     let container_name = if container.is_empty() {
         name.to_owned()
     } else {
@@ -111,16 +166,17 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<(
         uri.clone(),
         Symbol {
             name: name.to_owned(),
-            folded_name,
-            folded_container_name: container_name.to_lowercase(),
+            folded_name: (!name.is_ascii()).then(|| name.to_lowercase()),
+            folded_container_name: (!container_name.is_ascii())
+                .then(|| container_name.to_lowercase()),
             boundary_positions: boundary_positions(name),
-            container_boundary_positions: boundary_positions(&container_name),
+            container_boundary_positions: boundary_positions_parts(container, name),
             kind: item
                 .get("kind")
                 .and_then(Value::as_u64)
                 .and_then(|kind| u8::try_from(kind).ok())
                 .unwrap_or_default(),
-            container: container.to_owned(),
+            container: containers.intern(container),
             range: item
                 .get("selectionRange")
                 .or_else(|| item.get("range"))
@@ -129,7 +185,7 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<(
     ));
     if let Some(children) = item.get("children").and_then(Value::as_array) {
         for child in children {
-            flatten_document(child, &uri, &container_name, output);
+            flatten_document(child, &uri, &container_name, output, containers);
         }
     }
 }
@@ -156,33 +212,89 @@ fn boundary_positions(value: &str) -> BoundaryPositions {
         }
         BoundaryPositions::Mask(mask)
     } else {
-        let characters = value.chars().collect::<Vec<_>>();
-        BoundaryPositions::List(
-            characters
-                .iter()
-                .enumerate()
-                .filter_map(|(index, character)| {
-                    (index == 0
-                        || characters[index - 1] == '_'
-                        || (character.is_uppercase() && characters[index - 1].is_lowercase()))
-                    .then(|| u8::try_from(index).ok())
-                    .flatten()
-                })
-                .collect(),
-        )
+        let mut positions = Vec::new();
+        let mut previous = None;
+        for (index, character) in value.chars().enumerate() {
+            if index == 0
+                || previous == Some('_')
+                || (character.is_uppercase() && previous.is_some_and(char::is_lowercase))
+            {
+                positions.push(index as u64);
+            }
+            previous = Some(character);
+        }
+        BoundaryPositions::List(positions.into_boxed_slice())
     }
 }
 
-pub fn search<'a>(symbols: impl IntoIterator<Item = &'a Symbol>, query: &str) -> Vec<Symbol> {
-    search_with_uris(symbols.into_iter().map(|symbol| ("", symbol)), query)
-        .into_iter()
-        .map(|(_, symbol)| symbol.clone())
-        .collect()
+fn boundary_positions_parts(container: &str, name: &str) -> BoundaryPositions {
+    if container.is_empty() {
+        return boundary_positions(name);
+    }
+    if container.is_ascii() && name.is_ascii() && container.len() + 1 + name.len() <= 64 {
+        let mut mask = 0;
+        let mut previous = None;
+        for (index, &character) in container
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&b'.'))
+            .chain(name.as_bytes())
+            .enumerate()
+        {
+            if index == 0
+                || previous == Some(b'_')
+                || (character.is_ascii_uppercase()
+                    && previous.is_some_and(|value| value.is_ascii_lowercase()))
+            {
+                mask |= 1 << index;
+            }
+            previous = Some(character);
+        }
+        return BoundaryPositions::Mask(mask);
+    }
+    let mut positions = Vec::new();
+    let mut previous = None;
+    for (index, character) in container
+        .chars()
+        .chain(std::iter::once('.'))
+        .chain(name.chars())
+        .enumerate()
+    {
+        if index == 0
+            || previous == Some('_')
+            || (character.is_uppercase() && previous.is_some_and(char::is_lowercase))
+        {
+            positions.push(index as u64);
+        }
+        previous = Some(character);
+    }
+    if positions.len() <= 64 {
+        let mask = positions
+            .into_iter()
+            .fold(0, |mask, position| mask | (1 << position));
+        BoundaryPositions::Mask(mask)
+    } else {
+        BoundaryPositions::List(positions.into_boxed_slice())
+    }
+}
+
+#[cfg(test)]
+fn search<'a>(symbols: impl IntoIterator<Item = &'a Symbol>, query: &str) -> Vec<Symbol> {
+    let containers = ContainerTable::default();
+    search_with_uris(
+        symbols.into_iter().map(|symbol| ("", symbol)),
+        query,
+        &containers,
+    )
+    .into_iter()
+    .map(|(_, symbol)| symbol.clone())
+    .collect()
 }
 
 pub fn search_with_uris<'a>(
     symbols: impl IntoIterator<Item = (&'a str, &'a Symbol)>,
     query: &str,
+    containers: &ContainerTable,
 ) -> Vec<(&'a str, &'a Symbol)> {
     let container_query = query.contains('.') || query.contains(' ');
     let query = query.to_lowercase();
@@ -193,51 +305,95 @@ pub fn search_with_uris<'a>(
     };
     let mut scratch = Vec::new();
     let mut candidate = Vec::new();
-    let mut matches = symbols
-        .into_iter()
-        .filter_map(|(uri, symbol)| {
-            let target = if container_query {
-                &symbol.folded_container_name
+    let mut target = Vec::new();
+    let mut matches = BinaryHeap::with_capacity(200);
+    for (uri, symbol) in symbols {
+        let Some((gap, offset)) = (if container_query {
+            if let Some(target) = symbol.folded_container_name.as_deref() {
+                if target.len() > 256 && target.chars().count() > 256 {
+                    continue;
+                }
+                best_match_into(target, &query, &mut scratch, &mut candidate)
             } else {
-                &symbol.folded_name
-            };
-            if target.len() > 256 && target.chars().count() > 256 {
-                return None;
+                let container = containers.get(symbol.container).as_bytes();
+                if container.is_empty() {
+                    if symbol.name.len() > 256 {
+                        continue;
+                    }
+                    best_match_into(&symbol.name, &query, &mut scratch, &mut candidate)
+                } else {
+                    if container.len() + 1 + symbol.name.len() > 256 {
+                        continue;
+                    }
+                    target.clear();
+                    target.extend_from_slice(container);
+                    target.push(b'.');
+                    target.extend_from_slice(symbol.name.as_bytes());
+                    best_match_ascii(&target, query.as_bytes(), &mut scratch, &mut candidate)
+                }
             }
-            let (gap, offset, indices) =
-                best_match_into(target, &query, &mut scratch, &mut candidate)?;
-            let boundary_positions = if container_query {
-                &symbol.container_boundary_positions
+        } else if let Some(target) = symbol.folded_name.as_deref() {
+            if target.len() > 256 && target.chars().count() > 256 {
+                continue;
+            }
+            best_match_into(target, &query, &mut scratch, &mut candidate)
+        } else {
+            if symbol.name.len() > 256 {
+                continue;
             } else {
-                &symbol.boundary_positions
-            };
-            let boundary_count = indices
-                .iter()
-                .filter(|index| boundary_positions.contains(**index))
-                .count();
-            Some(Match {
-                symbol,
-                uri,
-                gap: gap.saturating_sub(boundary_count * 4),
-                offset,
-                boundary_count,
-                indices,
-                range_start: (symbol.range[0], symbol.range[1]),
-            })
-        })
-        .collect::<Vec<_>>();
-    if matches.len() > 200 {
-        matches.select_nth_unstable_by(199, compare_matches);
-        matches.truncate(200);
+                best_match_into(&symbol.name, &query, &mut scratch, &mut candidate)
+            }
+        }) else {
+            continue;
+        };
+        let boundary_positions = if container_query {
+            &symbol.container_boundary_positions
+        } else {
+            &symbol.boundary_positions
+        };
+        let boundary_count = scratch
+            .iter()
+            .filter(|index| boundary_positions.contains(**index))
+            .count();
+        let matched = Match {
+            symbol,
+            uri,
+            gap: gap.saturating_sub(boundary_count * 4),
+            offset,
+            boundary_count,
+            indices: Vec::new(),
+            range_start: (symbol.range[0], symbol.range[1]),
+        };
+        if matches.len() < 200 {
+            matches.push(HeapMatch(Match {
+                indices: scratch.clone(),
+                ..matched
+            }));
+        } else {
+            if matches.peek().is_some_and(|worst| {
+                compare_match_parts(&matched, &scratch, &worst.0) == Ordering::Less
+            }) {
+                matches.pop();
+                matches.push(HeapMatch(Match {
+                    indices: scratch.clone(),
+                    ..matched
+                }));
+            }
+        }
     }
-    matches.sort_by(compare_matches);
+    let mut matches = matches.into_vec();
+    matches.sort_by(|left, right| compare_matches(&left.0, &right.0));
     matches
         .into_iter()
-        .map(|matched| (matched.uri, matched.symbol))
+        .map(|matched| (matched.0.uri, matched.0.symbol))
         .collect()
 }
 
 fn compare_matches(left: &Match<'_>, right: &Match<'_>) -> Ordering {
+    compare_match_parts(left, &left.indices, right)
+}
+
+fn compare_match_parts(left: &Match<'_>, left_indices: &[usize], right: &Match<'_>) -> Ordering {
     left.gap
         .cmp(&right.gap)
         .then(right.boundary_count.cmp(&left.boundary_count))
@@ -245,7 +401,7 @@ fn compare_matches(left: &Match<'_>, right: &Match<'_>) -> Ordering {
         .then(left.symbol.name.cmp(&right.symbol.name))
         .then(left.uri.cmp(right.uri))
         .then(left.range_start.cmp(&right.range_start))
-        .then(left.indices.cmp(&right.indices))
+        .then(left_indices.cmp(&right.indices))
 }
 
 fn best_match_into(
@@ -253,13 +409,11 @@ fn best_match_into(
     query: &str,
     indices: &mut Vec<usize>,
     candidate: &mut Vec<usize>,
-) -> Option<(usize, usize, Vec<usize>)> {
+) -> Option<(usize, usize)> {
     if name.is_ascii() && query.is_ascii() {
-        let (gap, offset) =
-            best_match_ascii(name.as_bytes(), query.as_bytes(), indices, candidate)?;
-        return Some((gap, offset, indices.clone()));
+        return best_match_ascii(name.as_bytes(), query.as_bytes(), indices, candidate);
     }
-    best_match_unicode(name, query)
+    best_match_unicode(name, query, indices, candidate)
 }
 
 fn best_match_ascii(
@@ -277,14 +431,17 @@ fn best_match_ascii(
     }
     let mut best = None;
     for start in 0..name.len() {
-        if name[start] != query[0] {
+        if !name[start].eq_ignore_ascii_case(&query[0]) {
             continue;
         }
         candidate.clear();
         candidate.push(start);
         let mut position = start + 1;
         for &wanted in &query[1..] {
-            let Some(offset) = name[position..].iter().position(|&value| value == wanted) else {
+            let Some(offset) = name[position..]
+                .iter()
+                .position(|value| value.eq_ignore_ascii_case(&wanted))
+            else {
                 candidate.clear();
                 break;
             };
@@ -306,9 +463,15 @@ fn best_match_ascii(
     best
 }
 
-fn best_match_unicode(name: &str, query: &str) -> Option<(usize, usize, Vec<usize>)> {
+fn best_match_unicode(
+    name: &str,
+    query: &str,
+    indices: &mut Vec<usize>,
+    candidate: &mut Vec<usize>,
+) -> Option<(usize, usize)> {
     if query.is_empty() {
-        return Some((0, 0, Vec::new()));
+        indices.clear();
+        return Some((0, 0));
     }
     if !is_subsequence(name, query) {
         return None;
@@ -330,23 +493,27 @@ fn best_match_unicode(name: &str, query: &str) -> Option<(usize, usize, Vec<usiz
         if name[start] != query[0] {
             continue;
         }
-        let mut indices = vec![start];
+        candidate.clear();
+        candidate.push(start);
         let mut position = start + 1;
         for row in next.iter().skip(1) {
             let index = row[position.min(name.len())];
             if index == name.len() {
                 break;
             }
-            indices.push(index);
+            candidate.push(index);
             position = index + 1;
         }
-        if indices.len() != query.len() {
+        if candidate.len() != query.len() {
             continue;
         }
-        let gap = indices.last().unwrap() - start + 1 - query.len();
-        let candidate = (gap, start, indices);
-        if best.as_ref().is_none_or(|current| candidate < *current) {
-            best = Some(candidate);
+        let gap = candidate.last().unwrap() - start + 1 - query.len();
+        if best.is_none_or(|(current_gap, current_start)| {
+            (gap, start, candidate.as_slice()) < (current_gap, current_start, indices.as_slice())
+        }) {
+            indices.clear();
+            indices.extend_from_slice(candidate);
+            best = Some((gap, start));
         }
     }
     best
@@ -358,7 +525,7 @@ fn is_subsequence_bytes(name: &[u8], query: &[u8]) -> bool {
         return true;
     };
     for character in name {
-        if character == wanted {
+        if character.eq_ignore_ascii_case(wanted) {
             let Some(next) = query.next() else {
                 return true;
             };
@@ -403,9 +570,9 @@ fn range_value(position: &Value, key: &str) -> u32 {
         .unwrap_or_default()
 }
 
-pub fn symbol_information(symbol: &Symbol, uri: &str) -> Value {
+pub fn symbol_information(symbol: &Symbol, uri: &str, containers: &ContainerTable) -> Value {
     let [start_line, start_character, end_line, end_character] = symbol.range;
-    crate::json!({"name": (symbol.name.clone()), "kind": (u64::from(symbol.kind)), "containerName": (symbol.container.clone()), "location": {"uri": (uri.to_owned()), "range": {"start": {"line": (u64::from(start_line)), "character": (u64::from(start_character))}, "end": {"line": (u64::from(end_line)), "character": (u64::from(end_character))}}}})
+    crate::json!({"name": (symbol.name.clone()), "kind": (u64::from(symbol.kind)), "containerName": (containers.get(symbol.container).to_owned()), "location": {"uri": (uri.to_owned()), "range": {"start": {"line": (u64::from(start_line)), "character": (u64::from(start_character))}, "end": {"line": (u64::from(end_line)), "character": (u64::from(end_character))}}}})
 }
 
 #[cfg(test)]
@@ -413,11 +580,16 @@ mod tests {
     use super::*;
 
     fn symbol(name: &str, _uri: &str, line: u64) -> Symbol {
-        symbol_with_container(name, "", line)
+        let mut containers = ContainerTable::default();
+        symbol_with_container(name, "", line, &mut containers)
     }
 
-    fn symbol_with_container(name: &str, container: &str, line: u64) -> Symbol {
-        let folded_name = name.to_lowercase();
+    fn symbol_with_container(
+        name: &str,
+        container: &str,
+        line: u64,
+        containers: &mut ContainerTable,
+    ) -> Symbol {
         let container_name = if container.is_empty() {
             name.to_owned()
         } else {
@@ -425,12 +597,13 @@ mod tests {
         };
         Symbol {
             name: name.to_owned(),
-            folded_name,
-            folded_container_name: container_name.to_lowercase(),
+            folded_name: (!name.is_ascii()).then(|| name.to_lowercase()),
+            folded_container_name: (!container_name.is_ascii())
+                .then(|| container_name.to_lowercase()),
             boundary_positions: boundary_positions(name),
-            container_boundary_positions: boundary_positions(&container_name),
+            container_boundary_positions: boundary_positions_parts(container, name),
             kind: 12,
-            container: container.to_owned(),
+            container: containers.intern(container),
             range: [line as u32, 0, line as u32, 1],
         }
     }
@@ -466,10 +639,10 @@ mod tests {
             symbol("xready", "file:///c", 0),
         ];
         assert_eq!(search(&items, "ready").first().unwrap().name, "ready");
-        assert_eq!(
-            best_match_unicode("rreaddy", "ready").unwrap().2,
-            vec![1, 2, 3, 4, 6]
-        );
+        let mut indices = Vec::new();
+        let mut candidate = Vec::new();
+        best_match_unicode("rreaddy", "ready", &mut indices, &mut candidate).unwrap();
+        assert_eq!(indices, vec![1, 2, 3, 4, 6]);
     }
 
     #[test]
@@ -483,10 +656,13 @@ mod tests {
 
     #[test]
     fn container_queries_match_dotted_and_spaced_names() {
-        let items = vec![symbol_with_container("jump", "Player", 0)];
-        assert_eq!(search(&items, "player jump")[0].name, "jump");
-        assert_eq!(search(&items, "Player.jump")[0].name, "jump");
-        assert!(search(&items, "player").is_empty());
+        let mut containers = ContainerTable::default();
+        let items = [symbol_with_container("jump", "Player", 0, &mut containers)];
+        let search =
+            |query| search_with_uris(items.iter().map(|symbol| ("", symbol)), query, &containers);
+        assert_eq!(search("player jump")[0].1.name, "jump");
+        assert_eq!(search("Player.jump")[0].1.name, "jump");
+        assert!(search("player").is_empty());
     }
 
     #[test]
@@ -571,10 +747,11 @@ mod tests {
                 {"name":"Other","kind":6,"range":{"start":{"line":3},"end":{"line":4}},"selectionRange":{"start":{"line":3},"end":{"line":3}},"uri":"file:///tmp/../tmp/other.gd","children":[{"name":"Nested","kind":6,"selectionRange":{"start":{"line":4},"end":{"line":4}}}]}
             ]}
         ]);
-        let flattened = flatten(&result, "file:///tmp/../tmp/main.gd");
+        let mut containers = ContainerTable::default();
+        let flattened = flatten(&result, "file:///tmp/../tmp/main.gd", &mut containers);
         assert_eq!(flattened.len(), 4);
-        assert_eq!(flattened[0].1.container, "");
-        assert_eq!(flattened[1].1.container, "Root");
+        assert_eq!(containers.get(flattened[0].1.container), "");
+        assert_eq!(containers.get(flattened[1].1.container), "Root");
         assert_eq!(flattened[0].1.range[0], 1);
         assert_eq!(flattened[0].0, "file:///tmp/main.gd");
         assert_eq!(flattened[1].0, "file:///tmp/main.gd");
