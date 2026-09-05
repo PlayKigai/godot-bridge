@@ -24,7 +24,7 @@ use crate::process::{
     Readiness,
 };
 use crate::root::{find_project_dir, worktree_root_from_initialize};
-use crate::settings_file::{parse_settings, Settings};
+use crate::settings_file::{parse_trusted_settings, Settings};
 use crate::state::{
     clear_owner_identity, gui_process_alive, handoff_decision, matches_project, read_state,
     remove_if_stale, serve_socket, set_owner_identity, start_ticks, try_lock, write_state,
@@ -60,13 +60,53 @@ struct PendingRequest {
     symbol: Option<(String, u64, i64)>,
 }
 
+const SERVER_REQUEST_CAP: usize = 4096;
+
+#[derive(Default)]
+struct RequestKeys {
+    values: HashSet<crate::json::RequestKey>,
+    order: VecDeque<crate::json::RequestKey>,
+}
+
+impl RequestKeys {
+    fn insert(&mut self, key: crate::json::RequestKey) {
+        if self.values.insert(key.clone()) {
+            self.order.push_back(key);
+            while self.order.len() > SERVER_REQUEST_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.values.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &crate::json::RequestKey) -> bool {
+        self.values.remove(key)
+    }
+
+    fn contains(&self, key: &crate::json::RequestKey) -> bool {
+        self.values.contains(key)
+    }
+
+    fn drain(&mut self) -> Vec<crate::json::RequestKey> {
+        self.order.clear();
+        self.values.drain().collect()
+    }
+
+    fn extend(&mut self, keys: impl IntoIterator<Item = crate::json::RequestKey>) {
+        for key in keys {
+            self.insert(key);
+        }
+    }
+}
+
 struct ProxyState {
     documents: DocumentState,
     pending: HashMap<i64, PendingRequest>,
     queued: VecDeque<(Value, usize)>,
     queued_bytes: usize,
-    server_requests: HashSet<crate::json::RequestKey>,
-    stale_server_ids: HashSet<crate::json::RequestKey>,
+    server_requests: RequestKeys,
+    stale_server_ids: RequestKeys,
     next_id: i64,
     initialized_forwarded: bool,
     zed_initialized: bool,
@@ -454,17 +494,6 @@ pub fn run() -> Result<ExitCode> {
         .get("params")
         .cloned()
         .unwrap_or_else(|| crate::json!({}));
-    let settings = match params.get("initializationOptions") {
-        Some(options) => match parse_settings(options) {
-            Ok(settings) => settings,
-            Err(error) => {
-                send_error(&mut output, &initialize_id, -32602, "InvalidParams")?;
-                crate::error!("invalid initialization settings: {error}");
-                return Ok(ExitCode::from(1));
-            }
-        },
-        None => Settings::default(),
-    };
     let root = match worktree_root_from_initialize(&params) {
         Ok(root) => root,
         Err(error) => {
@@ -474,6 +503,15 @@ pub fn run() -> Result<ExitCode> {
                 error.lsp_code(),
                 &error.to_string(),
             )?;
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let options = params.get("initializationOptions").unwrap_or(&Value::Null);
+    let settings = match parse_trusted_settings(options, &root) {
+        Ok(settings) => settings,
+        Err(error) => {
+            send_error(&mut output, &initialize_id, -32602, "InvalidParams")?;
+            crate::error!("invalid initialization settings: {error}");
             return Ok(ExitCode::from(1));
         }
     };
@@ -501,8 +539,8 @@ pub fn run() -> Result<ExitCode> {
         pending: HashMap::new(),
         queued: VecDeque::new(),
         queued_bytes: 0,
-        server_requests: HashSet::new(),
-        stale_server_ids: HashSet::new(),
+        server_requests: RequestKeys::default(),
+        stale_server_ids: RequestKeys::default(),
         next_id: 1,
         initialized_forwarded: false,
         zed_initialized: false,
@@ -1661,8 +1699,8 @@ mod tests {
             pending: HashMap::new(),
             queued: VecDeque::new(),
             queued_bytes: 0,
-            server_requests: HashSet::new(),
-            stale_server_ids: HashSet::new(),
+            server_requests: RequestKeys::default(),
+            stale_server_ids: RequestKeys::default(),
             next_id: 1,
             initialized_forwarded: false,
             zed_initialized: false,

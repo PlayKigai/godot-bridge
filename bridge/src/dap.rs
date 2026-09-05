@@ -17,7 +17,7 @@ use crate::framing::{
 };
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
-use crate::settings_file::{parse_settings, Settings};
+use crate::settings_file::{parse_trusted_settings, Settings};
 use crate::state::{socket_request, try_lock, LockGuard, ProjectFiles};
 
 const FRAME_CAP: usize = 64 * 1024 * 1024;
@@ -186,20 +186,33 @@ impl<W: Write> ClientOutput<W> {
 
 struct ServerRequests {
     original_sequences: HashMap<crate::json::RequestKey, Value>,
+    order: VecDeque<crate::json::RequestKey>,
 }
 
 impl ServerRequests {
     fn new() -> Self {
         Self {
             original_sequences: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
     fn rewrite(&mut self, message: &mut Value, bridge_seq: i64) {
         if message.get("type").and_then(Value::as_str) == Some("request") {
             if let Some(original) = message.get("seq").cloned() {
-                self.original_sequences
-                    .insert(crate::json::RequestKey::Number(bridge_seq), original);
+                let key = crate::json::RequestKey::Number(bridge_seq);
+                if self
+                    .original_sequences
+                    .insert(key.clone(), original)
+                    .is_none()
+                {
+                    self.order.push_back(key);
+                    while self.order.len() > 4096 {
+                        if let Some(old) = self.order.pop_front() {
+                            self.original_sequences.remove(&old);
+                        }
+                    }
+                }
             }
         }
         message["seq"] = crate::json!(bridge_seq);
@@ -322,8 +335,8 @@ fn prepare(
     if cancel.load(Ordering::Acquire) {
         return Err("DAP startup cancelled".to_owned());
     }
-    let settings = read_settings()?;
     let root = cwd_root().map_err(|error| error.to_string())?;
+    let settings = read_settings(&root)?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
     if let Some(file) = file {
@@ -366,7 +379,7 @@ fn prepare(
     })
 }
 
-fn read_settings() -> std::result::Result<Settings, String> {
+fn read_settings(worktree: &Path) -> std::result::Result<Settings, String> {
     let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
         Ok(contents) if contents.len() <= 1024 * 1024 => crate::json::from_str(&contents)
             .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
@@ -374,7 +387,7 @@ fn read_settings() -> std::result::Result<Settings, String> {
         Err(std::env::VarError::NotPresent) => Value::Null,
         Err(error) => return Err(format!("cannot read GODOT_BRIDGE_SETTINGS: {error}")),
     };
-    parse_settings(&value)
+    parse_trusted_settings(&value, worktree)
 }
 
 fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {

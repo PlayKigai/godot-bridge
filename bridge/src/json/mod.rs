@@ -434,6 +434,11 @@ impl RawJson<'_> {
     }
 
     pub(crate) fn request_key(self) -> RequestKey {
+        if self.0.first() == Some(&b'"') {
+            if let Ok(Value::String(value)) = from_slice(self.0) {
+                return RequestKey::Lexical(value);
+            }
+        }
         self.as_i64()
             .map_or_else(|| RequestKey::Lexical(self.lexical()), RequestKey::Number)
     }
@@ -524,9 +529,14 @@ impl RawJson<'_> {
 }
 
 pub(crate) fn value_request_key(value: &Value) -> RequestKey {
-    value
-        .as_i64()
-        .map_or_else(|| RequestKey::Lexical(to_string(value)), RequestKey::Number)
+    match value {
+        Value::String(value) => RequestKey::Lexical(value.clone()),
+        Value::Number(number) => number.as_i64().map_or_else(
+            || RequestKey::Lexical(number.to_string()),
+            RequestKey::Number,
+        ),
+        _ => RequestKey::Lexical(to_string(value)),
+    }
 }
 
 pub(crate) struct TopLevel<'a> {
@@ -1418,7 +1428,7 @@ break"}"#,
                 .id
                 .unwrap()
                 .request_key(),
-            RequestKey::Lexical("\"1\"".to_owned())
+            RequestKey::Lexical("1".to_owned())
         );
         assert_eq!(
             scan_top_level(br#"{"id":1.0}"#)
@@ -1436,5 +1446,16 @@ break"}"#,
                 .request_key(),
             RequestKey::Lexical("18446744073709551615".to_owned())
         );
+    }
+
+    #[test]
+    fn request_keys_decode_string_escapes() {
+        let wire = scan_top_level(br#"{"id":"a\/b"}"#)
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key();
+        let parsed = value_request_key(&from_str(r#""a/b""#).unwrap());
+        assert_eq!(wire, parsed);
     }
 }

@@ -38,7 +38,7 @@ fn fail_in_flight(session: &mut Session) -> Result<()> {
         }
     }
     session.proxy.queued_bytes = 0;
-    let served = session.proxy.server_requests.drain().collect::<Vec<_>>();
+    let served = session.proxy.server_requests.drain();
     session.proxy.stale_server_ids.extend(served);
     Ok(())
 }
