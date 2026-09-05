@@ -10,6 +10,11 @@ fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.documents.set_open_change_events(false);
     session.proxy.symbol_cache.clear();
     session.proxy.symbol_scheduled.clear();
+    session.proxy.bulk_documents.clear();
+    session.proxy.bulk_batch_uris.clear();
+    session.proxy.bulk_complete = false;
+    session.proxy.bulk_active = false;
+    session.proxy.bulk_deadline = None;
     session.proxy.bulk_generation += 1;
     session.proxy.project_diagnostics_started = false;
     set_recovering(&session.runtime)

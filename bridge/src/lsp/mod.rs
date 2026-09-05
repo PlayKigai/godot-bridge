@@ -80,6 +80,7 @@ struct ProxyState {
     bulk_documents: VecDeque<docs_state::ScannedDocument>,
     bulk_batch_uris: HashSet<String>,
     bulk_complete: bool,
+    bulk_active: bool,
     bulk_deadline: Option<Instant>,
 }
 
@@ -542,6 +543,7 @@ pub fn run() -> Result<ExitCode> {
         bulk_documents: VecDeque::new(),
         bulk_batch_uris: HashSet::new(),
         bulk_complete: false,
+        bulk_active: false,
         bulk_deadline: None,
     };
 
@@ -1204,6 +1206,7 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
     proxy.bulk_documents.clear();
     proxy.bulk_batch_uris.clear();
     proxy.bulk_complete = false;
+    proxy.bulk_active = true;
     proxy.bulk_deadline = None;
     let project = proxy.project.clone();
     let diagnose_addons = settings.diagnose_addons;
@@ -1281,9 +1284,15 @@ fn pump_bulk_documents(proxy: &mut ProxyState, editor: &mut Editor) -> Result<()
         }
         if !proxy.bulk_batch_uris.is_empty() {
             proxy.bulk_deadline = Some(Instant::now() + Duration::from_millis(BULK_INTERVAL_MS));
+            if proxy.bulk_complete && proxy.bulk_documents.is_empty() {
+                proxy.bulk_active = false;
+            }
             return Ok(());
         }
         if proxy.bulk_documents.is_empty() {
+            if proxy.bulk_complete {
+                proxy.bulk_active = false;
+            }
             return Ok(());
         }
     }
@@ -1561,7 +1570,12 @@ fn send_due_symbol_requests(editor: &mut Editor, proxy: &mut ProxyState) -> Resu
     let due = proxy
         .symbol_scheduled
         .iter()
-        .filter(|(_, (_, _, deadline))| *deadline <= now)
+        .filter(|(uri, (_, _, deadline))| {
+            *deadline <= now
+                && !(proxy.bulk_active
+                    && proxy.documents.owner(&proxy.documents.key_for_uri(uri))
+                        == Some(DocumentOwner::Bridge))
+        })
         .map(|(uri, (generation, version, _))| (uri.clone(), *generation, *version))
         .collect::<Vec<_>>();
     for (uri, generation, version) in due {
@@ -1633,6 +1647,7 @@ mod tests {
             bulk_documents: VecDeque::new(),
             bulk_batch_uris: HashSet::new(),
             bulk_complete: false,
+            bulk_active: false,
             bulk_deadline: None,
         };
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
