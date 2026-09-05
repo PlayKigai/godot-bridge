@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const HEADER_CAP: usize = 16 * 1024;
 const COMPACT_THRESHOLD: usize = 64 * 1024;
-const READ_CHUNK_SIZE: usize = 8192;
+const READ_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum FrameError {
@@ -229,22 +229,21 @@ where
     thread::Builder::new()
         .name(name)
         .stack_size(256 * 1024)
-        .spawn(move || loop {
+        .spawn(move || {
             let mut chunk = vec![0; READ_CHUNK_SIZE];
-            let event = match reader.read(&mut chunk) {
-                Ok(0) => Ok(None),
-                Ok(len) => {
-                    chunk.truncate(len);
-                    Ok(Some(chunk))
+            loop {
+                let event = match reader.read(&mut chunk) {
+                    Ok(0) => Ok(None),
+                    Ok(len) => Ok(Some(chunk[..len].to_vec())),
+                    Err(error) => Err(error),
+                };
+                let done = matches!(&event, Ok(None) | Err(_));
+                if sender.send(map(event)).is_err() {
+                    return;
                 }
-                Err(error) => Err(error),
-            };
-            let done = matches!(&event, Ok(None) | Err(_));
-            if sender.send(map(event)).is_err() {
-                return;
-            }
-            if done {
-                return;
+                if done {
+                    return;
+                }
             }
         })
 }

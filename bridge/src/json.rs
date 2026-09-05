@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Write};
+use std::fmt::Write as _;
 use std::ops::{Index, IndexMut};
 use std::str;
 
@@ -73,12 +73,19 @@ impl Number {
 
     fn from_integer(value: impl fmt::Display) -> Self {
         let mut bytes = [0; 24];
-        let len = {
-            let mut writer = io::Cursor::new(&mut bytes[..]);
+        let len;
+        {
+            let mut writer = NumberWriter {
+                bytes: &mut bytes,
+                len: 0,
+            };
             write!(writer, "{value}").expect("integer fits in number buffer");
-            writer.position() as usize
-        };
-        Self::from_bytes(&bytes[..len])
+            len = writer.len;
+        }
+        Self(NumberRepr::Small {
+            bytes,
+            len: len as u8,
+        })
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -94,6 +101,21 @@ impl Number {
 
     fn as_u64(&self) -> Option<u64> {
         str::from_utf8(self.as_bytes()).ok()?.parse().ok()
+    }
+}
+
+struct NumberWriter<'a> {
+    bytes: &'a mut [u8; 24],
+    len: usize,
+}
+
+impl fmt::Write for NumberWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -373,6 +395,7 @@ pub(crate) struct RawJson<'a>(&'a [u8]);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RequestKey {
     Number(i64),
+    String(String),
     Lexical(String),
 }
 
@@ -384,18 +407,18 @@ impl RawJson<'_> {
             .ok()
     }
 
-    pub(crate) fn is_number(self) -> bool {
+    fn is_number(self) -> bool {
         matches!(self.0.first(), Some(b'-' | b'0'..=b'9'))
     }
 
-    pub(crate) fn lexical(self) -> String {
+    fn lexical(self) -> String {
         String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8")
     }
 
     pub(crate) fn request_key(self) -> RequestKey {
         if self.0.first() == Some(&b'"') {
             if let Ok(Value::String(value)) = from_slice(self.0) {
-                return RequestKey::Lexical(value);
+                return RequestKey::String(value);
             }
         }
         self.as_i64()
@@ -416,11 +439,15 @@ impl RawJson<'_> {
         }
         matches!(from_slice(self.0), Ok(Value::String(value)) if value.as_bytes() == expected)
     }
+
+    pub(crate) fn is_string(self) -> bool {
+        self.0.first() == Some(&b'"')
+    }
 }
 
 pub(crate) fn value_request_key(value: &Value) -> RequestKey {
     match value {
-        Value::String(value) => RequestKey::Lexical(value.clone()),
+        Value::String(value) => RequestKey::String(value.clone()),
         Value::Number(number) => number.as_i64().map_or_else(
             || RequestKey::Lexical(number.to_string()),
             RequestKey::Number,
@@ -440,7 +467,7 @@ pub(crate) struct TopLevel<'a> {
 }
 
 pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
-    let mut parser = Parser::new(bytes, false);
+    let mut parser = Parser::new(bytes, false, false);
     parser.skip_space()?;
     if !parser.take(b'{') {
         return Err(Error::new(parser.index, "message is not an object"));
@@ -520,17 +547,16 @@ macro_rules! value_number_eq {
 value_number_eq!(i32, i64, u32, u64, usize);
 
 pub fn from_slice(bytes: &[u8]) -> Result<Value, Error> {
-    let text = str::from_utf8(bytes)
-        .map_err(|error| Error::new(error.valid_up_to(), "input is not UTF-8"))?;
-    from_str(text)
+    str::from_utf8(bytes).map_err(|error| Error::new(error.valid_up_to(), "input is not UTF-8"))?;
+    Parser::new(bytes, false, true).parse()
 }
 
 pub fn from_str(text: &str) -> Result<Value, Error> {
-    Parser::new(text.as_bytes(), false).parse()
+    Parser::new(text.as_bytes(), false, true).parse()
 }
 
 pub fn from_str_relaxed(text: &str) -> Result<Value, Error> {
-    Parser::new(text.as_bytes(), true).parse()
+    Parser::new(text.as_bytes(), true, true).parse()
 }
 
 pub fn to_vec(value: &Value) -> Vec<u8> {
@@ -577,45 +603,75 @@ fn write_value(value: &Value, output: &mut Vec<u8>) {
 
 pub(crate) fn write_string(string: &str, output: &mut Vec<u8>) {
     output.push(b'"');
+    let bytes = string.as_bytes();
     let mut run_start = 0;
-    for (index, character) in string.char_indices() {
-        let escape = match character {
-            '"' => Some(b'"'),
-            '\\' => Some(b'\\'),
-            '\u{08}' => Some(b'b'),
-            '\u{0c}' => Some(b'f'),
-            '\n' => Some(b'n'),
-            '\r' => Some(b'r'),
-            '\t' => Some(b't'),
-            character if character <= '\u{1f}' => Some(0),
-            _ => None,
-        };
-        let Some(escape) = escape else {
-            continue;
-        };
+    while run_start < bytes.len() {
+        let index = run_start + find_special(&bytes[run_start..]);
+        if index == bytes.len() {
+            break;
+        }
+        let byte = bytes[index];
         output.extend_from_slice(&string.as_bytes()[run_start..index]);
         output.push(b'\\');
-        if escape == 0 {
-            let code = character as u32;
-            let hex = b"0123456789abcdef";
-            output.push(b'u');
-            output.push(hex[((code >> 12) & 0xf) as usize]);
-            output.push(hex[((code >> 8) & 0xf) as usize]);
-            output.push(hex[((code >> 4) & 0xf) as usize]);
-            output.push(hex[(code & 0xf) as usize]);
-        } else {
-            output.push(escape);
+        match byte {
+            b'"' => output.push(b'"'),
+            b'\\' => output.push(b'\\'),
+            0x08 => output.push(b'b'),
+            0x0c => output.push(b'f'),
+            b'\n' => output.push(b'n'),
+            b'\r' => output.push(b'r'),
+            b'\t' => output.push(b't'),
+            byte => {
+                let code = u32::from(byte);
+                let hex = b"0123456789abcdef";
+                output.push(b'u');
+                output.push(hex[((code >> 12) & 0xf) as usize]);
+                output.push(hex[((code >> 8) & 0xf) as usize]);
+                output.push(hex[((code >> 4) & 0xf) as usize]);
+                output.push(hex[(code & 0xf) as usize]);
+            }
         }
-        run_start = index + character.len_utf8();
+        run_start = index + 1;
     }
     output.extend_from_slice(&string.as_bytes()[run_start..]);
     output.push(b'"');
+}
+
+fn find_special(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    const QUOTES: u64 = 0x2222_2222_2222_2222;
+    const BACKSLASHES: u64 = 0x5c5c_5c5c_5c5c_5c5c;
+    const CONTROLS: u64 = 0x2020_2020_2020_2020;
+    let mut index = 0;
+    while let Some(chunk) = bytes.get(index..index + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+        let quote = word ^ QUOTES;
+        let backslash = word ^ BACKSLASHES;
+        let equal = (quote.wrapping_sub(ONES) & !quote & HIGHS)
+            | (backslash.wrapping_sub(ONES) & !backslash & HIGHS);
+        let control = word.wrapping_sub(CONTROLS) & !word & HIGHS;
+        if equal | control != 0 {
+            return index
+                + bytes[index..index + 8]
+                    .iter()
+                    .position(|byte| *byte == b'"' || *byte == b'\\' || *byte < 0x20)
+                    .expect("special byte exists in matching chunk");
+        }
+        index += 8;
+    }
+    index
+        + bytes[index..]
+            .iter()
+            .position(|byte| *byte == b'"' || *byte == b'\\' || *byte < 0x20)
+            .unwrap_or(bytes.len() - index)
 }
 
 struct Parser<'a> {
     input: &'a [u8],
     index: usize,
     relaxed: bool,
+    validated: bool,
 }
 
 struct ObjectBuilder {
@@ -658,11 +714,12 @@ impl ObjectBuilder {
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a [u8], relaxed: bool) -> Self {
+    fn new(input: &'a [u8], relaxed: bool, validated: bool) -> Self {
         Self {
             input,
             index: 0,
             relaxed,
+            validated,
         }
     }
 
@@ -699,13 +756,18 @@ impl<'a> Parser<'a> {
             return self.error("object keys must be strings");
         }
         loop {
-            let Some(byte) = self.input.get(self.index).copied() else {
+            let offset = find_special(&self.input[self.index..]);
+            if offset == self.input.len() - self.index {
                 return self.error("unterminated string");
-            };
+            }
+            self.index += offset;
+            let byte = self.input[self.index];
             match byte {
                 b'"' => {
                     self.index += 1;
-                    if str::from_utf8(&self.input[start + 1..self.index - 1]).is_err() {
+                    if !self.validated
+                        && str::from_utf8(&self.input[start + 1..self.index - 1]).is_err()
+                    {
                         return self.error("string is not UTF-8");
                     }
                     return Ok((start, self.index));
@@ -714,8 +776,7 @@ impl<'a> Parser<'a> {
                     self.index += 1;
                     self.parse_escape(None)?;
                 }
-                byte if byte < 0x20 => return self.error("control character in string"),
-                _ => self.index += 1,
+                _ => return self.error("control character in string"),
             }
         }
     }
@@ -776,7 +837,9 @@ impl<'a> Parser<'a> {
             b'n' if self.take_keyword(b"null") => {}
             b't' if self.take_keyword(b"true") => {}
             b'f' if self.take_keyword(b"false") => {}
-            b'-' | b'0'..=b'9' => self.skip_number()?,
+            b'-' | b'0'..=b'9' => {
+                self.scan_number()?;
+            }
             _ => return self.error("expected a value"),
         }
         Ok(())
@@ -789,10 +852,6 @@ impl<'a> Parser<'a> {
         } else {
             false
         }
-    }
-
-    fn skip_number(&mut self) -> Result<(), Error> {
-        self.scan_number().map(|_| ())
     }
 
     fn scan_number(&mut self) -> Result<(usize, usize), Error> {
@@ -923,32 +982,48 @@ impl<'a> Parser<'a> {
         let mut run_start = self.index;
         let mut output = None;
         loop {
-            let Some(byte) = self.input.get(self.index).copied() else {
+            let offset = find_special(&self.input[self.index..]);
+            if offset == self.input.len() - self.index {
                 return self.error("unterminated string");
-            };
+            }
+            self.index += offset;
+            let byte = self.input[self.index];
             match byte {
                 b'"' => {
                     let end = self.index;
                     if let Some(mut output) = output {
-                        append_utf8(&mut output, &self.input[run_start..end], self.index)?;
+                        append_utf8(
+                            &mut output,
+                            &self.input[run_start..end],
+                            self.index,
+                            self.validated,
+                        )?;
                         self.index += 1;
                         return Ok(output);
                     }
-                    let value = str::from_utf8(&self.input[run_start..end])
-                        .map_err(|_| Error::new(self.index, "string is not UTF-8"))?
-                        .to_owned();
+                    let value = if self.validated {
+                        unsafe { str::from_utf8_unchecked(&self.input[run_start..end]) }.to_owned()
+                    } else {
+                        str::from_utf8(&self.input[run_start..end])
+                            .map_err(|_| Error::new(self.index, "string is not UTF-8"))?
+                            .to_owned()
+                    };
                     self.index += 1;
                     return Ok(value);
                 }
                 b'\\' => {
                     let current = output.get_or_insert_with(String::new);
-                    append_utf8(current, &self.input[run_start..self.index], self.index)?;
+                    append_utf8(
+                        current,
+                        &self.input[run_start..self.index],
+                        self.index,
+                        self.validated,
+                    )?;
                     self.index += 1;
                     self.parse_escape(Some(current))?;
                     run_start = self.index;
                 }
-                byte if byte < 0x20 => return self.error("control character in string"),
-                _ => self.index += 1,
+                _ => return self.error("control character in string"),
             }
         }
     }
@@ -1075,9 +1150,18 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn append_utf8(output: &mut String, bytes: &[u8], offset: usize) -> Result<(), Error> {
-    let value = str::from_utf8(bytes).map_err(|_| Error::new(offset, "string is not UTF-8"))?;
-    output.push_str(value);
+fn append_utf8(
+    output: &mut String,
+    bytes: &[u8],
+    offset: usize,
+    validated: bool,
+) -> Result<(), Error> {
+    if validated {
+        output.push_str(unsafe { str::from_utf8_unchecked(bytes) });
+    } else {
+        let value = str::from_utf8(bytes).map_err(|_| Error::new(offset, "string is not UTF-8"))?;
+        output.push_str(value);
+    }
     Ok(())
 }
 
@@ -1234,7 +1318,7 @@ break"}"#,
                 .id
                 .unwrap()
                 .request_key(),
-            RequestKey::Lexical("1".to_owned())
+            RequestKey::String("1".to_owned())
         );
         assert_eq!(
             scan_top_level(br#"{"id":1.0}"#)
@@ -1263,5 +1347,22 @@ break"}"#,
             .request_key();
         let parsed = value_request_key(&from_str(r#""a/b""#).unwrap());
         assert_eq!(wire, parsed);
+    }
+
+    #[test]
+    fn request_keys_keep_string_and_number_lexemes_distinct() {
+        let number = scan_top_level(br#"{"id":1.0}"#)
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key();
+        let string = scan_top_level(br#"{"id":"1.0"}"#)
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key();
+        assert_ne!(number, string);
+        assert_eq!(value_request_key(&from_str(r#"1.0"#).unwrap()), number);
+        assert_eq!(value_request_key(&from_str(r#""1.0""#).unwrap()), string);
     }
 }
