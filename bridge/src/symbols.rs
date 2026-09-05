@@ -132,6 +132,9 @@ fn best_match(name: &str, query: &str) -> Option<(usize, usize, Vec<usize>)> {
     if query.is_empty() {
         return Some((0, 0, Vec::new()));
     }
+    if !is_subsequence(name, query) {
+        return None;
+    }
     let name = name.chars().collect::<Vec<_>>();
     let query = query.chars().collect::<Vec<_>>();
     let mut next = vec![vec![name.len(); name.len() + 1]; query.len()];
@@ -169,6 +172,22 @@ fn best_match(name: &str, query: &str) -> Option<(usize, usize, Vec<usize>)> {
         }
     }
     best
+}
+
+fn is_subsequence(name: &str, query: &str) -> bool {
+    let mut query = query.chars();
+    let Some(mut wanted) = query.next() else {
+        return true;
+    };
+    for character in name.chars() {
+        if character == wanted {
+            let Some(next) = query.next() else {
+                return true;
+            };
+            wanted = next;
+        }
+    }
+    false
 }
 
 fn range_start(range: &Value) -> (u64, u64) {
