@@ -9,6 +9,7 @@ fn minimal_project_diagnostics_and_cleanup() {
     if !godot_available("lsp integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
@@ -33,6 +34,7 @@ fn nested_project_is_selected() {
     if !godot_available("lsp integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("nested");
     let expected = fixture("nested/repo/game").canonicalize().unwrap();
@@ -48,6 +50,7 @@ fn second_owner_is_rejected() {
     if !godot_available("lsp integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut first = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
@@ -67,6 +70,7 @@ fn godot_crash_recovers_completion() {
     if !godot_available("lsp integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);

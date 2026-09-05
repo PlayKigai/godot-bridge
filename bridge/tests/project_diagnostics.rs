@@ -9,6 +9,7 @@ fn project_diagnostics_scan_create_and_remove() {
     if !godot_available("project diagnostics integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let project = TempDir::new().unwrap();
     copy_directory(&fixture("minimal-project"), project.path());
     let runtime = TempDir::new().unwrap();

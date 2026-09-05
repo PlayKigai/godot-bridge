@@ -7,12 +7,22 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub enum Protocol {
     Lsp,
     Dap,
+}
+
+static GODOT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn lock_godot() -> MutexGuard<'static, ()> {
+    GODOT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct BridgeClient {

@@ -10,6 +10,7 @@ fn workspace_symbol_finds_ready_function() {
     if !godot_available("workspace symbol integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);

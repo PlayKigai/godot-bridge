@@ -15,6 +15,7 @@ fn open_editor_handoff_and_gui_recovery() {
     if !godot_available("open-editor integration test") {
         return;
     }
+    let _godot_lock = lock_godot();
 
     let runtime = TempDir::new().unwrap();
     let config = TempDir::new().unwrap();
