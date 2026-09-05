@@ -450,13 +450,8 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<
 }
 
 pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
-    let value: Value = crate::json::from_slice(body).map_err(|error| {
-        if protocol.is_empty() {
-            format!("invalid JSON: {error}")
-        } else {
-            format!("invalid {protocol} JSON: {error}")
-        }
-    })?;
+    let value: Value = crate::json::from_slice(body)
+        .map_err(|error| format!("invalid {protocol} JSON: {error}"))?;
     if !value.is_object() {
         return Err(format!("{protocol} message is not an object"));
     }

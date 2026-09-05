@@ -250,11 +250,11 @@ impl State {
             project: string_field(object, "project")?,
             status,
             mode,
-            godot_pid: optional_u32(object, "godot_pid")?,
-            godot_pgid: optional_u32(object, "godot_pgid")?,
-            lsp_port: optional_u16(object, "lsp_port")?,
-            dap_port: optional_u16(object, "dap_port")?,
-            owner_pid: optional_u32(object, "owner_pid")?,
+            godot_pid: optional_int(object, "godot_pid")?,
+            godot_pgid: optional_int(object, "godot_pgid")?,
+            lsp_port: optional_int(object, "lsp_port")?,
+            dap_port: optional_int(object, "dap_port")?,
+            owner_pid: optional_int(object, "owner_pid")?,
             owner_start_ticks: optional_u64(object, "owner_start_ticks")?,
             godot_start_ticks: optional_u64(object, "godot_start_ticks")?,
             started_at: string_field(object, "started_at")?,
@@ -286,18 +286,16 @@ fn optional_u64(object: &Map, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
-fn optional_u32(object: &Map, key: &str) -> Result<Option<u32>, String> {
+fn optional_int<T: TryFrom<u64>>(object: &Map, key: &str) -> Result<Option<T>, String> {
     optional_u64(object, key)?
-        .map(u32::try_from)
+        .map(T::try_from)
         .transpose()
-        .map_err(|_| format!("state.{key} must be a 32-bit integer or null"))
-}
-
-fn optional_u16(object: &Map, key: &str) -> Result<Option<u16>, String> {
-    optional_u64(object, key)?
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|_| format!("state.{key} must be a 16-bit integer or null"))
+        .map_err(|_| {
+            format!(
+                "state.{key} must be a {}-bit integer or null",
+                std::mem::size_of::<T>() * 8
+            )
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -625,7 +623,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::os::unix::fs::PermissionsExt;
 
     fn files(dir: &Path) -> ProjectFiles {
@@ -665,7 +663,7 @@ mod tests {
 
     #[test]
     fn second_lock_is_rejected() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let first = try_lock(&dir.path().join("lock")).unwrap().unwrap();
         assert!(try_lock(&dir.path().join("lock")).unwrap().is_none());
         drop(first);
@@ -674,7 +672,7 @@ mod tests {
 
     #[test]
     fn dead_owner_state_is_removed() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let project_files = files(dir.path());
         write_state(&project_files.state, &state(Some(u32::MAX), Some(1))).unwrap();
         std::fs::write(&project_files.sock, b"stale").unwrap();
@@ -685,7 +683,7 @@ mod tests {
 
     #[test]
     fn reused_pid_is_ignored_by_ticks() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let project_files = files(dir.path());
         let pid = std::process::id();
         let ticks = start_ticks(pid).unwrap();
@@ -739,7 +737,7 @@ mod tests {
 
     #[test]
     fn handoff_dap_lock_is_rejected_when_held() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let first = try_lock(&dir.path().join("dap.lock")).unwrap().unwrap();
         assert!(try_lock(&dir.path().join("dap.lock")).unwrap().is_none());
         drop(first);
@@ -759,7 +757,7 @@ mod tests {
 
     #[test]
     fn socket_status_round_trip() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("status.sock");
         let handle = serve_socket(&path, |request| {
             if request["cmd"] == "status" {

@@ -521,7 +521,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
 
     #[test]
     fn picked_port_can_be_bound_again() {
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn readiness_reports_child_exit() {
-        let directory = tempdir().expect("temporary directory");
+        let directory = TempDir::new().expect("temporary directory");
         let args = vec!["-c".to_owned(), "exit 0".to_owned()];
         let mut child = spawn_godot(
             Path::new("/bin/sh"),
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn group_kill_terminates_grandchild() {
-        let directory = tempdir().expect("temporary directory");
+        let directory = TempDir::new().expect("temporary directory");
         let script = "/bin/sleep 30 & printf '%s\\n' \"$!\" >&2; wait";
         let args = vec!["-c".to_owned(), script.to_owned()];
         let child = spawn_godot(

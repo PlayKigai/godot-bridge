@@ -102,11 +102,10 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<(
         .map(normalize_uri)
         .unwrap_or_else(|| uri.to_owned());
     let folded_name = name.to_lowercase();
-    let current_container = container.to_owned();
-    let container_name = if current_container.is_empty() {
+    let container_name = if container.is_empty() {
         name.to_owned()
     } else {
-        format!("{current_container}.{name}")
+        format!("{container}.{name}")
     };
     output.push((
         uri.clone(),
@@ -121,7 +120,7 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<(
                 .and_then(Value::as_u64)
                 .and_then(|kind| u8::try_from(kind).ok())
                 .unwrap_or_default(),
-            container: current_container,
+            container: container.to_owned(),
             range: item
                 .get("selectionRange")
                 .or_else(|| item.get("range"))

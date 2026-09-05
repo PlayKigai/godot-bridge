@@ -97,16 +97,12 @@ fn collect_options(
         };
         *target = Some(match inline_value {
             Some(value) => value,
-            None => next_value(&argument, arguments)?,
+            None => arguments
+                .next()
+                .ok_or_else(|| format!("{argument} needs a value"))?,
         });
     }
     Ok(options)
-}
-
-fn next_value(flag: &str, arguments: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    arguments
-        .next()
-        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 fn required(value: Option<String>, name: &str) -> Result<String, String> {

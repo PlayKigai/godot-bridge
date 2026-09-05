@@ -496,13 +496,13 @@ pub(crate) fn directory_is_skipped(path: &Path, project: &Path, diagnose_addons:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::fs;
     use std::sync::Mutex;
 
     #[test]
     fn scan_filters_project_diagnostics_files() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         fs::write(directory.path().join("valid.gd"), "extends Node\n").unwrap();
         fs::create_dir(directory.path().join(".godot")).unwrap();
         fs::write(directory.path().join(".godot/hidden.gd"), "x").unwrap();
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn ownership_transitions_emit_document_events() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let path = directory.path().join("document.gd");
         fs::write(&path, "disk").unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));

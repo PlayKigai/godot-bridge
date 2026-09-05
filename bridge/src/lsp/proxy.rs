@@ -55,10 +55,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             .min();
         if symbol_deadline.is_some_and(|deadline| deadline <= now) {
             if let Err(error) = send_due_symbol_requests(&mut session.editor, &mut session.proxy) {
-                if unmanaged {
-                    return exit_session(&mut session, 1);
+                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                    return Ok(code);
                 }
-                recover(&mut session, &error.to_string(), true)?;
             }
         }
         if !session.proxy.bulk_documents.is_empty()
@@ -68,10 +67,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             if let Err(error) =
                 pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
             {
-                if unmanaged {
-                    return exit_session(&mut session, 1);
+                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                    return Ok(code);
                 }
-                recover(&mut session, &error.to_string(), true)?;
             }
         }
         if session
@@ -89,10 +87,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                 changes,
                 false,
             ) {
-                if unmanaged {
-                    return exit_session(&mut session, 1);
+                if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                    return Ok(code);
                 }
-                recover(&mut session, &error.to_string(), true)?;
             }
         }
         let mut processed = false;
@@ -150,10 +147,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                         Ok(FramePoll::Frame(Err(error))) => {
                             processed = true;
                             crate::error!("cannot forward server message: {error}");
-                            if unmanaged {
-                                return exit_session(&mut session, 1);
+                            if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                                return Ok(code);
                             }
-                            recover(&mut session, &error.to_string(), true)?;
                         }
                         Ok(FramePoll::Empty) => {}
                         Ok(FramePoll::End) | Err(_) => {
@@ -201,10 +197,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                     &mut session.editor,
                                     &mut session.proxy,
                                 ) {
-                                    if unmanaged {
-                                        return exit_session(&mut session, 1);
+                                    if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                                        return Ok(code);
                                     }
-                                    recover(&mut session, &error.to_string(), true)?;
                                 }
                             }
                             InternalEvent::Bulk {
@@ -217,10 +212,11 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                         &mut session.proxy,
                                         &mut session.editor.connection.writer,
                                     ) {
-                                        if unmanaged {
-                                            return exit_session(&mut session, 1);
+                                        if let Some(code) =
+                                            on_error(&mut session, unmanaged, &error)?
+                                        {
+                                            return Ok(code);
                                         }
-                                        recover(&mut session, &error.to_string(), true)?;
                                     }
                                 }
                             }
@@ -232,10 +228,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                     &mut session.proxy,
                                     &mut session.editor.connection.writer,
                                 ) {
-                                    if unmanaged {
-                                        return exit_session(&mut session, 1);
+                                    if let Some(code) = on_error(&mut session, unmanaged, &error)? {
+                                        return Ok(code);
                                     }
-                                    recover(&mut session, &error.to_string(), true)?;
                                 }
                             }
                             InternalEvent::Bulk { .. } => {}
@@ -344,13 +339,24 @@ fn handle_client_frame(
         ClientFrame::Forward(Ok(())) => Ok(None),
         ClientFrame::Forward(Err(error)) => {
             crate::error!("cannot forward client message: {error}");
-            if unmanaged {
-                return Ok(Some(exit_session(session, 1)?));
+            if let Some(code) = on_error(session, unmanaged, &error)? {
+                return Ok(Some(code));
             }
-            recover(session, &error.to_string(), true)?;
             Ok(None)
         }
     }
+}
+
+fn on_error(
+    session: &mut Session,
+    unmanaged: bool,
+    error: &dyn std::fmt::Display,
+) -> Result<Option<ExitCode>> {
+    if unmanaged {
+        return Ok(Some(exit_session(session, 1)?));
+    }
+    recover(session, &error.to_string(), true)?;
+    Ok(None)
 }
 
 fn exit_session(session: &mut Session, code: u8) -> Result<ExitCode> {

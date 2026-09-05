@@ -27,19 +27,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 struct Prepared {
     connection: Connection<()>,
-    lock: DapLock,
+    lock: LockGuard,
     project: PathBuf,
     file: Option<PathBuf>,
-}
-
-struct DapLock {
-    guard: Option<LockGuard>,
-}
-
-impl Drop for DapLock {
-    fn drop(&mut self) {
-        self.guard.take();
-    }
 }
 
 struct ClientBuffer {
@@ -234,12 +224,10 @@ impl ServerRequests {
     }
 }
 
-enum ForwardClient {
-    Failure {
-        request_seq: Value,
-        command: String,
-        message: String,
-    },
+struct RequestFailure {
+    request_seq: Value,
+    command: String,
+    message: String,
 }
 
 enum InitializeWait {
@@ -350,7 +338,7 @@ fn prepare(
     }
     let files = ProjectFiles::new(&project).map_err(|error| error.to_string())?;
     let lock = match try_lock(&files.dap_lock).map_err(|error| error.to_string())? {
-        Some(guard) => DapLock { guard: Some(guard) },
+        Some(guard) => guard,
         None => {
             return Err(format!(
                 "A debug session for {} is already running",
@@ -511,12 +499,7 @@ fn run_session_inner(
         if let Some(result) =
             forward_client_body(&body, &mut server_requests, connection, project, file)?
         {
-            let ForwardClient::Failure {
-                request_seq,
-                command,
-                message,
-            } = result;
-            send_request_failure(output, request_seq, command, message)?;
+            send_request_failure(output, result)?;
         }
     }
 
@@ -536,12 +519,7 @@ fn run_session_inner(
                 if let Some(failure) =
                     forward_client_body(&body, &mut server_requests, connection, project, file)?
                 {
-                    let ForwardClient::Failure {
-                        request_seq,
-                        command,
-                        message,
-                    } = failure;
-                    send_request_failure(output, request_seq, command, message)?;
+                    send_request_failure(output, failure)?;
                 }
             }
             DapFrame::End(DapSide::Godot) => return godot_died(output),
@@ -609,7 +587,7 @@ fn forward_client_body(
     connection: &mut Connection<()>,
     project: &Path,
     file: Option<&Path>,
-) -> Result<Option<ForwardClient>> {
+) -> Result<Option<RequestFailure>> {
     let fields = crate::json::scan_top_level(body)?;
     let rewrite = fields.type_.is_some_and(|value| {
         value.string_eq("response")
@@ -636,7 +614,7 @@ fn forward_client(
     connection: &mut Connection<()>,
     project: &Path,
     file: Option<&Path>,
-) -> Result<Option<ForwardClient>> {
+) -> Result<Option<RequestFailure>> {
     if message.get("type").and_then(Value::as_str) == Some("response") {
         server_requests.restore_response(&mut message);
     }
@@ -650,7 +628,7 @@ fn forward_client(
             match rewrite_launch_or_attach(&mut message, &command, project, file) {
                 Ok(()) => {}
                 Err((request_seq, message)) => {
-                    return Ok(Some(ForwardClient::Failure {
+                    return Ok(Some(RequestFailure {
                         request_seq,
                         command,
                         message,
@@ -665,16 +643,14 @@ fn forward_client(
 
 fn send_request_failure(
     output: &mut ClientOutput<std::io::Stdout>,
-    request_seq: Value,
-    command: String,
-    message: String,
+    failure: RequestFailure,
 ) -> Result<()> {
     output.send(crate::json!({
         "type": "response",
-        "request_seq": request_seq,
-        "command": command,
+        "request_seq": (failure.request_seq),
+        "command": (failure.command),
         "success": false,
-        "message": message,
+        "message": (failure.message),
     }))
 }
 
@@ -734,7 +710,7 @@ fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<Option<ForwardClient>> {
+fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<Option<RequestFailure>> {
     write_frame(writer, body, FRAME_CAP)?;
     Ok(None)
 }

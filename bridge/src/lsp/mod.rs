@@ -151,7 +151,7 @@ struct Runtime {
     state: Arc<RwLock<State>>,
     socket: Option<crate::state::SocketHandle>,
     lock: Option<crate::state::LockGuard>,
-    handoff_receiver: Option<Receiver<HandoffRequest>>,
+    handoff_receiver: Option<Receiver<LockGuard>>,
     mode: Mode,
 }
 
@@ -170,20 +170,6 @@ struct Session {
     settings: Settings,
     editor: Editor,
     watch: Watch,
-}
-
-struct HandoffRequest {
-    dap_lock: HandoffLock,
-}
-
-struct HandoffLock {
-    guard: Option<LockGuard>,
-}
-
-impl Drop for HandoffLock {
-    fn drop(&mut self) {
-        self.guard.take();
-    }
 }
 
 enum RecoveryItem {
@@ -375,8 +361,8 @@ fn gui_process_is_alive(runtime: &Runtime) -> bool {
     gui_process_alive(&state)
 }
 
-fn perform_handoff(session: &mut Session, handoff: HandoffRequest) -> Result<()> {
-    let _dap_lock = handoff.dap_lock;
+fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
+    let _dap_lock = dap_lock;
     let mut recovery_queue = start_recovery(session)?;
     let old_lsp_port = session.editor.lsp_port;
     let old_dap_port = session.editor.dap_port;

@@ -195,13 +195,12 @@ impl WatcherState {
         sender: &Sender<io::Result<WatcherChange>>,
     ) -> bool {
         if event.mask & libc::IN_Q_OVERFLOW != 0 {
-            return self.send_change(
-                sender,
-                WatcherChange {
+            return sender
+                .send(Ok(WatcherChange {
                     kind: WatcherChangeKind::Rescan,
                     path: self.project.clone(),
-                },
-            );
+                }))
+                .is_ok();
         }
         if event.mask & libc::IN_IGNORED != 0 {
             self.watch_paths.remove(&event.wd);
@@ -210,26 +209,25 @@ impl WatcherState {
         let Some(directory) = self.watch_paths.get(&event.wd).cloned() else {
             return true;
         };
-        let path = if let Some(end) = name_bytes.iter().position(|byte| *byte == 0) {
+        let end = name_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_bytes.len());
+        let path = if end == 0 {
+            directory.clone()
+        } else {
             directory.join(PathBuf::from(std::ffi::OsString::from_vec(
                 name_bytes[..end].to_vec(),
             )))
-        } else if !name_bytes.is_empty() {
-            directory.join(PathBuf::from(std::ffi::OsString::from_vec(
-                name_bytes.to_vec(),
-            )))
-        } else {
-            directory.clone()
         };
         if event.mask & libc::IN_DELETE_SELF != 0 {
             self.watch_paths.remove(&event.wd);
-            return self.send_change(
-                sender,
-                WatcherChange {
+            return sender
+                .send(Ok(WatcherChange {
                     kind: WatcherChangeKind::Removed,
                     path,
-                },
-            );
+                }))
+                .is_ok();
         }
         if event.mask & libc::IN_MOVE_SELF != 0 {
             self.watch_paths.remove(&event.wd);
@@ -254,15 +252,7 @@ impl WatcherState {
         } else {
             return true;
         };
-        self.send_change(sender, WatcherChange { kind, path })
-    }
-
-    fn send_change(
-        &mut self,
-        sender: &Sender<io::Result<WatcherChange>>,
-        change: WatcherChange,
-    ) -> bool {
-        sender.send(Ok(change)).is_ok()
+        sender.send(Ok(WatcherChange { kind, path })).is_ok()
     }
 }
 
@@ -309,13 +299,13 @@ fn watch_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::fs;
     use std::time::Duration;
 
     #[test]
     fn watches_file_lifecycle() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let watcher = watch_project(directory.path(), false).unwrap();
         let path = directory.path().join("file.gd");
         fs::write(&path, "one").unwrap();
@@ -376,7 +366,7 @@ mod tests {
 
     #[test]
     fn watches_directories_created_after_start() {
-        let directory = tempdir().unwrap();
+        let directory = TempDir::new().unwrap();
         let watcher = watch_project(directory.path(), false).unwrap();
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();

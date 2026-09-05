@@ -49,17 +49,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Number {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     fn new(value: impl Into<String>) -> Self {
         Self(value.into())
-    }
-
-    fn from_f64(value: f64) -> Self {
-        assert!(value.is_finite(), "JSON numbers must be finite");
-        Self(value.to_string())
     }
 
     fn as_i64(&self) -> Option<i64> {
@@ -67,10 +58,6 @@ impl Number {
     }
 
     fn as_u64(&self) -> Option<u64> {
-        self.0.parse().ok()
-    }
-
-    fn as_f64(&self) -> Option<f64> {
         self.0.parse().ok()
     }
 }
@@ -131,10 +118,6 @@ impl Map {
         self.0.iter().map(|(key, value)| (key, value))
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Value)> {
-        self.0.iter_mut().map(|(key, value)| (&*key, value))
-    }
-
     pub fn extend<I>(&mut self, entries: I)
     where
         I: IntoIterator<Item = (String, Value)>,
@@ -189,14 +172,6 @@ impl Value {
         matches!(self, Self::Object(_))
     }
 
-    pub fn is_array(&self) -> bool {
-        matches!(self, Self::Array(_))
-    }
-
-    pub fn is_number(&self) -> bool {
-        matches!(self, Self::Number(_))
-    }
-
     pub fn as_object(&self) -> Option<&Map> {
         match self {
             Self::Object(object) => Some(object),
@@ -212,13 +187,6 @@ impl Value {
     }
 
     pub fn as_array(&self) -> Option<&Vec<Value>> {
-        match self {
-            Self::Array(array) => Some(array),
-            _ => None,
-        }
-    }
-
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
         match self {
             Self::Array(array) => Some(array),
             _ => None,
@@ -249,13 +217,6 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Number(number) => number.as_u64(),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Number(number) => number.as_f64(),
             _ => None,
         }
     }
@@ -356,18 +317,6 @@ impl From<&Value> for Value {
     }
 }
 
-impl From<f64> for Value {
-    fn from(value: f64) -> Self {
-        Self::Number(Number::from_f64(value))
-    }
-}
-
-impl From<f32> for Value {
-    fn from(value: f32) -> Self {
-        Self::Number(Number::from_f64(f64::from(value)))
-    }
-}
-
 macro_rules! integer_value {
     ($($type:ty),* $(,)?) => {
         $(
@@ -380,7 +329,7 @@ macro_rules! integer_value {
     };
 }
 
-integer_value!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+integer_value!(i32, i64, u16, u32, u64);
 
 impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(value: Option<T>) -> Self {
@@ -873,12 +822,6 @@ pub fn from_slice(bytes: &[u8]) -> Result<Value, Error> {
 
 pub fn from_str(text: &str) -> Result<Value, Error> {
     Parser::new(text.as_bytes(), false).parse()
-}
-
-pub fn from_slice_relaxed(bytes: &[u8]) -> Result<Value, Error> {
-    let text = str::from_utf8(bytes)
-        .map_err(|error| Error::new(error.valid_up_to(), "input is not UTF-8"))?;
-    from_str_relaxed(text)
 }
 
 pub fn from_str_relaxed(text: &str) -> Result<Value, Error> {

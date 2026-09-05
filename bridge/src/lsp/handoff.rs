@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn serve_owner_socket(
     files: &ProjectFiles,
     state: Arc<RwLock<State>>,
-    handoff_sender: mpsc::Sender<HandoffRequest>,
+    handoff_sender: mpsc::Sender<LockGuard>,
 ) -> Result<crate::state::SocketHandle> {
     let dap_path = files.dap_lock.clone();
     Ok(serve_socket(&files.sock, move |request: Value| {
@@ -36,10 +36,7 @@ pub(super) fn serve_owner_socket(
                     HandoffDecision::AlreadyGui => crate::json!({"version": 1, "accepted": true}),
                     HandoffDecision::Swap => match try_lock(&dap_path) {
                         Ok(Some(guard)) => {
-                            let handoff = HandoffRequest {
-                                dap_lock: HandoffLock { guard: Some(guard) },
-                            };
-                            if handoff_sender.send(handoff).is_ok() {
+                            if handoff_sender.send(guard).is_ok() {
                                 crate::json!({"version": 1, "accepted": true})
                             } else {
                                 crate::json!({"version": 1, "accepted": false, "reason": "owner is shutting down"})

@@ -295,7 +295,7 @@ fn user_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
     use std::fs;
 
     fn user_settings_path_in(config_dir: &Path) -> PathBuf {
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn project_settings_override_user_per_key() {
-        let config_dir = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
         write_user_settings(
             config_dir.path(),
             r#"{
@@ -366,7 +366,7 @@ mod tests {
                 }
             }"#,
         );
-        let worktree = tempdir().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{
@@ -398,8 +398,8 @@ mod tests {
 
     #[test]
     fn comment_bearing_settings_file_parses() {
-        let config_dir = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{
@@ -423,8 +423,8 @@ mod tests {
 
     #[test]
     fn validation_error_names_the_file() {
-        let config_dir = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
         write_project_settings(
             worktree.path(),
             r#"{"lsp": {"godot": {"settings": {"dap_port": "bad"}}}}"#,

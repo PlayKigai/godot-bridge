@@ -42,11 +42,11 @@ mod tests {
     use super::*;
     use crate::json::Value;
     use crate::state::{serve_socket, write_state, Mode, State, Status};
-    use crate::temp::tempdir;
+    use crate::temp::TempDir;
 
     #[test]
     fn detached_gui_state_without_socket_is_kept() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         write_state(
             &dir.path().join("gui.json"),
             &crate::state::detached_gui_state(Path::new("/project"), Status::Ready),
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn stale_state_is_removed_and_live_status_is_printed() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new().unwrap();
         let stale = State {
             version: 1,
             project: "/stale".to_owned(),
