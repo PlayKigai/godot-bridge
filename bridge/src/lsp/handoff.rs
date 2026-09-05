@@ -40,7 +40,7 @@ pub(super) fn serve_owner_socket(
                             }
                         }
                         Ok(None) => {
-                            crate::json!({"version": 1, "accepted": false, "reason": "a debug session is active"})
+                            crate::json!({"version": 1, "accepted": false, "reason": "a debug session or hand-off is in progress"})
                         }
                         Err(error) => {
                             crate::json!({"version": 1, "accepted": false, "reason": (error.to_string())})
