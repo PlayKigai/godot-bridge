@@ -317,8 +317,8 @@ pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
     if !signal_group(pid, pgid, ticks, libc::SIGKILL)? {
         return Ok(());
     }
-    while pid_alive_with_ticks(pid, ticks) {
-        thread::sleep(Duration::from_millis(50));
+    if !wait_for_process_to_disappear(pid, ticks, GROUP_WAIT) {
+        crate::warn!("process {pid} did not exit after SIGKILL");
     }
     Ok(())
 }

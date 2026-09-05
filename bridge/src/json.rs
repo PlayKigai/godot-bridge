@@ -423,9 +423,16 @@ impl RawJson<'_> {
                 return Some(RequestKey::String(value));
             }
         }
-        Some(
-            self.as_i64()
-                .map_or_else(|| RequestKey::Lexical(self.lexical()), RequestKey::Number),
+        self.as_i64().map_or_else(
+            || {
+                if self.0.len() > 256 {
+                    crate::warn!("dropping request id longer than 256 bytes");
+                    None
+                } else {
+                    Some(RequestKey::Lexical(self.lexical()))
+                }
+            },
+            |number| Some(RequestKey::Number(number)),
         )
     }
 
@@ -459,11 +466,27 @@ pub(crate) fn value_request_key(value: &Value) -> Option<RequestKey> {
                 Some(RequestKey::String(value.clone()))
             }
         }
-        Value::Number(number) => Some(number.as_i64().map_or_else(
-            || RequestKey::Lexical(number.to_string()),
-            RequestKey::Number,
-        )),
-        _ => Some(RequestKey::Lexical(to_string(value))),
+        Value::Number(number) => number.as_i64().map_or_else(
+            || {
+                let lexical = number.to_string();
+                if lexical.len() > 256 {
+                    crate::warn!("dropping request id longer than 256 bytes");
+                    None
+                } else {
+                    Some(RequestKey::Lexical(lexical))
+                }
+            },
+            |number| Some(RequestKey::Number(number)),
+        ),
+        _ => {
+            let lexical = to_string(value);
+            if lexical.len() > 256 {
+                crate::warn!("dropping request id longer than 256 bytes");
+                None
+            } else {
+                Some(RequestKey::Lexical(lexical))
+            }
+        }
     }
 }
 
@@ -1389,5 +1412,13 @@ break"}"#,
             .unwrap()
             .request_key()
             .is_none());
+        let wire = format!(r#"{{"id":{}}}"#, "1".repeat(257));
+        assert!(scan_top_level(wire.as_bytes())
+            .unwrap()
+            .id
+            .unwrap()
+            .request_key()
+            .is_none());
+        assert!(value_request_key(&from_str(&"1".repeat(257)).unwrap()).is_none());
     }
 }

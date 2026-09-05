@@ -75,41 +75,47 @@ struct PendingRequest {
 }
 
 #[derive(Default)]
-struct RequestKeys {
+pub(crate) struct RequestKeys {
     values: HashSet<crate::json::RequestKey>,
     order: VecDeque<crate::json::RequestKey>,
 }
 
 impl RequestKeys {
-    fn insert(&mut self, key: crate::json::RequestKey) {
-        if self.values.insert(key.clone()) {
-            self.order.push_back(key);
-            if self.values.len() > crate::SERVER_REQUEST_CAP {
-                if let Some(old) = self.order.pop_front() {
-                    if !self.order.iter().any(|key| key == &old) {
-                        self.values.remove(&old);
-                    }
-                }
-            }
+    pub(crate) fn insert(
+        &mut self,
+        key: crate::json::RequestKey,
+    ) -> Option<crate::json::RequestKey> {
+        if !self.values.insert(key.clone()) {
+            return None;
+        }
+        self.order.push_back(key);
+        if self.order.len() > crate::SERVER_REQUEST_CAP {
+            let old = self.order.pop_front()?;
+            self.values.remove(&old);
+            Some(old)
+        } else {
+            None
         }
     }
 
-    fn remove(&mut self, key: &crate::json::RequestKey) -> bool {
-        self.values.remove(key)
+    pub(crate) fn remove(&mut self, key: &crate::json::RequestKey) -> bool {
+        let removed = self.values.remove(key);
+        self.order.retain(|ordered| ordered != key);
+        removed
     }
 
-    fn contains(&self, key: &crate::json::RequestKey) -> bool {
+    pub(crate) fn contains(&self, key: &crate::json::RequestKey) -> bool {
         self.values.contains(key)
     }
 
-    fn drain(&mut self) -> Vec<crate::json::RequestKey> {
+    pub(crate) fn drain(&mut self) -> Vec<crate::json::RequestKey> {
         self.order.clear();
         self.values.drain().collect()
     }
 
-    fn extend(&mut self, keys: impl IntoIterator<Item = crate::json::RequestKey>) {
+    pub(crate) fn extend(&mut self, keys: impl IntoIterator<Item = crate::json::RequestKey>) {
         for key in keys {
-            self.insert(key);
+            let _ = self.insert(key);
         }
     }
 }
@@ -1913,16 +1919,20 @@ mod tests {
     }
 
     #[test]
-    fn removed_request_key_survives_reinsertion_until_its_turn() {
+    fn removed_request_key_is_reinserted_at_back() {
         let mut keys = RequestKeys::default();
         let key = crate::json::RequestKey::String("A".to_owned());
         keys.insert(key.clone());
         assert!(keys.remove(&key));
         keys.insert(key.clone());
-        for index in 0..crate::SERVER_REQUEST_CAP {
+        for index in 0..crate::SERVER_REQUEST_CAP - 1 {
             keys.insert(crate::json::RequestKey::Number(index as i64));
         }
         assert!(keys.contains(&key));
+        keys.insert(crate::json::RequestKey::Number(
+            crate::SERVER_REQUEST_CAP as i64,
+        ));
+        assert!(!keys.contains(&key));
     }
 
     #[test]

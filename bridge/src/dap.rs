@@ -176,14 +176,14 @@ impl<W: Write> ClientOutput<W> {
 
 struct ServerRequests {
     original_sequences: HashMap<crate::json::RequestKey, Value>,
-    order: VecDeque<crate::json::RequestKey>,
+    keys: crate::lsp::RequestKeys,
 }
 
 impl ServerRequests {
     fn new() -> Self {
         Self {
             original_sequences: HashMap::new(),
-            order: VecDeque::new(),
+            keys: crate::lsp::RequestKeys::default(),
         }
     }
 
@@ -196,11 +196,8 @@ impl ServerRequests {
                     .insert(key.clone(), original)
                     .is_none()
                 {
-                    self.order.push_back(key);
-                    while self.order.len() > crate::SERVER_REQUEST_CAP {
-                        if let Some(old) = self.order.pop_front() {
-                            self.original_sequences.remove(&old);
-                        }
+                    if let Some(old) = self.keys.insert(key) {
+                        self.original_sequences.remove(&old);
                     }
                 }
             }
@@ -216,6 +213,7 @@ impl ServerRequests {
         };
         if let Some(key) = crate::json::value_request_key(request_seq) {
             if let Some(original) = self.original_sequences.remove(&key) {
+                self.keys.remove(&key);
                 message["request_seq"] = original;
             }
         }

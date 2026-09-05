@@ -189,6 +189,7 @@ pub(super) fn spawn_one(
     event_sender: &mpsc::SyncSender<ProxyEvent>,
     deadline: Option<Instant>,
 ) -> std::result::Result<Editor, StartupError> {
+    let mut port_mismatches = 0;
     loop {
         let lsp_port =
             pick_free_port(6005..=6999).map_err(|error| StartupError::Io(error.to_string()))?;
@@ -210,12 +211,24 @@ pub(super) fn spawn_one(
         }
         let (child, stream) = match await_port(child, lsp_port, deadline, "LSP") {
             Ok(value) => value,
-            Err(StartupError::PortMismatch) => continue,
+            Err(StartupError::PortMismatch) => {
+                port_mismatches += 1;
+                if port_mismatches >= STARTUP_ATTEMPTS {
+                    return Err(StartupError::PortMismatch);
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let (child, _) = match await_port(child, dap_port, deadline, "DAP") {
             Ok(value) => value,
-            Err(StartupError::PortMismatch) => continue,
+            Err(StartupError::PortMismatch) => {
+                port_mismatches += 1;
+                if port_mismatches >= STARTUP_ATTEMPTS {
+                    return Err(StartupError::PortMismatch);
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         return Ok(Editor {
