@@ -1,13 +1,11 @@
 use crate::json::{Map, Value};
-use std::future::Future;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 
 const SOCKET_CLIENT_CAP: usize = 16;
 const SOCKET_LINE_CAP: usize = 64 * 1024;
@@ -437,58 +435,112 @@ pub fn remove_if_stale(state_path: &Path, sock_path: &Path) -> io::Result<bool> 
 
 pub struct SocketHandle {
     path: PathBuf,
-    task: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    listener: Option<JoinHandle<()>>,
+    clients: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Drop for SocketHandle {
     fn drop(&mut self) {
-        self.task.abort();
+        self.stop.store(true, Ordering::Release);
+        let _ = UnixStream::connect(&self.path);
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        if let Ok(mut clients) = self.clients.lock() {
+            for client in clients.drain(..) {
+                let _ = client.join();
+            }
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-pub async fn serve_socket<F, Fut>(path: impl AsRef<Path>, handler: F) -> io::Result<SocketHandle>
+pub fn serve_socket<F>(path: impl AsRef<Path>, handler: F) -> io::Result<SocketHandle>
 where
-    F: Fn(Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Value> + Send + 'static,
+    F: Fn(Value) -> Value + Send + Sync + 'static,
 {
     let path = path.as_ref().to_path_buf();
     not_found_ok(std::fs::remove_file(&path))?;
     let listener = UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let handler = Arc::new(handler);
-    let permits = Arc::new(Semaphore::new(SOCKET_CLIENT_CAP));
-    let task = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                continue;
-            };
-            let handler = Arc::clone(&handler);
-            tokio::spawn(handle_client(stream, handler, permit));
-        }
-    });
-    Ok(SocketHandle { path, task })
+    let stop = Arc::new(AtomicBool::new(false));
+    let clients = Arc::new(Mutex::new(Vec::new()));
+    let count = Arc::new(AtomicUsize::new(0));
+    let stop_for_thread = Arc::clone(&stop);
+    let clients_for_thread = Arc::clone(&clients);
+    let count_for_thread = Arc::clone(&count);
+    let listener_thread = thread::Builder::new()
+        .name("godot-bridge-socket".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                if count_for_thread.load(Ordering::Acquire) >= SOCKET_CLIENT_CAP {
+                    continue;
+                }
+                count_for_thread.fetch_add(1, Ordering::AcqRel);
+                let handler = Arc::clone(&handler);
+                let stop = Arc::clone(&stop_for_thread);
+                let count = Arc::clone(&count_for_thread);
+                let client = thread::Builder::new()
+                    .name("godot-bridge-socket-client".to_owned())
+                    .stack_size(256 * 1024)
+                    .spawn(move || {
+                        handle_client(stream, handler, stop);
+                        count.fetch_sub(1, Ordering::AcqRel);
+                    });
+                if let Ok(client) = client {
+                    if let Ok(mut clients) = clients_for_thread.lock() {
+                        clients.push(client);
+                    }
+                } else {
+                    count_for_thread.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        })?;
+    Ok(SocketHandle {
+        path,
+        stop,
+        listener: Some(listener_thread),
+        clients,
+    })
 }
 
 pub fn unknown_command() -> Value {
     crate::json!({"error": "unknown cmd"})
 }
 
-async fn handle_client<F, Fut>(
-    stream: UnixStream,
-    handler: Arc<F>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-) where
-    F: Fn(Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Value> + Send + 'static,
+fn handle_client<F>(stream: UnixStream, handler: Arc<F>, stop: Arc<AtomicBool>)
+where
+    F: Fn(Value) -> Value + Send + Sync + 'static,
 {
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    let reader_stream = match stream.try_clone() {
+        Ok(reader_stream) => reader_stream,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(reader_stream);
+    let mut write = stream;
     loop {
-        let line = match tokio::time::timeout(SOCKET_TIMEOUT, read_line_limited(&mut reader)).await
-        {
-            Ok(Ok(Some(line))) => line,
-            _ => break,
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let line = match read_line_limited(&mut reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(_) => break,
         };
         let response = match crate::json::from_slice(&line) {
             Ok(request) => {
@@ -497,10 +549,7 @@ async fn handle_client<F, Fut>(
                     Some("status") | Some("handoff")
                 );
                 if known {
-                    match tokio::time::timeout(SOCKET_TIMEOUT, handler(request)).await {
-                        Ok(response) => response,
-                        Err(_) => crate::json!({"error": "request timed out"}),
-                    }
+                    handler(request)
                 } else {
                     unknown_command()
                 }
@@ -509,19 +558,16 @@ async fn handle_client<F, Fut>(
         };
         let mut bytes = crate::json::to_vec(&response);
         bytes.push(b'\n');
-        if !matches!(
-            tokio::time::timeout(SOCKET_TIMEOUT, write.write_all(&bytes)).await,
-            Ok(Ok(()))
-        ) {
+        if write.write_all(&bytes).is_err() {
             break;
         }
     }
 }
 
-async fn read_line_limited<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+fn read_line_limited<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
-        let available = reader.fill_buf().await?;
+        let available = reader.fill_buf()?;
         if available.is_empty() {
             return if line.is_empty() {
                 Ok(None)
@@ -555,25 +601,18 @@ async fn read_line_limited<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Resul
     }
 }
 
-pub async fn socket_request(
-    path: impl AsRef<Path>,
-    req: &Value,
-    timeout: Duration,
-) -> io::Result<Value> {
-    tokio::time::timeout(timeout, async {
-        let stream = UnixStream::connect(path).await?;
-        let (read, mut write) = stream.into_split();
-        let mut bytes = crate::json::to_vec(req);
-        bytes.push(b'\n');
-        write.write_all(&bytes).await?;
-        let mut reader = BufReader::new(read);
-        let line = read_line_limited(&mut reader)
-            .await?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
-        crate::json::from_slice(&line).map_err(io::Error::other)
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket request timed out"))?
+pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) -> io::Result<Value> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut write = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    let mut bytes = crate::json::to_vec(req);
+    bytes.push(b'\n');
+    write.write_all(&bytes)?;
+    let line = read_line_limited(&mut reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
+    crate::json::from_slice(&line).map_err(io::Error::other)
 }
 
 #[cfg(unix)]
@@ -715,25 +754,23 @@ mod tests {
         assert!(value["dap_port"].is_null());
     }
 
-    #[tokio::test]
-    async fn socket_status_round_trip() {
+    #[test]
+    fn socket_status_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("status.sock");
-        let handle = serve_socket(&path, |request| async move {
+        let handle = serve_socket(&path, |request| {
             if request["cmd"] == "status" {
                 crate::json!({"status": "ready"})
             } else {
                 crate::json!({"error": "unexpected"})
             }
         })
-        .await
         .unwrap();
         let response = socket_request(
             &path,
             &crate::json!({"cmd": "status"}),
             Duration::from_secs(1),
         )
-        .await
         .unwrap();
         assert_eq!(response["status"], "ready");
         drop(handle);

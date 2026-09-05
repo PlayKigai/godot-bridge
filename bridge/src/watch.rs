@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::docs_state::{directory_is_skipped, WatcherChange, WatcherChangeKind};
 use crate::root::canonical_or_normalized;
@@ -37,7 +37,6 @@ struct WatcherState {
     diagnose_addons: bool,
     watch_paths: HashMap<RawFd, PathBuf>,
     watch_limit_reached: bool,
-    rescan_pending: bool,
 }
 
 pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<ProjectWatcher> {
@@ -52,7 +51,6 @@ pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<Projec
         diagnose_addons,
         watch_paths: HashMap::new(),
         watch_limit_reached: false,
-        rescan_pending: false,
     };
     if let Err(error) = state.watch_directory(&project) {
         unsafe {
@@ -61,11 +59,12 @@ pub fn watch_project(project: &Path, diagnose_addons: bool) -> io::Result<Projec
         return Err(error);
     }
 
-    let (sender, receiver) = mpsc::channel(1024);
+    let (sender, receiver) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
     let thread = match thread::Builder::new()
         .name("godot-bridge-watch".to_owned())
+        .stack_size(256 * 1024)
         .spawn(move || watch_events(state, sender, stop_for_thread))
     {
         Ok(thread) => thread,
@@ -263,32 +262,7 @@ impl WatcherState {
         sender: &Sender<io::Result<WatcherChange>>,
         change: WatcherChange,
     ) -> bool {
-        match sender.try_send(Ok(change)) {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(change))) => {
-                self.rescan_pending |= change.kind == WatcherChangeKind::Rescan;
-                true
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(Err(_))) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    }
-
-    fn send_pending_rescan(&mut self, sender: &Sender<io::Result<WatcherChange>>) -> bool {
-        if !self.rescan_pending {
-            return true;
-        }
-        match sender.try_send(Ok(WatcherChange {
-            kind: WatcherChangeKind::Rescan,
-            path: self.project.clone(),
-        })) {
-            Ok(()) => {
-                self.rescan_pending = false;
-                true
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-        }
+        sender.send(Ok(change)).is_ok()
     }
 }
 
@@ -298,9 +272,6 @@ fn watch_events(
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Acquire) {
-        if !state.send_pending_rescan(&sender) {
-            break;
-        }
         let mut pollfd = libc::pollfd {
             fd: state.fd,
             events: libc::POLLIN,
@@ -311,21 +282,21 @@ fn watch_events(
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            let _ = sender.try_send(Err(io::Error::last_os_error()));
+            let _ = sender.send(Err(io::Error::last_os_error()));
             break;
         }
         if result == 0 {
             continue;
         }
         if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            let _ = sender.try_send(Err(io::Error::other("inotify watch closed")));
+            let _ = sender.send(Err(io::Error::other("inotify watch closed")));
             break;
         }
         match state.read_events(&sender) {
             Ok(true) => {}
             Ok(false) => break,
             Err(error) => {
-                let _ = sender.try_send(Err(error));
+                let _ = sender.send(Err(error));
                 break;
             }
         }
@@ -345,97 +316,91 @@ mod tests {
     #[test]
     fn watches_file_lifecycle() {
         let directory = tempdir().unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut watcher = watch_project(directory.path(), false).unwrap();
-            let path = directory.path().join("file.gd");
-            fs::write(&path, "one").unwrap();
-            let mut changes = Vec::new();
-            while changes.len() < 2 {
-                changes.push(
-                    tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap(),
-                );
-            }
-            assert!(changes.iter().any(|change| {
-                change.kind == WatcherChangeKind::Created && change.path == path
-            }));
-            assert!(changes.iter().any(|change| {
-                change.kind == WatcherChangeKind::Modified && change.path == path
-            }));
+        let watcher = watch_project(directory.path(), false).unwrap();
+        let path = directory.path().join("file.gd");
+        fs::write(&path, "one").unwrap();
+        let mut changes = Vec::new();
+        while changes.len() < 2 {
+            changes.push(
+                watcher
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(changes
+            .iter()
+            .any(|change| { change.kind == WatcherChangeKind::Created && change.path == path }));
+        assert!(changes
+            .iter()
+            .any(|change| { change.kind == WatcherChangeKind::Modified && change.path == path }));
 
-            fs::write(&path, "two").unwrap();
-            let modified = tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(modified.kind, WatcherChangeKind::Modified);
-            assert_eq!(modified.path, path);
+        fs::write(&path, "two").unwrap();
+        let modified = watcher
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(modified.kind, WatcherChangeKind::Modified);
+        assert_eq!(modified.path, path);
 
-            let renamed = directory.path().join("renamed.gd");
-            fs::rename(&path, &renamed).unwrap();
-            let mut rename_changes = Vec::new();
-            while rename_changes.len() < 2 {
-                rename_changes.push(
-                    tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap(),
-                );
-            }
-            assert!(rename_changes.iter().any(|change| {
-                change.kind == WatcherChangeKind::Removed && change.path == path
-            }));
-            assert!(rename_changes.iter().any(|change| {
-                change.kind == WatcherChangeKind::Created && change.path == renamed
-            }));
+        let renamed = directory.path().join("renamed.gd");
+        fs::rename(&path, &renamed).unwrap();
+        let mut rename_changes = Vec::new();
+        while rename_changes.len() < 2 {
+            rename_changes.push(
+                watcher
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(rename_changes
+            .iter()
+            .any(|change| { change.kind == WatcherChangeKind::Removed && change.path == path }));
+        assert!(rename_changes
+            .iter()
+            .any(|change| { change.kind == WatcherChangeKind::Created && change.path == renamed }));
 
-            fs::remove_file(&renamed).unwrap();
-            let removed = tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(removed.kind, WatcherChangeKind::Removed);
-            assert_eq!(removed.path, renamed);
-        });
+        fs::remove_file(&renamed).unwrap();
+        let removed = watcher
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.kind, WatcherChangeKind::Removed);
+        assert_eq!(removed.path, renamed);
     }
 
     #[test]
     fn watches_directories_created_after_start() {
         let directory = tempdir().unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut watcher = watch_project(directory.path(), false).unwrap();
-            let nested = directory.path().join("nested");
-            fs::create_dir(&nested).unwrap();
-            loop {
-                let change = tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                if change.kind == WatcherChangeKind::Created && change.path == nested {
-                    break;
-                }
+        let watcher = watch_project(directory.path(), false).unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        loop {
+            let change = watcher
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            if change.kind == WatcherChangeKind::Created && change.path == nested {
+                break;
             }
-            let path = nested.join("file.gd");
-            fs::write(&path, "one").unwrap();
-            loop {
-                let change = tokio::time::timeout(Duration::from_secs(2), watcher.receiver.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                if change.kind == WatcherChangeKind::Created && change.path == path {
-                    break;
-                }
+        }
+        let path = nested.join("file.gd");
+        fs::write(&path, "one").unwrap();
+        loop {
+            let change = watcher
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            if change.kind == WatcherChangeKind::Created && change.path == path {
+                break;
             }
-        });
+        }
     }
 }

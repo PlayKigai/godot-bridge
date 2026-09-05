@@ -43,10 +43,10 @@ impl BridgeClient {
             .current_dir(project)
             .env("XDG_RUNTIME_DIR", runtime)
             .env("XDG_CONFIG_HOME", &config)
-            .env("GODOT_BRIDGE_LOG", "error")
+            .env("GODOT_BRIDGE_LOG", "debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         if let Some(settings) = settings {
             process.env("GODOT_BRIDGE_SETTINGS", settings);
         }

@@ -1,7 +1,9 @@
 use std::fmt;
 
 use crate::json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::io::{Read, Write};
+use std::sync::mpsc::SyncSender;
+use std::thread::{self, JoinHandle};
 
 const HEADER_CAP: usize = 16 * 1024;
 
@@ -116,12 +118,39 @@ impl FrameDecoder {
     }
 }
 
-pub struct FrameReader<R: AsyncRead> {
+pub struct FrameReader<R: Read> {
     reader: R,
     decoder: FrameDecoder,
 }
 
-impl<R: AsyncRead + Unpin> FrameReader<R> {
+pub type FrameEvent = Result<Option<Vec<u8>>, FrameError>;
+
+pub fn spawn_frame_reader<R: Read + Send + 'static>(
+    name: &str,
+    reader: R,
+    cap: usize,
+    sender: SyncSender<FrameEvent>,
+) -> std::io::Result<JoinHandle<()>> {
+    let name = name.to_owned();
+    thread::Builder::new()
+        .name(name)
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let mut reader = FrameReader::new(reader, cap);
+            loop {
+                let event = reader.read_frame();
+                let done = matches!(&event, Ok(None) | Err(_));
+                if sender.send(event).is_err() {
+                    return;
+                }
+                if done {
+                    return;
+                }
+            }
+        })
+}
+
+impl<R: Read> FrameReader<R> {
     pub fn new(reader: R, cap: usize) -> Self {
         Self {
             reader,
@@ -129,15 +158,20 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     /// Reads the next body, returning `None` only at a clean frame boundary.
-    pub async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+    pub fn read_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
         let mut bytes = [0u8; 8192];
         loop {
             if let Some(frame) = self.decoder.next_frame()? {
                 return Ok(Some(frame));
             }
 
-            let count = self.reader.read(&mut bytes).await.map_err(FrameError::Io)?;
+            let count = self.reader.read(&mut bytes).map_err(FrameError::Io)?;
+
             if count == 0 {
                 if self.decoder.has_pending_bytes() {
                     return Err(FrameError::Malformed("unexpected EOF".to_string()));
@@ -155,17 +189,12 @@ pub fn encode_frame(body: &[u8]) -> Vec<u8> {
     frame
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    body: &[u8],
-    cap: usize,
-) -> Result<(), FrameError> {
+pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<(), FrameError> {
     if body.len() > cap {
         return Err(FrameError::Oversized(body.len()));
     }
     writer
         .write_all(&encode_frame(body))
-        .await
         .map_err(FrameError::Io)
 }
 
@@ -183,16 +212,16 @@ pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-pub async fn write_json<W: AsyncWrite + Unpin>(
+pub fn write_json<W: Write>(
     writer: &mut W,
     message: &Value,
     cap: usize,
     flush: bool,
 ) -> Result<(), FrameError> {
     let body = crate::json::to_vec(message);
-    write_frame(writer, &body, cap).await?;
+    write_frame(writer, &body, cap)?;
     if flush {
-        writer.flush().await.map_err(FrameError::Io)?;
+        writer.flush().map_err(FrameError::Io)?;
     }
     Ok(())
 }
@@ -200,7 +229,7 @@ pub async fn write_json<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use std::io::Cursor;
 
     #[test]
     fn split_frame_across_pushes() {
@@ -249,19 +278,10 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn eof_mid_frame() {
-        let (mut writer, reader) = duplex(64);
-        writer
-            .write_all(b"Content-Length: 4\r\n\r\nabc")
-            .await
-            .unwrap();
-        writer.shutdown().await.unwrap();
-        let mut reader = FrameReader::new(reader, 64);
-        assert!(matches!(
-            reader.read_frame().await,
-            Err(FrameError::Malformed(_))
-        ));
+    #[test]
+    fn eof_mid_frame() {
+        let mut reader = FrameReader::new(Cursor::new(b"Content-Length: 4\r\n\r\nabc"), 64);
+        assert!(matches!(reader.read_frame(), Err(FrameError::Malformed(_))));
     }
 
     #[test]

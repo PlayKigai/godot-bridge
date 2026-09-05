@@ -3,8 +3,7 @@ use godot_bridge::{dap, doc, lsp, open_editor, run, status};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let arguments = std::env::args_os()
         .skip(1)
         .map(|argument| {
@@ -27,15 +26,15 @@ async fn main() -> ExitCode {
     };
 
     let (label, result): (&str, godot_bridge::error::Result<ExitCode>) = match command {
-        Command::Lsp => ("lsp: ", lsp::run().await),
-        Command::Dap { file } => ("dap: ", dap::run(file.map(PathBuf::from)).await),
-        Command::Status => ("status: ", status::run().await.map(|()| ExitCode::SUCCESS)),
+        Command::Lsp => ("lsp: ", lsp::run()),
+        Command::Dap { file } => ("dap: ", dap::run(file.map(PathBuf::from))),
+        Command::Status => ("status: ", status::run().map(|()| ExitCode::SUCCESS)),
         Command::Run { file, scene } => ("run: ", run::run(Path::new(&file), scene.as_deref())),
         Command::ProjectDir { file } => (
             "",
             run::project_dir(Path::new(&file)).map(|()| ExitCode::SUCCESS),
         ),
-        Command::OpenEditor { file } => ("open-editor: ", open_editor::run(Path::new(&file)).await),
+        Command::OpenEditor { file } => ("open-editor: ", open_editor::run(Path::new(&file))),
         Command::Doc { symbol } => ("doc: ", doc::open_doc(&symbol).map(|()| ExitCode::SUCCESS)),
     };
 
