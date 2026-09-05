@@ -1,5 +1,7 @@
 use crate::json::{Map, Value};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -506,12 +508,14 @@ fn handle_client<F>(stream: UnixStream, handler: Arc<F>, stop: Arc<AtomicBool>)
 where
     F: Fn(Value) -> Value + Send + Sync + 'static,
 {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let reader_stream = match stream.try_clone() {
         Ok(reader_stream) => reader_stream,
         Err(_) => return,
     };
+    if reader_stream.set_nonblocking(true).is_err() {
+        return;
+    }
     let mut reader = BufReader::new(reader_stream);
     let mut write = stream;
     let mut partial = Vec::new();
@@ -520,13 +524,16 @@ where
         if stop.load(Ordering::Acquire) {
             break;
         }
+        if reader.buffer().is_empty() {
+            match poll_for_read(reader.get_ref().as_raw_fd(), idle_deadline) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
+            }
+        }
         let line = match read_line_limited(&mut reader, &mut partial) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                if Instant::now() >= idle_deadline {
-                    break;
-                }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 continue;
             }
             Err(_) => break,
@@ -540,6 +547,31 @@ where
         bytes.push(b'\n');
         if write.write_all(&bytes).is_err() {
             break;
+        }
+    }
+}
+
+fn poll_for_read(fd: RawFd, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let timeout = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result >= 0 {
+            return Ok(result != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
         }
     }
 }
@@ -595,11 +627,6 @@ pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) ->
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
     crate::json::from_slice(&line).map_err(io::Error::other)
 }
-
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(test)]
 mod tests {

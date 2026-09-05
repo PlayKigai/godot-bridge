@@ -474,9 +474,6 @@ pub(crate) struct TopLevel<'a> {
     pub(crate) method: Option<RawJson<'a>>,
     pub(crate) type_: Option<RawJson<'a>>,
     pub(crate) command: Option<RawJson<'a>>,
-    pub(crate) event: Option<RawJson<'a>>,
-    pub(crate) seq: Option<RawJson<'a>>,
-    pub(crate) request_seq: Option<RawJson<'a>>,
 }
 
 pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
@@ -490,9 +487,6 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
         method: None,
         type_: None,
         command: None,
-        event: None,
-        seq: None,
-        request_seq: None,
     };
     parser.skip_space()?;
     if parser.take(b'}') {
@@ -522,12 +516,6 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
             fields.type_ = Some(value);
         } else if key.string_eq("command") {
             fields.command = Some(value);
-        } else if key.string_eq("event") {
-            fields.event = Some(value);
-        } else if key.string_eq("seq") {
-            fields.seq = Some(value);
-        } else if key.string_eq("request_seq") {
-            fields.request_seq = Some(value);
         }
         parser.skip_space()?;
         if parser.take(b'}') {

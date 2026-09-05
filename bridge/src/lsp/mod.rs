@@ -1497,10 +1497,17 @@ fn process_bulk_document(
         let Some(open) = proxy.documents.open_docs.get(&document.key) else {
             return Ok(None);
         };
+        let text = match open.owner {
+            DocumentOwner::Zed => open.text.clone(),
+            DocumentOwner::Bridge => docs_state::read_document(&document.key),
+        };
+        let Some(text) = text else {
+            return Ok(None);
+        };
         let message = crate::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
-            "params": {"textDocument": {"uri": (open.uri.clone()), "languageId": "gdscript", "version": 1, "text": (open.text.clone())}}
+            "params": {"textDocument": {"uri": (open.uri.clone()), "languageId": "gdscript", "version": 1, "text": (text)}}
         });
         send_godot(writer, &message, false)?;
         return Ok(Some(open.uri.clone()));
@@ -1508,7 +1515,10 @@ fn process_bulk_document(
     if proxy.documents.open_docs.contains_key(&document.key) {
         return Ok(None);
     }
-    let action = proxy.documents.bridge_open_key(document.key, document.text);
+    let Some(text) = document.text else {
+        return Ok(None);
+    };
+    let action = proxy.documents.bridge_open_key(document.key, text);
     if let Some(action) = action {
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),

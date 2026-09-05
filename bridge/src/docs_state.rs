@@ -22,7 +22,8 @@ pub struct OpenDoc {
     pub uri: String,
     pub version: i64,
     pub generation: u64,
-    pub text: String,
+    pub text: Option<String>,
+    text_hash: u64,
     pub owner: DocumentOwner,
 }
 
@@ -62,7 +63,8 @@ impl DocumentState {
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
         self.watcher_keys.insert(normalize_path(&key), key.clone());
         if let Some(doc) = self.open_docs.get_mut(&key) {
-            doc.text = text.clone();
+            doc.text = Some(text.clone());
+            doc.text_hash = text_hash(&text);
             doc.version += 1;
             doc.owner = DocumentOwner::Zed;
             let uri = doc.uri.clone();
@@ -84,7 +86,8 @@ impl DocumentState {
                 uri: uri.clone(),
                 version,
                 generation,
-                text: text.clone(),
+                text: Some(text.clone()),
+                text_hash: text_hash(&text),
                 owner: DocumentOwner::Zed,
             },
         );
@@ -95,7 +98,8 @@ impl DocumentState {
     pub fn zed_change(&mut self, incoming_uri: &str, text: String) -> Option<DocumentAction> {
         let key = self.key_for_uri(incoming_uri);
         let doc = self.open_docs.get_mut(&key)?;
-        doc.text = text.clone();
+        doc.text = Some(text.clone());
+        doc.text_hash = text_hash(&text);
         doc.version += 1;
         doc.owner = DocumentOwner::Zed;
         let uri = doc.uri.clone();
@@ -130,7 +134,8 @@ impl DocumentState {
                 uri: uri.clone(),
                 version,
                 generation,
-                text: text.clone(),
+                text: None,
+                text_hash: text_hash(&text),
                 owner: DocumentOwner::Bridge,
             },
         );
@@ -141,11 +146,12 @@ impl DocumentState {
     pub fn bridge_change_path(&mut self, path: &Path, text: String) -> Option<DocumentAction> {
         let key = canonical_or_normalized(path);
         self.register_watcher_path(path, key.clone());
+        let hash = text_hash(&text);
         let doc = self.open_docs.get_mut(&key)?;
-        if doc.owner != DocumentOwner::Bridge || doc.text == text {
+        if doc.owner != DocumentOwner::Bridge || doc.text_hash == hash {
             return None;
         }
-        doc.text = text.clone();
+        doc.text_hash = hash;
         doc.version += 1;
         let uri = doc.uri.clone();
         let version = doc.version;
@@ -216,7 +222,7 @@ impl Default for DocumentState {
 pub struct ScannedDocument {
     pub path: PathBuf,
     pub key: PathBuf,
-    pub text: String,
+    pub text: Option<String>,
 }
 
 pub fn scan_project(project: &Path, diagnose_addons: bool) -> Vec<ScannedDocument> {
@@ -276,11 +282,24 @@ pub fn scan_project_stream(
                 continue;
             };
             let key = canonical_or_normalized(&path);
-            if !send(ScannedDocument { path, key, text }) {
+            if !send(ScannedDocument {
+                path,
+                key,
+                text: Some(text),
+            }) {
                 return;
             }
         }
     }
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 pub fn read_document(path: &Path) -> Option<String> {

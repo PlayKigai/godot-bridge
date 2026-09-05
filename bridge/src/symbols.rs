@@ -7,32 +7,23 @@ const MAX_CONTAINER_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
-    pub name: String,
-    folded_name: Option<String>,
-    folded_container_name: Option<String>,
-    boundary_positions: BoundaryPositions,
-    container_boundary_positions: BoundaryPositions,
+    pub name: Box<str>,
+    folded: Option<Box<Folded>>,
+    boundary: u64,
+    container_boundary: u64,
+    occurrence_mask: u32,
     pub kind: u8,
     pub container: u32,
-    inline_container: Option<String>,
     pub range: [u32; 4],
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum BoundaryPositions {
-    Mask(u64),
-    List(Box<[u64]>),
-}
-
-impl BoundaryPositions {
-    fn contains(&self, position: usize) -> bool {
-        match self {
-            Self::Mask(mask) => position < 64 && mask & (1 << position) != 0,
-            Self::List(positions) => u64::try_from(position)
-                .ok()
-                .is_some_and(|position| positions.binary_search(&position).is_ok()),
-        }
-    }
+struct Folded {
+    name: Option<Box<str>>,
+    container_name: Option<Box<str>>,
+    boundary: Option<Box<[u64]>>,
+    container_boundary: Option<Box<[u64]>>,
+    inline_container: Option<Box<str>>,
 }
 
 #[derive(Default)]
@@ -114,44 +105,28 @@ pub fn flatten(
     let mut output = Vec::new();
     for item in items {
         if let Some(location) = item.get("location") {
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
             let container = item
                 .get("containerName")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let (container_index, inline_container) = containers
-                .intern(&container)
-                .map_or((0, Some(container.clone())), |index| (index, None));
+                .unwrap_or_default();
             let uri = location
                 .get("uri")
                 .and_then(Value::as_str)
                 .map(|uri| normalize_uri_cached(uri, &mut uri_cache))
                 .unwrap_or_else(|| default_uri.clone());
-            let folded_name = (!name.is_ascii()).then(|| name.to_lowercase());
-            let folded_container_name = (!container.is_ascii() || !name.is_ascii())
-                .then(|| format!("{container}.{name}").to_lowercase());
             output.push((
                 uri,
-                Symbol {
-                    boundary_positions: boundary_positions(&name),
-                    container_boundary_positions: boundary_positions_parts(&container, &name),
-                    folded_container_name,
+                make_symbol(
                     name,
-                    folded_name,
-                    kind: item
-                        .get("kind")
+                    container,
+                    item.get("kind")
                         .and_then(Value::as_u64)
                         .and_then(|kind| u8::try_from(kind).ok())
                         .unwrap_or_default(),
-                    container: container_index,
-                    inline_container,
-                    range: range_values(location.get("range").unwrap_or(&Value::Null)),
-                },
+                    range_values(location.get("range").unwrap_or(&Value::Null)),
+                    containers,
+                ),
             ));
         } else {
             flatten_document(
@@ -186,30 +161,20 @@ fn flatten_document(
     } else {
         format!("{container}.{name}")
     };
-    let (container_index, inline_container) = containers
-        .intern(container)
-        .map_or((0, Some(container.to_owned())), |index| (index, None));
     output.push((
         uri.clone(),
-        Symbol {
-            name: name.to_owned(),
-            folded_name: (!name.is_ascii()).then(|| name.to_lowercase()),
-            folded_container_name: (!container_name.is_ascii())
-                .then(|| container_name.to_lowercase()),
-            boundary_positions: boundary_positions(name),
-            container_boundary_positions: boundary_positions_parts(container, name),
-            kind: item
-                .get("kind")
+        make_symbol(
+            name,
+            container,
+            item.get("kind")
                 .and_then(Value::as_u64)
                 .and_then(|kind| u8::try_from(kind).ok())
                 .unwrap_or_default(),
-            container: container_index,
-            inline_container,
-            range: item
-                .get("selectionRange")
+            item.get("selectionRange")
                 .or_else(|| item.get("range"))
                 .map_or([0; 4], range_values),
-        },
+            containers,
+        ),
     ));
     if let Some(children) = item.get("children").and_then(Value::as_array) {
         for child in children {
@@ -235,26 +200,72 @@ fn normalize_uri_cached(uri: &str, cache: &mut HashMap<String, String>) -> Strin
     normalized
 }
 
-fn boundary_positions(value: &str) -> BoundaryPositions {
-    boundary_positions_iter(value.chars())
-}
-
-fn boundary_positions_parts(container: &str, name: &str) -> BoundaryPositions {
-    if container.is_empty() {
-        return boundary_positions(name);
+fn make_symbol(
+    name: &str,
+    container: &str,
+    kind: u8,
+    range: [u32; 4],
+    containers: &mut ContainerTable,
+) -> Symbol {
+    let container_name = if container.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{container}.{name}")
+    };
+    let (container_index, inline_container) = containers
+        .intern(container)
+        .map_or((0, Some(container.into())), |index| (index, None));
+    let (boundary, boundary_list) = boundary_positions(name);
+    let (container_boundary, container_boundary_list) = boundary_positions(&container_name);
+    let folded = make_folded(
+        name,
+        &container_name,
+        boundary_list,
+        container_boundary_list,
+        inline_container,
+    );
+    Symbol {
+        name: name.into(),
+        folded,
+        boundary,
+        container_boundary,
+        occurrence_mask: occurrence_mask(&container_name),
+        kind,
+        container: container_index,
+        range,
     }
-    boundary_positions_iter(
-        container
-            .chars()
-            .chain(std::iter::once('.'))
-            .chain(name.chars()),
-    )
 }
 
-fn boundary_positions_iter(characters: impl Iterator<Item = char>) -> BoundaryPositions {
+fn make_folded(
+    name: &str,
+    container_name: &str,
+    boundary: Option<Box<[u64]>>,
+    container_boundary: Option<Box<[u64]>>,
+    inline_container: Option<Box<str>>,
+) -> Option<Box<Folded>> {
+    let folded_name = (!name.is_ascii()).then(|| name.to_lowercase().into_boxed_str());
+    let folded_container_name =
+        (!container_name.is_ascii()).then(|| container_name.to_lowercase().into_boxed_str());
+    (folded_name.is_some()
+        || folded_container_name.is_some()
+        || boundary.is_some()
+        || container_boundary.is_some()
+        || inline_container.is_some())
+    .then(|| {
+        Box::new(Folded {
+            name: folded_name,
+            container_name: folded_container_name,
+            boundary,
+            container_boundary,
+            inline_container,
+        })
+    })
+}
+
+fn boundary_positions(value: &str) -> (u64, Option<Box<[u64]>>) {
     let mut positions = Vec::new();
     let mut previous = None;
-    for (index, character) in characters.enumerate() {
+    for (index, character) in value.chars().enumerate() {
         if index == 0
             || previous == Some('_')
             || (character.is_uppercase() && previous.is_some_and(char::is_lowercase))
@@ -263,14 +274,43 @@ fn boundary_positions_iter(characters: impl Iterator<Item = char>) -> BoundaryPo
         }
         previous = Some(character);
     }
-    if positions.len() <= 64 && positions.last().is_none_or(|position| *position < 64) {
-        let mask = positions
-            .into_iter()
-            .fold(0, |mask, position| mask | (1 << position));
-        BoundaryPositions::Mask(mask)
+    let mask = positions
+        .iter()
+        .filter(|position| **position < 64)
+        .fold(0, |mask, position| mask | (1 << position));
+    let positions = positions
+        .into_iter()
+        .filter(|position| *position >= 64)
+        .collect::<Vec<_>>();
+    (
+        mask,
+        (!positions.is_empty()).then(|| positions.into_boxed_slice()),
+    )
+}
+
+fn boundary_contains(mask: u64, positions: Option<&[u64]>, position: usize) -> bool {
+    if position < 64 {
+        mask & (1 << position) != 0
     } else {
-        BoundaryPositions::List(positions.into_boxed_slice())
+        positions.is_some_and(|positions| {
+            u64::try_from(position)
+                .ok()
+                .is_some_and(|position| positions.binary_search(&position).is_ok())
+        })
     }
+}
+
+fn occurrence_mask(value: &str) -> u32 {
+    value.bytes().fold(0, |mask, byte| {
+        let byte = byte.to_ascii_lowercase();
+        mask | (1
+            << match byte {
+                b'a'..=b'z' => byte - b'a',
+                b'0'..=b'9' => 26,
+                b'_' => 27,
+                _ => 28,
+            })
+    })
 }
 
 #[cfg(test)]
@@ -298,13 +338,21 @@ pub fn search_with_uris<'a>(
     } else {
         query
     };
+    let query_mask = occurrence_mask(&query);
     let mut scratch = Vec::new();
     let mut candidate = Vec::new();
     let mut target = Vec::new();
     let mut matches = BinaryHeap::with_capacity(200);
     for (uri, symbol) in symbols {
+        if symbol.occurrence_mask & query_mask != query_mask {
+            continue;
+        }
         let Some((gap, offset)) = (if container_query {
-            if let Some(target) = symbol.folded_container_name.as_deref() {
+            if let Some(target) = symbol
+                .folded
+                .as_ref()
+                .and_then(|folded| folded.container_name.as_deref())
+            {
                 if target.len() > 256 && target.chars().count() > 256 {
                     continue;
                 }
@@ -315,7 +363,7 @@ pub fn search_with_uris<'a>(
                     if symbol.name.len() > 256 {
                         continue;
                     }
-                    best_match_into(&symbol.name, &query, &mut scratch, &mut candidate)
+                    best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
                 } else {
                     if container.len() + 1 + symbol.name.len() > 256 {
                         continue;
@@ -327,7 +375,11 @@ pub fn search_with_uris<'a>(
                     best_match_ascii(&target, query.as_bytes(), &mut scratch, &mut candidate)
                 }
             }
-        } else if let Some(target) = symbol.folded_name.as_deref() {
+        } else if let Some(target) = symbol
+            .folded
+            .as_ref()
+            .and_then(|folded| folded.name.as_deref())
+        {
             if target.len() > 256 && target.chars().count() > 256 {
                 continue;
             }
@@ -336,19 +388,31 @@ pub fn search_with_uris<'a>(
             if symbol.name.len() > 256 {
                 continue;
             } else {
-                best_match_into(&symbol.name, &query, &mut scratch, &mut candidate)
+                best_match_into(symbol.name.as_ref(), &query, &mut scratch, &mut candidate)
             }
         }) else {
             continue;
         };
-        let boundary_positions = if container_query {
-            &symbol.container_boundary_positions
+        let (boundary, boundary_list) = if container_query {
+            (
+                symbol.container_boundary,
+                symbol
+                    .folded
+                    .as_ref()
+                    .and_then(|folded| folded.container_boundary.as_deref()),
+            )
         } else {
-            &symbol.boundary_positions
+            (
+                symbol.boundary,
+                symbol
+                    .folded
+                    .as_ref()
+                    .and_then(|folded| folded.boundary.as_deref()),
+            )
         };
         let boundary_count = scratch
             .iter()
-            .filter(|index| boundary_positions.contains(**index))
+            .filter(|index| boundary_contains(boundary, boundary_list, **index))
             .count();
         let matched = Match {
             symbol,
@@ -408,7 +472,14 @@ fn best_match_into(
     if name.is_ascii() && query.is_ascii() {
         return best_match_ascii(name.as_bytes(), query.as_bytes(), indices, candidate);
     }
-    best_match_unicode(name, query, indices, candidate)
+    let name = name.chars().collect::<Vec<_>>();
+    let query = query.chars().collect::<Vec<_>>();
+    if !is_subsequence(&name, &query, &|left, right| left == right) {
+        return None;
+    }
+    best_match(&name, &query, indices, candidate, |left, right| {
+        left == right
+    })
 }
 
 fn best_match_ascii(
@@ -417,25 +488,40 @@ fn best_match_ascii(
     indices: &mut Vec<usize>,
     candidate: &mut Vec<usize>,
 ) -> Option<(usize, usize)> {
+    if !is_subsequence_bytes(name, query) {
+        return None;
+    }
+    best_match(name, query, indices, candidate, |left, right| {
+        left.eq_ignore_ascii_case(right)
+    })
+}
+
+fn best_match<T, F>(
+    name: &[T],
+    query: &[T],
+    indices: &mut Vec<usize>,
+    candidate: &mut Vec<usize>,
+    equal: F,
+) -> Option<(usize, usize)>
+where
+    F: Fn(&T, &T) -> bool,
+{
     if query.is_empty() {
         indices.clear();
         return Some((0, 0));
     }
-    if !is_subsequence_bytes(name, query) {
-        return None;
-    }
     let mut best = None;
     for start in 0..name.len() {
-        if !name[start].eq_ignore_ascii_case(&query[0]) {
+        if !equal(&name[start], &query[0]) {
             continue;
         }
         candidate.clear();
         candidate.push(start);
         let mut position = start + 1;
-        for &wanted in &query[1..] {
+        for wanted in &query[1..] {
             let Some(offset) = name[position..]
                 .iter()
-                .position(|value| value.eq_ignore_ascii_case(&wanted))
+                .position(|value| equal(value, wanted))
             else {
                 candidate.clear();
                 break;
@@ -458,69 +544,16 @@ fn best_match_ascii(
     best
 }
 
-fn best_match_unicode(
-    name: &str,
-    query: &str,
-    indices: &mut Vec<usize>,
-    candidate: &mut Vec<usize>,
-) -> Option<(usize, usize)> {
-    if query.is_empty() {
-        indices.clear();
-        return Some((0, 0));
-    }
-    if !is_subsequence(name, query) {
-        return None;
-    }
-    let name = name.chars().collect::<Vec<_>>();
-    let query = query.chars().collect::<Vec<_>>();
-    let mut next = vec![vec![name.len(); name.len() + 1]; query.len()];
-    for query_index in (0..query.len()).rev() {
-        let mut next_index = name.len();
-        for name_index in (0..name.len()).rev() {
-            if name[name_index] == query[query_index] {
-                next_index = name_index;
-            }
-            next[query_index][name_index] = next_index;
-        }
-    }
-    let mut best = None;
-    for start in 0..name.len() {
-        if name[start] != query[0] {
-            continue;
-        }
-        candidate.clear();
-        candidate.push(start);
-        let mut position = start + 1;
-        for row in next.iter().skip(1) {
-            let index = row[position.min(name.len())];
-            if index == name.len() {
-                break;
-            }
-            candidate.push(index);
-            position = index + 1;
-        }
-        if candidate.len() != query.len() {
-            continue;
-        }
-        let gap = candidate.last().unwrap() - start + 1 - query.len();
-        if best.is_none_or(|(current_gap, current_start)| {
-            (gap, start, candidate.as_slice()) < (current_gap, current_start, indices.as_slice())
-        }) {
-            indices.clear();
-            indices.extend_from_slice(candidate);
-            best = Some((gap, start));
-        }
-    }
-    best
-}
-
-fn is_subsequence_bytes(name: &[u8], query: &[u8]) -> bool {
+fn is_subsequence<T, F>(name: &[T], query: &[T], equal: &F) -> bool
+where
+    F: Fn(&T, &T) -> bool,
+{
     let mut query = query.iter();
     let Some(mut wanted) = query.next() else {
         return true;
     };
     for character in name {
-        if character.eq_ignore_ascii_case(wanted) {
+        if equal(character, wanted) {
             let Some(next) = query.next() else {
                 return true;
             };
@@ -530,20 +563,8 @@ fn is_subsequence_bytes(name: &[u8], query: &[u8]) -> bool {
     false
 }
 
-fn is_subsequence(name: &str, query: &str) -> bool {
-    let mut query = query.chars();
-    let Some(mut wanted) = query.next() else {
-        return true;
-    };
-    for character in name.chars() {
-        if character == wanted {
-            let Some(next) = query.next() else {
-                return true;
-            };
-            wanted = next;
-        }
-    }
-    false
+fn is_subsequence_bytes(name: &[u8], query: &[u8]) -> bool {
+    is_subsequence(name, query, &u8::eq_ignore_ascii_case)
 }
 
 fn range_values(range: &Value) -> [u32; 4] {
@@ -573,14 +594,15 @@ pub fn write_symbol_information(
 ) {
     let [start_line, start_character, end_line, end_character] = symbol.range;
     output.extend_from_slice(b"{\"name\":");
-    crate::json::write_string(&symbol.name, output);
+    crate::json::write_string(symbol.name.as_ref(), output);
     output.extend_from_slice(b",\"kind\":");
     write!(output, "{}", u64::from(symbol.kind)).expect("writing to Vec cannot fail");
     output.extend_from_slice(b",\"containerName\":");
     crate::json::write_string(
         symbol
-            .inline_container
-            .as_deref()
+            .folded
+            .as_ref()
+            .and_then(|folded| folded.inline_container.as_deref())
             .unwrap_or_else(|| containers.get(symbol.container)),
         output,
     );
@@ -612,22 +634,32 @@ mod tests {
         line: u64,
         containers: &mut ContainerTable,
     ) -> Symbol {
-        let container_name = if container.is_empty() {
-            name.to_owned()
+        make_symbol(
+            name,
+            container,
+            12,
+            [line as u32, 0, line as u32, 1],
+            containers,
+        )
+    }
+
+    fn minimum_elapsed(mut operation: impl FnMut()) -> std::time::Duration {
+        (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                operation();
+                std::hint::black_box(());
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug"
         } else {
-            format!("{container}.{name}")
-        };
-        Symbol {
-            name: name.to_owned(),
-            folded_name: (!name.is_ascii()).then(|| name.to_lowercase()),
-            folded_container_name: (!container_name.is_ascii())
-                .then(|| container_name.to_lowercase()),
-            boundary_positions: boundary_positions(name),
-            container_boundary_positions: boundary_positions_parts(container, name),
-            kind: 12,
-            container: containers.intern(container).unwrap(),
-            inline_container: None,
-            range: [line as u32, 0, line as u32, 1],
+            "release"
         }
     }
 
@@ -641,14 +673,14 @@ mod tests {
         assert_eq!(
             search(&items, "ready")
                 .iter()
-                .map(|item| item.name.as_str())
+                .map(|item| item.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["read_y", "_ready", "a_ready"]
         );
         assert_eq!(
             search(&items, "")
                 .iter()
-                .map(|item| item.name.as_str())
+                .map(|item| item.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["_ready", "a_ready", "read_y"]
         );
@@ -661,17 +693,20 @@ mod tests {
             symbol("ready", 0),
             symbol("xready", 0),
         ];
-        assert_eq!(search(&items, "ready").first().unwrap().name, "ready");
+        assert_eq!(
+            search(&items, "ready").first().unwrap().name.as_ref(),
+            "ready"
+        );
         let mut indices = Vec::new();
         let mut candidate = Vec::new();
-        best_match_unicode("rreaddy", "ready", &mut indices, &mut candidate).unwrap();
+        best_match_into("rreaddy", "ready", &mut indices, &mut candidate).unwrap();
         assert_eq!(indices, vec![1, 2, 3, 4, 6]);
     }
 
     #[test]
     fn boundary_bonus_prefers_word_starts() {
         let items = vec![symbol("improve", 0), symbol("player_velocity", 0)];
-        assert_eq!(search(&items, "pv")[0].name, "player_velocity");
+        assert_eq!(search(&items, "pv")[0].name.as_ref(), "player_velocity");
     }
 
     #[test]
@@ -680,8 +715,8 @@ mod tests {
         let items = [symbol_with_container("jump", "Player", 0, &mut containers)];
         let search =
             |query| search_with_uris(items.iter().map(|symbol| ("", symbol)), query, &containers);
-        assert_eq!(search("player jump")[0].1.name, "jump");
-        assert_eq!(search("Player.jump")[0].1.name, "jump");
+        assert_eq!(search("player jump")[0].1.name.as_ref(), "jump");
+        assert_eq!(search("Player.jump")[0].1.name.as_ref(), "jump");
         assert!(search("player").is_empty());
     }
 
@@ -729,9 +764,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for query in ["ready", "", "pv", "player jump"] {
-            let start = std::time::Instant::now();
+            let query_mask = occurrence_mask(query);
+            let expected = items
+                .iter()
+                .filter(|symbol| is_subsequence_bytes(symbol.name.as_bytes(), query.as_bytes()))
+                .count();
+            let masked = items
+                .iter()
+                .filter(|symbol| {
+                    symbol.occurrence_mask & query_mask == query_mask
+                        && is_subsequence_bytes(symbol.name.as_bytes(), query.as_bytes())
+                })
+                .count();
+            assert_eq!(masked, expected);
             let results = search(&items, query);
-            println!("real-name search {query:?}: {:?}", start.elapsed());
+            let elapsed = minimum_elapsed(|| {
+                std::hint::black_box(search(&items, query));
+            });
+            println!(
+                "symbols {} real-name search {query:?}: {elapsed:?}",
+                profile()
+            );
             assert!(results.len() <= 200);
         }
     }
@@ -742,19 +795,20 @@ mod tests {
             .map(|index| symbol(&format!("symbol_{index:05}_ready"), index))
             .collect::<Vec<_>>();
         for query in ["ready", "", "zzz"] {
-            let start = std::time::Instant::now();
             let actual = search(&items, query);
-            let elapsed = start.elapsed();
+            let elapsed = minimum_elapsed(|| {
+                std::hint::black_box(search(&items, query));
+            });
             match query {
                 "ready" => assert_eq!(actual.len(), 200),
                 "" => {
                     assert_eq!(actual.len(), 200);
-                    assert_eq!(actual[0].name, "symbol_00000_ready");
+                    assert_eq!(actual[0].name.as_ref(), "symbol_00000_ready");
                 }
                 "zzz" => assert!(actual.is_empty()),
                 _ => unreachable!(),
             }
-            println!("search {query:?}: {elapsed:?}");
+            println!("symbols {} search {query:?}: {elapsed:?}", profile());
         }
     }
 

@@ -232,7 +232,7 @@ fn replay_open_documents(session: &mut Session) -> Result<()> {
             .push_back(docs_state::ScannedDocument {
                 path: key.clone(),
                 key: key.clone(),
-                text: doc.text.clone(),
+                text: None,
             });
     }
     let replayed = session
