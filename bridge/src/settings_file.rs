@@ -251,8 +251,8 @@ fn user_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp::tempdir;
     use std::fs;
-    use tempfile::tempdir;
 
     fn user_settings_path_in(config_dir: &Path) -> PathBuf {
         config_dir.join("zed").join("settings.json")

@@ -496,9 +496,9 @@ pub(crate) fn directory_is_skipped(path: &Path, project: &Path, diagnose_addons:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp::tempdir;
     use std::fs;
     use std::sync::Mutex;
-    use tempfile::tempdir;
 
     #[test]
     fn scan_filters_project_diagnostics_files() {

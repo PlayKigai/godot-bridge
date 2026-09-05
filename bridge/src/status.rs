@@ -42,7 +42,7 @@ mod tests {
     use super::*;
     use crate::json::Value;
     use crate::state::{serve_socket, write_state, Mode, State, Status};
-    use tempfile::tempdir;
+    use crate::temp::tempdir;
 
     #[test]
     fn detached_gui_state_without_socket_is_kept() {

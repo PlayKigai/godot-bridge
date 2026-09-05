@@ -522,7 +522,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use tempfile::tempdir;
+    use crate::temp::tempdir;
 
     #[test]
     fn picked_port_can_be_bound_again() {

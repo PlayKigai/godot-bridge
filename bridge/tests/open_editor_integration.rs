@@ -1,10 +1,10 @@
 mod common;
 use common::*;
+use godot_bridge::temp::TempDir;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
-use tempfile::TempDir;
 
 #[test]
 fn open_editor_handoff_and_gui_recovery() {

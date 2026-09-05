@@ -143,8 +143,8 @@ fn normalize_res_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp::tempdir;
     use std::fs;
-    use tempfile::tempdir;
 
     fn script(project: &Path, relative: &str) -> PathBuf {
         let file = project.join(relative);

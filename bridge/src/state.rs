@@ -623,7 +623,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::temp::tempdir;
 
     fn files(dir: &Path) -> ProjectFiles {
         ProjectFiles {

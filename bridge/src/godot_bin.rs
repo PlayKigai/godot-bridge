@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn version_4x_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::temp::tempdir().unwrap();
         let bin = write_script(dir.path(), "godot", "#!/bin/sh\necho 4.7.2.stable\n");
         let version = version_of(&bin).unwrap();
         assert!(version.starts_with("4."));
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn version_3x_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::temp::tempdir().unwrap();
         let bin = write_script(dir.path(), "godot", "#!/bin/sh\necho 3.5\n");
         let error = version_of(&bin).unwrap_err();
         assert_eq!(error, format!("Godot at {} is not 4.x: 3.5", bin.display()));
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn version_timeout_is_rejected() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::temp::tempdir().unwrap();
         let sleeper = if Path::new("/bin/sleep").exists() {
             "/bin/sleep"
         } else {
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn resolve_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::temp::tempdir().unwrap();
         let setting = touch(dir.path(), "setting");
         let env_bin = touch(dir.path(), "env-bin");
         let first = dir.path().join("first");

@@ -309,9 +309,9 @@ fn watch_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp::tempdir;
     use std::fs;
     use std::time::Duration;
-    use tempfile::tempdir;
 
     #[test]
     fn watches_file_lifecycle() {
