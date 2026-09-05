@@ -3,6 +3,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 
+const MAX_CONTAINER_ENTRIES: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
     pub name: String,
@@ -12,6 +14,7 @@ pub struct Symbol {
     container_boundary_positions: BoundaryPositions,
     pub kind: u8,
     pub container: u32,
+    inline_container: Option<String>,
     pub range: [u32; 4],
 }
 
@@ -39,14 +42,22 @@ pub struct ContainerTable {
 }
 
 impl ContainerTable {
-    fn intern(&mut self, name: &str) -> u32 {
+    fn intern(&mut self, name: &str) -> Option<u32> {
         if let Some(&index) = self.indices.get(name) {
-            return index;
+            return Some(index);
+        }
+        if self.names.len() >= MAX_CONTAINER_ENTRIES {
+            return None;
         }
         let index = self.names.len() as u32;
         self.names.push(name.to_owned());
         self.indices.insert(name.to_owned(), index);
-        index
+        Some(index)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.names.clear();
+        self.indices.clear();
     }
 
     fn get(&self, index: u32) -> &str {
@@ -98,7 +109,8 @@ pub fn flatten(
     let Some(items) = result.as_array() else {
         return Vec::new();
     };
-    let default_uri = normalize_uri(default_uri);
+    let mut uri_cache = HashMap::new();
+    let default_uri = normalize_uri_cached(default_uri, &mut uri_cache);
     let mut output = Vec::new();
     for item in items {
         if let Some(location) = item.get("location") {
@@ -112,11 +124,13 @@ pub fn flatten(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let container_index = containers.intern(&container);
+            let (container_index, inline_container) = containers
+                .intern(&container)
+                .map_or((0, Some(container.clone())), |index| (index, None));
             let uri = location
                 .get("uri")
                 .and_then(Value::as_str)
-                .map(normalize_uri)
+                .map(|uri| normalize_uri_cached(uri, &mut uri_cache))
                 .unwrap_or_else(|| default_uri.clone());
             let folded_name = (!name.is_ascii()).then(|| name.to_lowercase());
             let folded_container_name = (!container.is_ascii() || !name.is_ascii())
@@ -135,11 +149,19 @@ pub fn flatten(
                         .and_then(|kind| u8::try_from(kind).ok())
                         .unwrap_or_default(),
                     container: container_index,
+                    inline_container,
                     range: range_values(location.get("range").unwrap_or(&Value::Null)),
                 },
             ));
         } else {
-            flatten_document(item, &default_uri, "", &mut output, containers);
+            flatten_document(
+                item,
+                &default_uri,
+                "",
+                &mut output,
+                containers,
+                &mut uri_cache,
+            );
         }
     }
     output
@@ -151,18 +173,22 @@ fn flatten_document(
     container: &str,
     output: &mut Vec<(String, Symbol)>,
     containers: &mut ContainerTable,
+    uri_cache: &mut HashMap<String, String>,
 ) {
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
     let uri = item
         .get("uri")
         .and_then(Value::as_str)
-        .map(normalize_uri)
+        .map(|uri| normalize_uri_cached(uri, uri_cache))
         .unwrap_or_else(|| uri.to_owned());
     let container_name = if container.is_empty() {
         name.to_owned()
     } else {
         format!("{container}.{name}")
     };
+    let (container_index, inline_container) = containers
+        .intern(container)
+        .map_or((0, Some(container.to_owned())), |index| (index, None));
     output.push((
         uri.clone(),
         Symbol {
@@ -177,7 +203,8 @@ fn flatten_document(
                 .and_then(Value::as_u64)
                 .and_then(|kind| u8::try_from(kind).ok())
                 .unwrap_or_default(),
-            container: containers.intern(container),
+            container: container_index,
+            inline_container,
             range: item
                 .get("selectionRange")
                 .or_else(|| item.get("range"))
@@ -186,7 +213,7 @@ fn flatten_document(
     ));
     if let Some(children) = item.get("children").and_then(Value::as_array) {
         for child in children {
-            flatten_document(child, &uri, &container_name, output, containers);
+            flatten_document(child, &uri, &container_name, output, containers, uri_cache);
         }
     }
 }
@@ -197,6 +224,15 @@ fn normalize_uri(uri: &str) -> String {
     } else {
         uri.to_owned()
     }
+}
+
+fn normalize_uri_cached(uri: &str, cache: &mut HashMap<String, String>) -> String {
+    if let Some(normalized) = cache.get(uri) {
+        return normalized.clone();
+    }
+    let normalized = normalize_uri(uri);
+    cache.insert(uri.to_owned(), normalized.clone());
+    normalized
 }
 
 fn boundary_positions(value: &str) -> BoundaryPositions {
@@ -529,11 +565,6 @@ fn range_value(position: &Value, key: &str) -> u32 {
         .unwrap_or_default()
 }
 
-pub fn symbol_information(symbol: &Symbol, uri: &str, containers: &ContainerTable) -> Value {
-    let [start_line, start_character, end_line, end_character] = symbol.range;
-    crate::json!({"name": (symbol.name.clone()), "kind": (u64::from(symbol.kind)), "containerName": (containers.get(symbol.container).to_owned()), "location": {"uri": (uri.to_owned()), "range": {"start": {"line": (u64::from(start_line)), "character": (u64::from(start_character))}, "end": {"line": (u64::from(end_line)), "character": (u64::from(end_character))}}}})
-}
-
 pub fn write_symbol_information(
     symbol: &Symbol,
     uri: &str,
@@ -546,7 +577,13 @@ pub fn write_symbol_information(
     output.extend_from_slice(b",\"kind\":");
     write!(output, "{}", u64::from(symbol.kind)).expect("writing to Vec cannot fail");
     output.extend_from_slice(b",\"containerName\":");
-    crate::json::write_string(containers.get(symbol.container), output);
+    crate::json::write_string(
+        symbol
+            .inline_container
+            .as_deref()
+            .unwrap_or_else(|| containers.get(symbol.container)),
+        output,
+    );
     output.extend_from_slice(b",\"location\":{\"uri\":");
     crate::json::write_string(uri, output);
     output.extend_from_slice(b",\"range\":{\"start\":{\"line\":");
@@ -564,7 +601,7 @@ pub fn write_symbol_information(
 mod tests {
     use super::*;
 
-    fn symbol(name: &str, _uri: &str, line: u64) -> Symbol {
+    fn symbol(name: &str, line: u64) -> Symbol {
         let mut containers = ContainerTable::default();
         symbol_with_container(name, "", line, &mut containers)
     }
@@ -588,7 +625,8 @@ mod tests {
             boundary_positions: boundary_positions(name),
             container_boundary_positions: boundary_positions_parts(container, name),
             kind: 12,
-            container: containers.intern(container),
+            container: containers.intern(container).unwrap(),
+            inline_container: None,
             range: [line as u32, 0, line as u32, 1],
         }
     }
@@ -596,9 +634,9 @@ mod tests {
     #[test]
     fn ranking_and_empty_query_are_stable() {
         let items = vec![
-            symbol("a_ready", "file:///b", 0),
-            symbol("_ready", "file:///a", 1),
-            symbol("read_y", "file:///a", 0),
+            symbol("a_ready", 0),
+            symbol("_ready", 1),
+            symbol("read_y", 0),
         ];
         assert_eq!(
             search(&items, "ready")
@@ -619,9 +657,9 @@ mod tests {
     #[test]
     fn alignment_uses_gap_then_offset_then_indices() {
         let items = vec![
-            symbol("rxxeady", "file:///a", 0),
-            symbol("ready", "file:///b", 0),
-            symbol("xready", "file:///c", 0),
+            symbol("rxxeady", 0),
+            symbol("ready", 0),
+            symbol("xready", 0),
         ];
         assert_eq!(search(&items, "ready").first().unwrap().name, "ready");
         let mut indices = Vec::new();
@@ -632,10 +670,7 @@ mod tests {
 
     #[test]
     fn boundary_bonus_prefers_word_starts() {
-        let items = vec![
-            symbol("improve", "file:///a", 0),
-            symbol("player_velocity", "file:///b", 0),
-        ];
+        let items = vec![symbol("improve", 0), symbol("player_velocity", 0)];
         assert_eq!(search(&items, "pv")[0].name, "player_velocity");
     }
 
@@ -652,7 +687,7 @@ mod tests {
 
     #[test]
     fn repeated_characters_match_quickly() {
-        let items = vec![symbol(&"a".repeat(64), "file:///a", 0)];
+        let items = vec![symbol(&"a".repeat(64), 0)];
         assert_eq!(search(&items, &"a".repeat(32)).len(), 1);
         assert!(search(&items, &format!("{}b", "a".repeat(32))).is_empty());
     }
@@ -660,7 +695,7 @@ mod tests {
     #[test]
     fn truncates_to_two_hundred() {
         let items = (0..201)
-            .map(|index| symbol(&format!("x{index:03}"), "file:///a", index))
+            .map(|index| symbol(&format!("x{index:03}"), index))
             .collect::<Vec<_>>();
         assert_eq!(search(&items, "x").len(), 200);
     }
@@ -689,7 +724,6 @@ mod tests {
             .map(|index| {
                 symbol(
                     &format!("{}_{index}", NAMES[index as usize % NAMES.len()]),
-                    "file:///a",
                     index,
                 )
             })
@@ -705,7 +739,7 @@ mod tests {
     #[test]
     fn synthetic_search_benchmark_matches_reference() {
         let items = (0..32_000)
-            .map(|index| symbol(&format!("symbol_{index:05}_ready"), "file:///a", index))
+            .map(|index| symbol(&format!("symbol_{index:05}_ready"), index))
             .collect::<Vec<_>>();
         for query in ["ready", "", "zzz"] {
             let start = std::time::Instant::now();
