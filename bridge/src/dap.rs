@@ -577,13 +577,17 @@ fn forward_client_body(
     file: Option<&Path>,
 ) -> Result<Option<RequestFailure>> {
     let fields = crate::json::scan_top_level(body)?;
-    let rewrite = fields.type_.is_some_and(|value| {
-        value.string_eq("response")
-            || (value.string_eq("request")
-                && fields.command.is_some_and(|command| {
-                    command.string_eq("launch") || command.string_eq("attach")
-                }))
-    });
+    if fields.type_.is_none_or(|value| !value.is_string()) {
+        return Err(crate::error::Error::new(
+            "DAP message type must be a string",
+        ));
+    }
+    let rewrite = fields
+        .type_
+        .is_some_and(|value| value.string_eq("response"))
+        || fields
+            .command
+            .is_some_and(|command| command.string_eq("launch") || command.string_eq("attach"));
     if rewrite {
         return forward_client(
             parse_message(body)?,

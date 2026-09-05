@@ -14,7 +14,7 @@ pub(super) fn serve_owner_socket(
         let state = state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if requested.is_some_and(|requested| requested != state.project) {
+        if requested != Some(state.project.as_str()) {
             return if cmd == Some("status") {
                 crate::json!({"error": "project mismatch"})
             } else {

@@ -9,7 +9,6 @@ pub use crate::root::normalize_absolute as normalize_path;
 
 pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 pub const BULK_DOCUMENTS: usize = 100;
-pub const BULK_INTERVAL_MS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentOwner {
@@ -112,8 +111,12 @@ impl DocumentState {
 
     pub fn bridge_open_path(&mut self, path: &Path, text: String) -> Option<DocumentAction> {
         let key = canonical_or_normalized(path);
+        self.register_watcher_path(path, key.clone());
+        self.bridge_open_key(key, text)
+    }
+
+    pub fn bridge_open_key(&mut self, key: PathBuf, text: String) -> Option<DocumentAction> {
         if let Some(uri) = self.open_docs.get(&key).map(|doc| doc.uri.clone()) {
-            self.register_watcher_path(path, key.clone());
             self.uri_keys.insert(uri, key);
             return None;
         }
@@ -131,7 +134,6 @@ impl DocumentState {
             },
         );
         self.uri_keys.insert(uri.clone(), key.clone());
-        self.register_watcher_path(path, key.clone());
         Some(DocumentAction::Open { uri, version, text })
     }
 
@@ -217,20 +219,22 @@ pub struct ScannedDocument {
 }
 
 pub fn scan_project(project: &Path, diagnose_addons: bool) -> Vec<ScannedDocument> {
-    let project = canonical_or_normalized(project);
     let mut documents = Vec::new();
-    scan_directory(&project, &project, diagnose_addons, &mut documents);
+    scan_project_stream(project, diagnose_addons, |document| {
+        documents.push(document);
+        true
+    });
     documents.sort_by(|left, right| left.path.cmp(&right.path));
     documents
 }
 
-fn scan_directory(
-    directory: &Path,
+pub fn scan_project_stream(
     project: &Path,
     diagnose_addons: bool,
-    documents: &mut Vec<ScannedDocument>,
+    mut send: impl FnMut(ScannedDocument) -> bool,
 ) {
-    let mut directories = vec![directory.to_owned()];
+    let project = canonical_or_normalized(project);
+    let mut directories = vec![project.clone()];
     while let Some(directory) = directories.pop() {
         let mut entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries.flatten().collect::<Vec<_>>(),
@@ -259,7 +263,7 @@ fn scan_directory(
                 continue;
             }
             if file_type.is_dir() {
-                if !directory_is_skipped(&path, project, diagnose_addons) {
+                if !directory_is_skipped(&path, &project, diagnose_addons) {
                     directories.push(path);
                 }
                 continue;
@@ -271,7 +275,9 @@ fn scan_directory(
                 continue;
             };
             let key = canonical_or_normalized(&path);
-            documents.push(ScannedDocument { path, key, text });
+            if !send(ScannedDocument { path, key, text }) {
+                return;
+            }
         }
     }
 }

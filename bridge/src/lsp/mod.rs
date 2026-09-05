@@ -130,9 +130,10 @@ struct ProxyState {
     project_diagnostics_started: bool,
     workspace_symbols_notice_sent: bool,
     internal_sender: mpsc::SyncSender<ProxyEvent>,
+    bulk_sender: mpsc::SyncSender<InternalEvent>,
     symbol_cache: HashMap<String, Vec<Symbol>>,
     symbol_containers: symbols::ContainerTable,
-    symbol_scheduled: HashMap<String, (u64, i64, Instant)>,
+    symbol_scheduled: HashMap<String, (u64, i64, Instant, bool)>,
     bulk_generation: u64,
     bulk_documents: VecDeque<docs_state::ScannedDocument>,
     bulk_batch_uris: HashSet<String>,
@@ -140,6 +141,9 @@ struct ProxyState {
     bulk_active: bool,
     bulk_replay: bool,
     bulk_deadline: Option<Instant>,
+    rescan_generation: u64,
+    rescan_keys: HashSet<PathBuf>,
+    rescan_active: bool,
 }
 
 enum InternalEvent {
@@ -148,6 +152,13 @@ enum InternalEvent {
         document: docs_state::ScannedDocument,
     },
     BulkComplete {
+        generation: u64,
+    },
+    Rescan {
+        generation: u64,
+        document: docs_state::ScannedDocument,
+    },
+    RescanComplete {
         generation: u64,
     },
 }
@@ -176,6 +187,7 @@ struct Watch {
 
 struct Session {
     events: Receiver<ProxyEvent>,
+    bulk_events: Receiver<InternalEvent>,
     client: FrameState,
     godot: FrameState,
     deferred: DeferredQueue,
@@ -199,7 +211,6 @@ enum ProxyEvent {
     Client(ReadEvent),
     Godot(ReadEvent),
     Watcher(std::io::Result<WatcherChange>),
-    Internal(InternalEvent),
     Handoff(LockGuard),
 }
 
@@ -240,11 +251,6 @@ fn deferred_event_size(event: &ProxyEvent) -> usize {
                 .and_then(|event| event.as_ref())
                 .map_or(0, Vec::len),
             ProxyEvent::Watcher(Ok(change)) => change.path.as_os_str().len(),
-            ProxyEvent::Internal(InternalEvent::Bulk { document, .. }) => {
-                document.path.as_os_str().len()
-                    + document.key.as_os_str().len()
-                    + document.text.len()
-            }
             _ => 0,
         }
 }
@@ -563,6 +569,7 @@ fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> 
 
 pub fn run() -> Result<ExitCode> {
     let (event_sender, event_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
+    let (bulk_sender, bulk_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
     let _input_thread = spawn_frame_reader_with(
         "godot-bridge-lsp-client-reader",
         std::io::stdin(),
@@ -635,6 +642,7 @@ pub fn run() -> Result<ExitCode> {
         project_diagnostics_started: false,
         workspace_symbols_notice_sent: false,
         internal_sender,
+        bulk_sender,
         symbol_cache: HashMap::new(),
         symbol_containers: symbols::ContainerTable::default(),
         symbol_scheduled: HashMap::new(),
@@ -645,6 +653,9 @@ pub fn run() -> Result<ExitCode> {
         bulk_active: false,
         bulk_replay: false,
         bulk_deadline: None,
+        rescan_generation: 0,
+        rescan_keys: HashSet::new(),
+        rescan_active: false,
     };
 
     if let Some(lsp_port) = settings.lsp_port {
@@ -671,6 +682,7 @@ pub fn run() -> Result<ExitCode> {
         let connection = connection_from_stream(stream, event_sender.clone());
         let session = Session {
             events: event_receiver,
+            bulk_events: bulk_receiver,
             client,
             godot,
             deferred,
@@ -770,6 +782,7 @@ pub fn run() -> Result<ExitCode> {
                         return run_session(
                             Session {
                                 events: event_receiver,
+                                bulk_events: bulk_receiver,
                                 client,
                                 godot,
                                 deferred,
@@ -880,6 +893,7 @@ pub fn run() -> Result<ExitCode> {
     run_session(
         Session {
             events: event_receiver,
+            bulk_events: bulk_receiver,
             client,
             godot,
             deferred,
@@ -1097,6 +1111,7 @@ fn forward_server_message<W: Write>(
     if fields
         .method
         .is_some_and(|method| method.string_eq("textDocument/publishDiagnostics"))
+        && fields.id.is_none()
         && proxy.bulk_batch_uris.is_empty()
     {
         send_client_body(output, body)?;
@@ -1313,7 +1328,7 @@ fn rewrite_document_messages(
             let Some((key, close_uri)) = proxy.documents.zed_close(&uri) else {
                 return Ok(vec![crate::json::to_vec(&message)]);
             };
-            schedule_close(proxy, &close_uri);
+            forget_symbols(proxy, &close_uri);
             let mut messages = vec![crate::json::to_vec(&close_message(&close_uri))];
             if reopen_from_disk && key.is_file() {
                 if let Some(text) = docs_state::read_document(&key) {
@@ -1380,26 +1395,44 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
     proxy.bulk_deadline = None;
     let project = proxy.project.clone();
     let diagnose_addons = settings.diagnose_addons;
-    let sender = proxy.internal_sender.clone();
+    let sender = proxy.bulk_sender.clone();
     let _ = thread::Builder::new()
         .name("godot-bridge-project-scan".to_owned())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let documents = docs_state::scan_project(&project, diagnose_addons);
-            for document in documents {
-                if sender
-                    .send(ProxyEvent::Internal(InternalEvent::Bulk {
+            docs_state::scan_project_stream(&project, diagnose_addons, |document| {
+                sender
+                    .send(InternalEvent::Bulk {
                         generation,
                         document,
-                    }))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = sender.send(ProxyEvent::Internal(InternalEvent::BulkComplete {
-                generation,
-            }));
+                    })
+                    .is_ok()
+            });
+            let _ = sender.send(InternalEvent::BulkComplete { generation });
+        });
+}
+
+fn start_project_rescan(proxy: &mut ProxyState, settings: &Settings) {
+    proxy.rescan_generation += 1;
+    let generation = proxy.rescan_generation;
+    proxy.rescan_keys.clear();
+    proxy.rescan_active = true;
+    let project = proxy.project.clone();
+    let diagnose_addons = settings.diagnose_addons;
+    let sender = proxy.bulk_sender.clone();
+    let _ = thread::Builder::new()
+        .name("godot-bridge-project-rescan".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            docs_state::scan_project_stream(&project, diagnose_addons, |document| {
+                sender
+                    .send(InternalEvent::Rescan {
+                        generation,
+                        document,
+                    })
+                    .is_ok()
+            });
+            let _ = sender.send(InternalEvent::RescanComplete { generation });
         });
 }
 
@@ -1426,9 +1459,7 @@ fn process_bulk_document(
     if proxy.documents.open_docs.contains_key(&document.key) {
         return Ok(None);
     }
-    let action = proxy
-        .documents
-        .bridge_open_path(&document.path, document.text);
+    let action = proxy.documents.bridge_open_key(document.key, document.text);
     if let Some(action) = action {
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
@@ -1469,6 +1500,9 @@ fn pump_bulk_documents(proxy: &mut ProxyState, writer: &mut TcpStream) -> Result
             if proxy.bulk_complete {
                 proxy.bulk_active = false;
                 proxy.bulk_replay = false;
+                for (_, _, _, bulk_owned) in proxy.symbol_scheduled.values_mut() {
+                    *bulk_owned = false;
+                }
             }
             return Ok(());
         }
@@ -1491,35 +1525,8 @@ fn process_watcher_changes(
         .iter()
         .any(|change| change.kind == WatcherChangeKind::Rescan)
     {
-        let project = proxy.project.clone();
-        let diagnose_addons = settings.diagnose_addons;
-        let documents = docs_state::scan_project(&project, diagnose_addons);
-        let scanned_keys = documents
-            .iter()
-            .map(|document| document.key.clone())
-            .collect::<HashSet<_>>();
+        start_project_rescan(proxy, settings);
         changes.retain(|change| change.kind != WatcherChangeKind::Rescan);
-        changes.extend(documents.iter().map(|document| WatcherChange {
-            kind: if proxy.documents.owner(&document.key).is_some() {
-                WatcherChangeKind::Modified
-            } else {
-                WatcherChangeKind::Created
-            },
-            path: document.path.clone(),
-        }));
-        changes.extend(
-            proxy
-                .documents
-                .open_docs
-                .iter()
-                .filter(|(key, document)| {
-                    document.owner == DocumentOwner::Bridge && !scanned_keys.contains(*key)
-                })
-                .map(|(key, _)| WatcherChange {
-                    kind: WatcherChangeKind::Removed,
-                    path: key.clone(),
-                }),
-        );
     }
     for change in changes {
         let path = docs_state::normalize_path(&change.path);
@@ -1572,7 +1579,7 @@ fn process_watcher_changes(
                 let Some(uri) = proxy.documents.bridge_remove_key(&key) else {
                     continue;
                 };
-                schedule_close(proxy, &uri);
+                forget_symbols(proxy, &uri);
                 if !recovering {
                     let Some(editor) = editor.as_deref_mut() else {
                         crate::bail!("project diagnostics editor is unavailable");
@@ -1699,12 +1706,15 @@ fn check_workspace(message: &Value, project: &Path, port: Option<u16>) -> Result
 
 fn schedule_symbols(proxy: &mut ProxyState, uri: &str, generation: u64, version: i64) {
     proxy.symbol_cache.remove(uri);
+    let bulk_owned = proxy.bulk_active
+        && proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge);
     proxy.symbol_scheduled.insert(
         uri.to_owned(),
         (
             generation,
             version,
             Instant::now() + Duration::from_millis(300),
+            bulk_owned,
         ),
     );
 }
@@ -1730,10 +1740,6 @@ fn schedule_document_action(proxy: &mut ProxyState, action: &DocumentAction) {
     }
 }
 
-fn schedule_close(proxy: &mut ProxyState, uri: &str) {
-    forget_symbols(proxy, uri);
-}
-
 fn coalesce_watcher_changes(changes: Vec<WatcherChange>) -> Vec<WatcherChange> {
     let mut by_path = HashMap::new();
     for change in changes {
@@ -1754,14 +1760,9 @@ fn next_symbol_deadline(proxy: &ProxyState) -> Option<Instant> {
     proxy
         .symbol_scheduled
         .iter()
-        .filter(|(uri, _)| !bulk_owned_symbol(proxy, uri))
-        .map(|(_, (_, _, deadline))| *deadline)
+        .filter(|(_, (_, _, _, bulk_owned))| !bulk_owned)
+        .map(|(_, (_, _, deadline, _))| *deadline)
         .min()
-}
-
-fn bulk_owned_symbol(proxy: &ProxyState, uri: &str) -> bool {
-    proxy.bulk_active
-        && proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge)
 }
 
 fn send_due_symbol_requests(
@@ -1779,8 +1780,8 @@ fn send_due_symbol_requests(
     let due = proxy
         .symbol_scheduled
         .iter()
-        .filter(|(uri, (_, _, deadline))| *deadline <= now && !bulk_owned_symbol(proxy, uri))
-        .map(|(uri, (generation, version, _))| (uri.clone(), *generation, *version))
+        .filter(|(_, (_, _, deadline, bulk_owned))| *deadline <= now && !bulk_owned)
+        .map(|(uri, (generation, version, _, _))| (uri.clone(), *generation, *version))
         .take(available)
         .collect::<Vec<_>>();
     for (uri, generation, version) in due {
@@ -1833,6 +1834,7 @@ mod tests {
     #[test]
     fn document_uri_is_canonicalized() {
         let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
+        let bulk_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
         let mut proxy = ProxyState {
             documents: DocumentState::new(),
             pending: HashMap::new(),
@@ -1849,6 +1851,7 @@ mod tests {
             project_diagnostics_started: false,
             workspace_symbols_notice_sent: false,
             internal_sender,
+            bulk_sender,
             symbol_cache: HashMap::new(),
             symbol_containers: symbols::ContainerTable::default(),
             symbol_scheduled: HashMap::new(),
@@ -1859,6 +1862,9 @@ mod tests {
             bulk_active: false,
             bulk_replay: false,
             bulk_deadline: None,
+            rescan_generation: 0,
+            rescan_keys: HashSet::new(),
+            rescan_active: false,
         };
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =
@@ -1882,6 +1888,7 @@ mod tests {
             dap_port: 0,
         };
         let internal_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
+        let bulk_sender = mpsc::sync_channel(MERGED_EVENT_CAP).0;
         let mut proxy = ProxyState {
             documents: DocumentState::new(),
             pending: (1..=IN_FLIGHT_CAP as i64)
@@ -1909,6 +1916,7 @@ mod tests {
             project_diagnostics_started: false,
             workspace_symbols_notice_sent: false,
             internal_sender,
+            bulk_sender,
             symbol_cache: HashMap::new(),
             symbol_containers: symbols::ContainerTable::default(),
             symbol_scheduled: HashMap::new(),
@@ -1919,6 +1927,9 @@ mod tests {
             bulk_active: false,
             bulk_replay: false,
             bulk_deadline: None,
+            rescan_generation: 0,
+            rescan_keys: HashSet::new(),
+            rescan_active: false,
         };
         let mut output = Vec::new();
         forward_client_request(

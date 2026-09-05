@@ -52,6 +52,9 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         {
             start_project_diagnostics(&mut session.proxy, &session.settings);
         }
+        if let Some(code) = drain_bulk_events(&mut session, unmanaged)? {
+            return Ok(code);
+        }
         let now = Instant::now();
         if session.runtime.mode == Mode::Gui && now >= gui_deadline {
             while gui_deadline <= now {
@@ -104,6 +107,11 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
             }
         }
         let mut wait = Duration::from_secs(3600);
+        if (session.proxy.bulk_active || session.proxy.rescan_active)
+            && session.proxy.bulk_documents.len() <= BULK_DOCUMENTS * 2
+        {
+            wait = wait.min(Duration::from_millis(10));
+        }
         let now = Instant::now();
         if let Some(deadline) = symbol_deadline {
             wait = wait.min(
@@ -218,7 +226,21 @@ fn handle_event(
         ProxyEvent::Watcher(result) => {
             absorb_watcher_event(&mut session.watch, result);
         }
-        ProxyEvent::Internal(event) => match event {
+        ProxyEvent::Handoff(lock) => perform_handoff(session, lock)?,
+    }
+    Ok(None)
+}
+
+fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<ExitCode>> {
+    if session.proxy.bulk_documents.len() > BULK_DOCUMENTS * 2 {
+        return Ok(None);
+    }
+    loop {
+        let event = match session.bulk_events.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(None),
+        };
+        match event {
             InternalEvent::Bulk {
                 generation,
                 document,
@@ -244,11 +266,71 @@ fn handle_event(
                     return Ok(Some(code));
                 }
             }
-            InternalEvent::Bulk { .. } | InternalEvent::BulkComplete { .. } => {}
-        },
-        ProxyEvent::Handoff(lock) => perform_handoff(session, lock)?,
+            InternalEvent::Rescan {
+                generation,
+                document,
+            } if generation == session.proxy.rescan_generation => {
+                session.proxy.rescan_keys.insert(document.key.clone());
+                let change = WatcherChange {
+                    kind: if session.proxy.documents.owner(&document.key).is_some() {
+                        WatcherChangeKind::Modified
+                    } else {
+                        WatcherChangeKind::Created
+                    },
+                    path: document.path,
+                };
+                let result = process_watcher_changes(
+                    &mut session.proxy,
+                    &mut session.output,
+                    Some(&mut session.editor),
+                    &session.settings,
+                    vec![change],
+                    false,
+                );
+                if let Some(code) = guard(session, unmanaged, result)? {
+                    return Ok(Some(code));
+                }
+            }
+            InternalEvent::RescanComplete { generation }
+                if generation == session.proxy.rescan_generation =>
+            {
+                session.proxy.rescan_active = false;
+                let changes = session
+                    .proxy
+                    .documents
+                    .open_docs
+                    .iter()
+                    .filter(|(key, document)| {
+                        document.owner == DocumentOwner::Bridge
+                            && !session.proxy.rescan_keys.contains(*key)
+                    })
+                    .map(|(key, _)| WatcherChange {
+                        kind: WatcherChangeKind::Removed,
+                        path: key.clone(),
+                    })
+                    .collect();
+                session.proxy.rescan_keys.clear();
+                let result = process_watcher_changes(
+                    &mut session.proxy,
+                    &mut session.output,
+                    Some(&mut session.editor),
+                    &session.settings,
+                    changes,
+                    false,
+                );
+                if let Some(code) = guard(session, unmanaged, result)? {
+                    return Ok(Some(code));
+                }
+            }
+            InternalEvent::Bulk { .. }
+            | InternalEvent::BulkComplete { .. }
+            | InternalEvent::Rescan { .. }
+            | InternalEvent::RescanComplete { .. } => {}
+        }
+        if session.proxy.bulk_documents.len() > BULK_DOCUMENTS * 2 {
+            return Ok(None);
+        }
     }
-    Ok(None)
 }
 
 pub(super) fn receive_godot_frame(

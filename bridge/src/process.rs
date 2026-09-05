@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::state::{pid_alive_with_ticks, process_start_ticks};
+
 const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
 const GROUP_WAIT: Duration = Duration::from_secs(5);
@@ -246,7 +248,7 @@ pub fn kill_group(mut child: GodotChild) -> io::Result<()> {
 
 pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
     validate_ids(pid, pgid)?;
-    if process_start_ticks(pid).ok() != Some(ticks) {
+    if !pid_alive_with_ticks(pid, ticks) {
         return Ok(());
     }
 
@@ -260,14 +262,10 @@ pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
     if !signal_group(pid, pgid, ticks, libc::SIGKILL)? {
         return Ok(());
     }
-    while process_start_ticks(pid).ok() == Some(ticks) {
+    while pid_alive_with_ticks(pid, ticks) {
         thread::sleep(Duration::from_millis(50));
     }
     Ok(())
-}
-
-fn process_start_ticks(pid: u32) -> io::Result<u64> {
-    crate::state::process_start_ticks(pid)
 }
 
 fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
@@ -288,7 +286,7 @@ fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
 
 fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Result<bool> {
     validate_ids(pid, pgid)?;
-    if process_start_ticks(pid).ok() != Some(ticks) {
+    if !pid_alive_with_ticks(pid, ticks) {
         return Ok(false);
     }
     if unsafe { libc::kill(-pgid, signal) } == 0 {
@@ -305,7 +303,7 @@ fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Res
 fn wait_for_process_to_disappear(pid: u32, ticks: u64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if process_start_ticks(pid).ok() != Some(ticks) {
+        if !pid_alive_with_ticks(pid, ticks) {
             return true;
         }
         let remaining = match deadline.checked_duration_since(Instant::now()) {

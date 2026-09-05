@@ -8,6 +8,7 @@ pub(super) fn start_recovery(session: &mut Session) -> Result<()> {
 
 fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.symbol_cache.clear();
+    session.proxy.symbol_containers.clear();
     session.proxy.symbol_scheduled.clear();
     session.proxy.bulk_documents.clear();
     session.proxy.bulk_batch_uris.clear();
@@ -15,6 +16,9 @@ fn reset_for_recovery(session: &mut Session) -> Result<()> {
     session.proxy.bulk_active = false;
     session.proxy.bulk_replay = false;
     session.proxy.bulk_deadline = None;
+    session.proxy.rescan_generation += 1;
+    session.proxy.rescan_keys.clear();
+    session.proxy.rescan_active = false;
     session.godot = FrameState::new(GODOT_FRAME_CAP);
     session.proxy.bulk_generation += 1;
     session.proxy.project_diagnostics_started = false;

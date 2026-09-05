@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SOCKET_CLIENT_CAP: usize = 16;
 const SOCKET_LINE_CAP: usize = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn not_found_ok(result: io::Result<()>) -> io::Result<()> {
     match result {
@@ -514,6 +515,7 @@ where
     let mut reader = BufReader::new(reader_stream);
     let mut write = stream;
     let mut partial = Vec::new();
+    let mut idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -521,21 +523,17 @@ where
         let line = match read_line_limited(&mut reader, &mut partial) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                if Instant::now() >= idle_deadline {
+                    break;
+                }
+                continue;
+            }
             Err(_) => break,
         };
+        idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
         let response = match crate::json::from_slice(&line) {
-            Ok(request) => {
-                let known = matches!(
-                    request.get("cmd").and_then(Value::as_str),
-                    Some("status") | Some("handoff")
-                );
-                if known {
-                    handler(request)
-                } else {
-                    crate::json!({"error": "unknown cmd"})
-                }
-            }
+            Ok(request) => handler(request),
             Err(_) => crate::json!({"error": "invalid json"}),
         };
         let mut bytes = crate::json::to_vec(&response);
@@ -562,11 +560,9 @@ fn read_line_limited<R: BufRead>(
                 ))
             };
         }
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        let has_newline = available[..take].contains(&b'\n');
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        let has_newline = newline.is_some();
         if line.len() + take > SOCKET_LINE_CAP {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
