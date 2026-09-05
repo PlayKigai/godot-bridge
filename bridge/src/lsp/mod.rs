@@ -1394,13 +1394,16 @@ fn process_bulk_document(
     if proxy.documents.open_docs.contains_key(&document.key) {
         return Ok(None);
     }
-    if let Some(action) = proxy
+    proxy.documents.set_open_change_events(false);
+    let action = proxy
         .documents
-        .bridge_open_path(&document.path, document.text)
-    {
+        .bridge_open_path(&document.path, document.text);
+    proxy.documents.set_open_change_events(true);
+    if let Some(action) = action {
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
         };
+        schedule_document_action(proxy, &action);
         send_godot(writer, &document_action_message(&action), false)?;
         return Ok(Some(uri));
     }
