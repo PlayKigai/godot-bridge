@@ -831,9 +831,15 @@ fn forward_client_message(
                 .and_then(|params| params.get("query"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let matches = symbols::search_with_uris(
+                proxy.symbol_cache.iter().flat_map(|(uri, symbols)| {
+                    symbols.iter().map(move |symbol| (uri.as_str(), symbol))
+                }),
+                query,
+            );
             send_client(
                 output,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(symbols::search(proxy.symbol_cache.values().flatten(), query).iter().map(symbols::symbol_information).collect::<Vec<_>>()) }),
+                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(matches.iter().map(|(uri, symbol)| symbols::symbol_information(symbol, uri)).collect::<Vec<_>>()) }),
             )?;
             return Ok(());
         }
@@ -1039,10 +1045,16 @@ fn forward_server_message(
                         doc.uri == uri && doc.generation == generation && doc.version == version
                     });
                 if valid {
-                    proxy.symbol_cache.insert(
-                        uri.clone(),
-                        symbols::flatten(message.get("result").unwrap_or(&Value::Null), &uri),
-                    );
+                    proxy.symbol_cache.remove(&uri);
+                    for (symbol_uri, symbol) in
+                        symbols::flatten(message.get("result").unwrap_or(&Value::Null), &uri)
+                    {
+                        proxy
+                            .symbol_cache
+                            .entry(symbol_uri)
+                            .or_default()
+                            .push(symbol);
+                    }
                 }
             }
             flush_queued(output, writer, proxy)?;
