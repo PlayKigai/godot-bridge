@@ -1,4 +1,5 @@
-use crate::root::{canonical_or_normalized, doc_key, path_to_uri};
+use crate::file_uri::path_to_uri;
+use crate::root::{canonical_or_normalized, doc_key};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
@@ -331,18 +332,11 @@ pub fn eligible_path(project: &Path, path: &Path, diagnose_addons: bool) -> bool
     let Ok(relative) = path.strip_prefix(&project) else {
         return false;
     };
-    let components = relative.components().collect::<Vec<_>>();
-    if components.is_empty() {
+    if relative.components().next().is_none() {
         return false;
     }
-    components[..components.len() - 1].iter().all(|component| {
-        let Component::Normal(name) = component else {
-            return false;
-        };
-        *name != OsStr::new(".godot")
-            && (diagnose_addons || *name != OsStr::new("addons"))
-            && !name.to_string_lossy().starts_with('.')
-    })
+    path.parent()
+        .is_some_and(|parent| !directory_is_skipped(parent, &project, diagnose_addons))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -1285,10 +1285,6 @@ fn rewrite_document_messages(
             }
             let action = proxy.documents.zed_open(&uri, text.to_owned());
             let body = crate::json::to_vec(&document_action_message(&action));
-            if body.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didOpen for Godot {uri}");
-                return Ok(Vec::new());
-            }
             schedule_document_action(proxy, &action);
             return Ok(vec![body]);
         }
@@ -1310,17 +1306,9 @@ fn rewrite_document_messages(
             }
             let Some(action) = proxy.documents.zed_change(&uri, text.to_owned()) else {
                 let body = crate::json::to_vec(&message);
-                if body.len() > GODOT_WRITE_CAP {
-                    crate::warn!("skipping oversized didChange for Godot {uri}");
-                    return Ok(Vec::new());
-                }
                 return Ok(vec![body]);
             };
             let body = crate::json::to_vec(&document_action_message(&action));
-            if body.len() > GODOT_WRITE_CAP {
-                crate::warn!("skipping oversized didChange for Godot {uri}");
-                return Ok(Vec::new());
-            }
             schedule_document_action(proxy, &action);
             return Ok(vec![body]);
         }
@@ -1500,9 +1488,6 @@ fn pump_bulk_documents(proxy: &mut ProxyState, writer: &mut TcpStream) -> Result
             if proxy.bulk_complete {
                 proxy.bulk_active = false;
                 proxy.bulk_replay = false;
-                for (_, _, _, bulk_owned) in proxy.symbol_scheduled.values_mut() {
-                    *bulk_owned = false;
-                }
             }
             return Ok(());
         }
@@ -1706,15 +1691,15 @@ fn check_workspace(message: &Value, project: &Path, port: Option<u16>) -> Result
 
 fn schedule_symbols(proxy: &mut ProxyState, uri: &str, generation: u64, version: i64) {
     proxy.symbol_cache.remove(uri);
-    let bulk_owned = proxy.bulk_active
-        && proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge);
+    let bridge_owned =
+        proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge);
     proxy.symbol_scheduled.insert(
         uri.to_owned(),
         (
             generation,
             version,
             Instant::now() + Duration::from_millis(300),
-            bulk_owned,
+            bridge_owned,
         ),
     );
 }
@@ -1760,7 +1745,7 @@ fn next_symbol_deadline(proxy: &ProxyState) -> Option<Instant> {
     proxy
         .symbol_scheduled
         .iter()
-        .filter(|(_, (_, _, _, bulk_owned))| !bulk_owned)
+        .filter(|(_, (_, _, _, bridge_owned))| !(proxy.bulk_active && *bridge_owned))
         .map(|(_, (_, _, deadline, _))| *deadline)
         .min()
 }
@@ -1780,7 +1765,9 @@ fn send_due_symbol_requests(
     let due = proxy
         .symbol_scheduled
         .iter()
-        .filter(|(_, (_, _, deadline, bulk_owned))| *deadline <= now && !bulk_owned)
+        .filter(|(_, (_, _, deadline, bridge_owned))| {
+            *deadline <= now && !(proxy.bulk_active && *bridge_owned)
+        })
         .map(|(uri, (generation, version, _, _))| (uri.clone(), *generation, *version))
         .take(available)
         .collect::<Vec<_>>();

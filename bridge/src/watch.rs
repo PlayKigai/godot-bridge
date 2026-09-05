@@ -172,11 +172,8 @@ impl WatcherState {
             let error = io::Error::last_os_error();
             if error
                 .raw_os_error()
-                .is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK)
+                .is_some_and(|errno| matches!(errno, libc::EAGAIN | libc::EINTR))
             {
-                return Ok(true);
-            }
-            if error.raw_os_error() == Some(libc::EINTR) {
                 return Ok(true);
             }
             return Err(error);
