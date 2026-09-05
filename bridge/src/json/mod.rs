@@ -411,6 +411,12 @@ impl PartialEq<&str> for Value {
 #[derive(Clone, Copy)]
 pub(crate) struct RawJson<'a>(&'a [u8]);
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RequestKey {
+    Number(i64),
+    Lexical(String),
+}
+
 impl RawJson<'_> {
     pub(crate) fn as_i64(self) -> Option<i64> {
         self.is_number()
@@ -425,6 +431,11 @@ impl RawJson<'_> {
 
     pub(crate) fn lexical(self) -> String {
         String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8")
+    }
+
+    pub(crate) fn request_key(self) -> RequestKey {
+        self.as_i64()
+            .map_or_else(|| RequestKey::Lexical(self.lexical()), RequestKey::Number)
     }
 
     pub(crate) fn string_eq(self, expected: &str) -> bool {
@@ -507,6 +518,12 @@ impl RawJson<'_> {
         }
         expected_index == expected.len()
     }
+}
+
+pub(crate) fn value_request_key(value: &Value) -> RequestKey {
+    value
+        .as_i64()
+        .map_or_else(|| RequestKey::Lexical(to_string(value)), RequestKey::Number)
 }
 
 pub(crate) struct TopLevel<'a> {
@@ -1380,5 +1397,41 @@ break"}"#,
     fn top_level_scan_rejects_invalid_nested_values() {
         assert!(scan_top_level(br#"{"params":{"x":}}"#).is_err());
         assert!(scan_top_level(br#"[1]"#).is_err());
+    }
+
+    #[test]
+    fn request_keys_prefer_integer_ids() {
+        assert_eq!(
+            scan_top_level(br#"{"id":1}"#)
+                .unwrap()
+                .id
+                .unwrap()
+                .request_key(),
+            RequestKey::Number(1)
+        );
+        assert_eq!(
+            scan_top_level(br#"{"id":"1"}"#)
+                .unwrap()
+                .id
+                .unwrap()
+                .request_key(),
+            RequestKey::Lexical("\"1\"".to_owned())
+        );
+        assert_eq!(
+            scan_top_level(br#"{"id":1.0}"#)
+                .unwrap()
+                .id
+                .unwrap()
+                .request_key(),
+            RequestKey::Lexical("1.0".to_owned())
+        );
+        assert_eq!(
+            scan_top_level(br#"{"id":18446744073709551615}"#)
+                .unwrap()
+                .id
+                .unwrap()
+                .request_key(),
+            RequestKey::Lexical("18446744073709551615".to_owned())
+        );
     }
 }

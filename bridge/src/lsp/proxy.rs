@@ -421,6 +421,7 @@ pub(super) fn forward_initialize(
             Ok(None) => return Err("Godot closed during initialize".to_owned()),
             Err(error) => return Err(error.to_string()),
         };
+        let fields = crate::json::scan_top_level(&frame).map_err(|error| error.to_string())?;
         let message = parse_message(&frame)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {
@@ -459,8 +460,9 @@ pub(super) fn forward_initialize(
             return Ok(());
         }
         if message.get("method").is_some() && message.get("id").is_some() {
-            let id = message["id"].to_string();
-            proxy.server_requests.insert(id);
+            if let Some(id) = fields.id {
+                proxy.server_requests.insert(id.request_key());
+            }
             if send_client(output, &message).is_err() {
                 return Err("cannot forward Godot request".to_owned());
             }

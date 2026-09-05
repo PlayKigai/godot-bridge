@@ -160,27 +160,25 @@ pub fn spawn_frame_reader<R: Read + Send + 'static>(
     thread::Builder::new()
         .name(name)
         .stack_size(256 * 1024)
-        .spawn(move || {
-            loop {
-                let mut chunk = ReadChunk {
-                    bytes: [0; READ_CHUNK_SIZE],
-                    len: 0,
-                };
-                let event = match reader.read(&mut chunk.bytes) {
-                    Ok(0) => Ok(None),
-                    Ok(len) => {
-                        chunk.len = len;
-                        Ok(Some(chunk))
-                    }
-                    Err(error) => Err(error),
-                };
-                let done = matches!(&event, Ok(None) | Err(_));
-                if sender.send(event).is_err() {
-                    return;
+        .spawn(move || loop {
+            let mut chunk = ReadChunk {
+                bytes: [0; READ_CHUNK_SIZE],
+                len: 0,
+            };
+            let event = match reader.read(&mut chunk.bytes) {
+                Ok(0) => Ok(None),
+                Ok(len) => {
+                    chunk.len = len;
+                    Ok(Some(chunk))
                 }
-                if done {
-                    return;
-                }
+                Err(error) => Err(error),
+            };
+            let done = matches!(&event, Ok(None) | Err(_));
+            if sender.send(event).is_err() {
+                return;
+            }
+            if done {
+                return;
             }
         })
 }

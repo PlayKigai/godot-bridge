@@ -180,10 +180,12 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
         let message = match item {
             RecoveryItem::Request(message) | RecoveryItem::Notification(message) => message,
             RecoveryItem::Response(message) => {
-                if message
-                    .get("id")
-                    .is_some_and(|id| session.proxy.stale_server_ids.contains(&id.to_string()))
-                {
+                if message.get("id").is_some_and(|id| {
+                    session
+                        .proxy
+                        .stale_server_ids
+                        .contains(&crate::json::value_request_key(id))
+                }) {
                     crate::debug!("dropping response to stale Godot request");
                     continue;
                 }

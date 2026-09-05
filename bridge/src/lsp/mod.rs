@@ -64,8 +64,8 @@ struct ProxyState {
     pending: HashMap<i64, PendingRequest>,
     queued: VecDeque<Value>,
     queued_bytes: usize,
-    server_requests: HashSet<String>,
-    stale_server_ids: HashSet<String>,
+    server_requests: HashSet<crate::json::RequestKey>,
+    stale_server_ids: HashSet<crate::json::RequestKey>,
     next_id: i64,
     initialized_forwarded: bool,
     zed_initialized: bool,
@@ -798,11 +798,11 @@ fn forward_client_body(
             || method.string_eq("$/cancelRequest")
     });
     if fields.id.is_some() && fields.method.is_none() {
-        let id = fields.id.expect("checked above").lexical();
+        let id = fields.id.expect("checked above").request_key();
         if proxy.server_requests.remove(&id) {
             send_godot_body(&mut editor.connection.writer, body, false)?;
         } else if proxy.stale_server_ids.remove(&id) {
-            crate::debug!("dropping response to stale Godot request {id}");
+            crate::debug!("dropping response to stale Godot request {id:?}");
         }
         return Ok(());
     }
@@ -868,14 +868,14 @@ fn forward_client_message(
         if body.len() > GODOT_WRITE_CAP {
             crate::bail!("Zed response is too large for Godot");
         }
-        let id = message.get("id").map(Value::to_string).unwrap_or_default();
+        let id = message
+            .get("id")
+            .map(crate::json::value_request_key)
+            .expect("response has an id");
         if proxy.server_requests.remove(&id) {
-            editor
-                .connection
-                .writer
-                .write_all(&crate::framing::encode_frame(&body))?;
+            send_godot_body(&mut editor.connection.writer, &body, false)?;
         } else if proxy.stale_server_ids.remove(&id) {
-            crate::debug!("dropping response to stale Godot request {id}");
+            crate::debug!("dropping response to stale Godot request {id:?}");
         }
         return Ok(());
     }
@@ -1016,8 +1016,8 @@ fn forward_server_message(
             send_client_body(output, body)?;
             return Ok(());
         }
-        if let Some(id) = message.get("id") {
-            proxy.server_requests.insert(id.to_string());
+        if let Some(id) = fields.id {
+            proxy.server_requests.insert(id.request_key());
         }
         send_client(output, &message)?;
         return Ok(());
@@ -1026,7 +1026,17 @@ fn forward_server_message(
         send_client(output, &message)?;
         return Ok(());
     };
-    let id_number = id.as_i64().unwrap_or_default();
+    let Some(id_number) = fields.id.and_then(|id| id.as_i64()) else {
+        if !shutdown_response {
+            let stale = fields
+                .id
+                .is_some_and(|id| proxy.stale_server_ids.contains(&id.request_key()));
+            if !stale {
+                crate::debug!("dropping unknown Godot response id {id}");
+            }
+        }
+        return Ok(());
+    };
     if let Some(pending) = proxy.pending.remove(&id_number) {
         if pending.internal {
             if let Some((uri, generation, version)) = pending.symbol {
@@ -1051,7 +1061,11 @@ fn forward_server_message(
         response["id"] = pending.zed_id;
         send_client(output, &response)?;
         flush_queued(output, writer, proxy)?;
-    } else if !proxy.stale_server_ids.contains(&id.to_string()) && !shutdown_response {
+    } else if !proxy
+        .stale_server_ids
+        .contains(&fields.id.expect("response has an id").request_key())
+        && !shutdown_response
+    {
         crate::debug!("dropping unknown Godot response id {id}");
     }
     Ok(())

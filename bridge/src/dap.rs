@@ -146,7 +146,7 @@ impl<W: Write> ClientOutput<W> {
 }
 
 struct ServerRequests {
-    original_sequences: HashMap<i64, Value>,
+    original_sequences: HashMap<crate::json::RequestKey, Value>,
 }
 
 impl ServerRequests {
@@ -159,7 +159,8 @@ impl ServerRequests {
     fn rewrite(&mut self, message: &mut Value, bridge_seq: i64) {
         if message.get("type").and_then(Value::as_str) == Some("request") {
             if let Some(original) = message.get("seq").cloned() {
-                self.original_sequences.insert(bridge_seq, original);
+                self.original_sequences
+                    .insert(crate::json::RequestKey::Number(bridge_seq), original);
             }
         }
         message["seq"] = crate::json!(bridge_seq);
@@ -169,10 +170,13 @@ impl ServerRequests {
         if message.get("type").and_then(Value::as_str) != Some("response") {
             return;
         }
-        let Some(request_seq) = message.get("request_seq").and_then(Value::as_i64) else {
+        let Some(request_seq) = message.get("request_seq") else {
             return;
         };
-        if let Some(original) = self.original_sequences.remove(&request_seq) {
+        if let Some(original) = self
+            .original_sequences
+            .remove(&crate::json::value_request_key(request_seq))
+        {
             message["request_seq"] = original;
         }
     }
