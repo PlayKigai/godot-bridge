@@ -23,16 +23,16 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
     let Some(items) = result.as_array() else {
         return Vec::new();
     };
+    let default_uri = normalize_uri(default_uri);
     let mut output = Vec::new();
     for item in items {
         if item.get("location").is_some() {
             let location = item.get("location").unwrap_or(&Value::Null);
-            let uri = normalize_uri(
-                location
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .unwrap_or(default_uri),
-            );
+            let uri = location
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(normalize_uri)
+                .unwrap_or_else(|| default_uri.clone());
             output.push(Symbol {
                 name: item
                     .get("name")
@@ -54,7 +54,7 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
                 range: location.get("range").cloned().unwrap_or(Value::Null),
             });
         } else {
-            flatten_document(item, default_uri, "", &mut output);
+            flatten_document(item, &default_uri, "", &mut output);
         }
     }
     output
@@ -62,6 +62,11 @@ pub fn flatten(result: &Value, default_uri: &str) -> Vec<Symbol> {
 
 fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<Symbol>) {
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(normalize_uri)
+        .unwrap_or_else(|| uri.to_owned());
     let current_container = if container.is_empty() {
         String::new()
     } else {
@@ -72,7 +77,7 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<S
         folded_name: name.to_lowercase(),
         kind: item.get("kind").cloned().unwrap_or(Value::Null),
         container: current_container,
-        uri: normalize_uri(item.get("uri").and_then(Value::as_str).unwrap_or(uri)),
+        uri: uri.clone(),
         range: item
             .get("selectionRange")
             .cloned()
@@ -86,7 +91,7 @@ fn flatten_document(item: &Value, uri: &str, container: &str, output: &mut Vec<S
     };
     if let Some(children) = item.get("children").and_then(Value::as_array) {
         for child in children {
-            flatten_document(child, uri, &next, output);
+            flatten_document(child, &uri, &next, output);
         }
     }
 }
@@ -295,12 +300,21 @@ mod tests {
 
     #[test]
     fn flattens_nested_document_symbols() {
-        let result = crate::json!([{"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[{"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}}]}]);
-        let flattened = flatten(&result, "file:///tmp/main.gd");
-        assert_eq!(flattened.len(), 2);
+        let result = crate::json!([
+            {"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[
+                {"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}},
+                {"name":"Other","kind":6,"range":{"start":{"line":3},"end":{"line":4}},"selectionRange":{"start":{"line":3},"end":{"line":3}},"uri":"file:///tmp/../tmp/other.gd","children":[{"name":"Nested","kind":6,"selectionRange":{"start":{"line":4},"end":{"line":4}}}]}
+            ]}
+        ]);
+        let flattened = flatten(&result, "file:///tmp/../tmp/main.gd");
+        assert_eq!(flattened.len(), 4);
         assert_eq!(flattened[0].container, "");
         assert_eq!(flattened[1].container, "Root");
         assert_eq!(flattened[0].range["start"]["line"], 1);
+        assert_eq!(flattened[0].uri, "file:///tmp/main.gd");
+        assert_eq!(flattened[1].uri, "file:///tmp/main.gd");
+        assert_eq!(flattened[2].uri, "file:///tmp/other.gd");
+        assert_eq!(flattened[3].uri, "file:///tmp/other.gd");
     }
 
 }
