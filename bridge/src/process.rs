@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -52,8 +52,19 @@ impl GodotChild {
 }
 
 pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
+    let start = *range.start();
+    let end = *range.end();
+    if start > end {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "port range is empty",
+        ));
+    }
+    let count = usize::from(end - start) + 1;
+    let offset = std::process::id() as usize % count;
     let mut last_error = None;
-    for port in range {
+    for index in 0..count {
+        let port = start + ((offset + index) % count) as u16;
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => {
                 drop(listener);
@@ -65,6 +76,50 @@ pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
 
     Err(last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "port range is empty")))
+}
+
+pub fn port_listener_belongs_to_process(pid: u32, port: u16) -> io::Result<bool> {
+    let mut inodes = HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let contents = std::fs::read_to_string(path)?;
+        for line in contents.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() <= 9 || fields[3] != "0A" {
+                continue;
+            }
+            let Some((_, port_hex)) = fields[1].split_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(port_hex, 16).ok() == Some(port) {
+                if let Ok(inode) = fields[9].parse::<u64>() {
+                    inodes.insert(inode);
+                }
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        let target = match std::fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(inode) = target
+            .to_str()
+            .and_then(|target| target.strip_prefix("socket:["))
+            .and_then(|target| target.strip_suffix(']'))
+            .and_then(|inode| inode.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if inodes.contains(&inode) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn spawn_godot(
@@ -490,6 +545,13 @@ mod tests {
             }
         }
         panic!("picked port should be bindable");
+    }
+
+    #[test]
+    fn listener_owner_matches_process() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_listener_belongs_to_process(std::process::id(), port).unwrap());
     }
 
     #[test]

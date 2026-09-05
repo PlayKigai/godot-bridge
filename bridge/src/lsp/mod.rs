@@ -22,8 +22,8 @@ use crate::framing::{
 };
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{
-    kill_group, kill_recorded, pick_free_port, spawn_godot, spawn_gui, wait_for_port, GodotChild,
-    Readiness,
+    kill_group, kill_recorded, pick_free_port, port_listener_belongs_to_process, spawn_godot,
+    spawn_gui, wait_for_port, GodotChild, Readiness,
 };
 use crate::root::{find_project_dir, worktree_root_from_initialize};
 use crate::settings_file::{parse_trusted_settings, Settings};
@@ -86,9 +86,11 @@ impl RequestKeys {
     fn insert(&mut self, key: crate::json::RequestKey) {
         if self.values.insert(key.clone()) {
             self.order.push_back(key);
-            while self.order.len() > SERVER_REQUEST_CAP {
+            if self.values.len() > SERVER_REQUEST_CAP {
                 if let Some(old) = self.order.pop_front() {
-                    self.values.remove(&old);
+                    if !self.order.iter().any(|key| key == &old) {
+                        self.values.remove(&old);
+                    }
                 }
             }
         }
@@ -297,6 +299,7 @@ struct RecoveryQueue {
 enum StartupError {
     ChildExited(Vec<String>),
     Deadline(Vec<String>),
+    PortMismatch,
     Io(String),
 }
 
@@ -305,6 +308,7 @@ impl StartupError {
         match self {
             Self::ChildExited(lines) => format_lines("Godot exited", lines),
             Self::Deadline(lines) => format_lines("Godot did not start before the deadline", lines),
+            Self::PortMismatch => "Godot port belongs to another process".to_owned(),
             Self::Io(error) => error.clone(),
         }
     }
@@ -1283,8 +1287,16 @@ fn rewrite_document_messages(
                 crate::warn!("skipping oversized didOpen for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let action = proxy.documents.zed_open(&uri, text.to_owned());
-            let body = crate::json::to_vec(&document_action_message(&action));
+            let planned = planned_zed_open(&proxy.documents, &uri, text);
+            let body = crate::json::to_vec(&document_action_message(&planned));
+            if body.len() > GODOT_WRITE_CAP {
+                crate::warn!("skipping oversized didOpen for Godot {uri}");
+                return Ok(Vec::new());
+            }
+            let action_text = match planned {
+                DocumentAction::Open { text, .. } | DocumentAction::Change { text, .. } => text,
+            };
+            let action = proxy.documents.zed_open(&uri, action_text);
             schedule_document_action(proxy, &action);
             return Ok(vec![body]);
         }
@@ -1304,11 +1316,26 @@ fn rewrite_document_messages(
                 crate::warn!("skipping oversized didChange for Godot {uri}");
                 return Ok(Vec::new());
             }
-            let Some(action) = proxy.documents.zed_change(&uri, text.to_owned()) else {
+            let Some(planned) = planned_zed_change(&proxy.documents, &uri, text) else {
                 let body = crate::json::to_vec(&message);
+                if body.len() > GODOT_WRITE_CAP {
+                    crate::warn!("skipping oversized didChange for Godot {uri}");
+                    return Ok(Vec::new());
+                }
                 return Ok(vec![body]);
             };
-            let body = crate::json::to_vec(&document_action_message(&action));
+            let body = crate::json::to_vec(&document_action_message(&planned));
+            if body.len() > GODOT_WRITE_CAP {
+                crate::warn!("skipping oversized didChange for Godot {uri}");
+                return Ok(Vec::new());
+            }
+            let action_text = match planned {
+                DocumentAction::Change { text, .. } => text,
+                DocumentAction::Open { .. } => unreachable!(),
+            };
+            let Some(action) = proxy.documents.zed_change(&uri, action_text) else {
+                return Ok(Vec::new());
+            };
             schedule_document_action(proxy, &action);
             return Ok(vec![body]);
         }
@@ -1335,6 +1362,33 @@ fn rewrite_document_messages(
         _ => {}
     }
     Ok(vec![crate::json::to_vec(&message)])
+}
+
+fn planned_zed_open(documents: &DocumentState, uri: &str, text: &str) -> DocumentAction {
+    let key = documents.key_for_uri(uri);
+    if let Some(doc) = documents.open_docs.get(&key) {
+        DocumentAction::Change {
+            uri: doc.uri.clone(),
+            version: doc.version + 1,
+            text: text.to_owned(),
+        }
+    } else {
+        DocumentAction::Open {
+            uri: crate::file_uri::path_to_uri(&key),
+            version: 1,
+            text: text.to_owned(),
+        }
+    }
+}
+
+fn planned_zed_change(documents: &DocumentState, uri: &str, text: &str) -> Option<DocumentAction> {
+    let key = documents.key_for_uri(uri);
+    let doc = documents.open_docs.get(&key)?;
+    Some(DocumentAction::Change {
+        uri: doc.uri.clone(),
+        version: doc.version + 1,
+        text: text.to_owned(),
+    })
 }
 
 fn document_action_message(action: &DocumentAction) -> Value {
@@ -1816,6 +1870,19 @@ mod tests {
     #[test]
     fn startup_deadline_zero_is_unbounded() {
         assert!(startup_deadline(0).is_none());
+    }
+
+    #[test]
+    fn removed_request_key_survives_reinsertion_until_its_turn() {
+        let mut keys = RequestKeys::default();
+        let key = crate::json::RequestKey::String("A".to_owned());
+        keys.insert(key.clone());
+        assert!(keys.remove(&key));
+        keys.insert(key.clone());
+        for index in 0..SERVER_REQUEST_CAP {
+            keys.insert(crate::json::RequestKey::Number(index as i64));
+        }
+        assert!(keys.contains(&key));
     }
 
     #[test]

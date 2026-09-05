@@ -189,32 +189,42 @@ pub(super) fn spawn_one(
     event_sender: &mpsc::SyncSender<ProxyEvent>,
     deadline: Option<Instant>,
 ) -> std::result::Result<Editor, StartupError> {
-    let lsp_port =
-        pick_free_port(6005..=6999).map_err(|error| StartupError::Io(error.to_string()))?;
-    let dap_port =
-        pick_free_port(7005..=7999).map_err(|error| StartupError::Io(error.to_string()))?;
-    let log_path = runtime.files.state.with_extension("godot.log");
-    let child = spawn_godot(
-        binary,
-        &settings.extra_args,
-        project,
-        lsp_port,
-        dap_port,
-        log_path,
-    )
-    .map_err(|error| StartupError::Io(error.to_string()))?;
-    if let Err(error) = update_state_spawned(runtime, &child, lsp_port, dap_port) {
-        terminate_editor_child(child);
-        return Err(StartupError::Io(error.to_string()));
+    loop {
+        let lsp_port =
+            pick_free_port(6005..=6999).map_err(|error| StartupError::Io(error.to_string()))?;
+        let dap_port =
+            pick_free_port(7005..=7999).map_err(|error| StartupError::Io(error.to_string()))?;
+        let log_path = runtime.files.state.with_extension("godot.log");
+        let child = spawn_godot(
+            binary,
+            &settings.extra_args,
+            project,
+            lsp_port,
+            dap_port,
+            log_path,
+        )
+        .map_err(|error| StartupError::Io(error.to_string()))?;
+        if let Err(error) = update_state_spawned(runtime, &child, lsp_port, dap_port) {
+            terminate_editor_child(child);
+            return Err(StartupError::Io(error.to_string()));
+        }
+        let (child, stream) = match await_port(child, lsp_port, deadline, "LSP") {
+            Ok(value) => value,
+            Err(StartupError::PortMismatch) => continue,
+            Err(error) => return Err(error),
+        };
+        let (child, _) = match await_port(child, dap_port, deadline, "DAP") {
+            Ok(value) => value,
+            Err(StartupError::PortMismatch) => continue,
+            Err(error) => return Err(error),
+        };
+        return Ok(Editor {
+            child: Some(child),
+            connection: connection_from_stream(stream, event_sender.clone()),
+            lsp_port,
+            dap_port,
+        });
     }
-    let (child, stream) = await_port(child, lsp_port, deadline, "LSP")?;
-    let (child, _) = await_port(child, dap_port, deadline, "DAP")?;
-    Ok(Editor {
-        child: Some(child),
-        connection: connection_from_stream(stream, event_sender.clone()),
-        lsp_port,
-        dap_port,
-    })
 }
 
 fn await_port(
@@ -224,7 +234,22 @@ fn await_port(
     label: &str,
 ) -> std::result::Result<(GodotChild, TcpStream), StartupError> {
     match wait_for_port(&mut child, port, deadline) {
-        Ok(Readiness::Ready(stream)) => Ok((child, stream)),
+        Ok(Readiness::Ready(stream)) => match port_listener_belongs_to_process(child.pid, port) {
+            Ok(true) => Ok((child, stream)),
+            Ok(false) => {
+                crate::warn!("Godot {label} port {port} belongs to another process");
+                terminate_editor_child(child);
+                Err(StartupError::PortMismatch)
+            }
+            Err(error) => {
+                let lines = child.last_lines();
+                terminate_editor_child(child);
+                Err(StartupError::Io(format!(
+                    "cannot verify Godot {label} port: {error}; {}",
+                    lines.join("\n")
+                )))
+            }
+        },
         Ok(Readiness::ChildExited(_)) => Err(StartupError::ChildExited(child.last_lines())),
         Ok(Readiness::Deadline) => {
             let lines = child.last_lines();
