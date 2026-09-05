@@ -91,7 +91,11 @@ impl ProjectFiles {
                 format!("project path {} is not valid UTF-8", project.display()),
             )
         })?;
-        let hash = crate::fnv::hash_hex(project_str.as_bytes());
+        let hash = format!(
+            "{}-{}",
+            crate::fnv::hash_hex(project_str.as_bytes()),
+            project_str.len()
+        );
         let mut runtime = runtime_dir()?;
         let socket = runtime.join(format!("{hash}.sock"));
         if socket.as_os_str().len() > 100 {
@@ -461,9 +465,11 @@ where
     F: Fn(Value) -> Value + Send + Sync + 'static,
 {
     let path = path.as_ref().to_path_buf();
-    not_found_ok(std::fs::remove_file(&path))?;
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let temporary = path.with_extension("tmp");
+    not_found_ok(std::fs::remove_file(&temporary))?;
+    let listener = UnixListener::bind(&temporary)?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temporary, &path)?;
     let handler = Arc::new(handler);
     let stop = Arc::new(AtomicBool::new(false));
     let clients = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
@@ -620,6 +626,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 mod tests {
     use super::*;
     use crate::temp::tempdir;
+    use std::os::unix::fs::PermissionsExt;
 
     fn files(dir: &Path) -> ProjectFiles {
         ProjectFiles {
@@ -762,6 +769,10 @@ mod tests {
             }
         })
         .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let response = socket_request(
             &path,
             &crate::json!({"cmd": "status"}),

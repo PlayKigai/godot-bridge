@@ -17,6 +17,7 @@ const KNOWN_KEYS: [&str; 8] = [
     "diagnose_addons",
     "extra_args",
 ];
+const PROJECT_UNTRUSTED_KEYS: [&str; 3] = ["godot_path", "project_dir", "extra_args"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -160,11 +161,54 @@ fn load_zed_settings_with(worktree: &Path, user_path: &Path) -> Result<Settings,
         validate_section(user_path, &section)?;
         merged.extend(section);
     }
-    if let Some(section) = project_section {
+    if let Some(mut section) = project_section {
+        remove_untrusted_project_keys(&project_path, &mut section);
         validate_section(&project_path, &section)?;
         merged.extend(section);
     }
     parse_settings(&Value::Object(merged))
+}
+
+pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings, String> {
+    let empty = Map::new();
+    let object = match value.as_object() {
+        Some(object) => object,
+        None if value.is_null() => &empty,
+        None => return parse_settings(value),
+    };
+    let user_path = user_settings_path();
+    let user_section = read_settings_section(&user_path)?;
+    if let Some(section) = &user_section {
+        validate_section(&user_path, section)?;
+    }
+
+    let project_path = worktree.join(".zed").join("settings.json");
+    if let Some(project_section) = read_settings_section(&project_path)? {
+        for key in PROJECT_UNTRUSTED_KEYS {
+            if project_section.contains_key(key) {
+                crate::warn!(
+                    "ignoring project setting {key} in {}",
+                    project_path.display()
+                );
+            }
+        }
+    }
+
+    let mut merged = user_section.unwrap_or_default();
+    for (key, value) in object {
+        if !PROJECT_UNTRUSTED_KEYS.contains(&key.as_str()) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    parse_settings(&Value::Object(merged))
+}
+
+fn remove_untrusted_project_keys(path: &Path, section: &mut Map) {
+    for key in PROJECT_UNTRUSTED_KEYS {
+        if section.remove(key).is_some() {
+            crate::warn!("ignoring project setting {key} in {}", path.display());
+        }
+    }
 }
 
 fn validate_section(path: &Path, section: &Map) -> Result<(), String> {
@@ -329,9 +373,10 @@ mod tests {
                 "lsp": {
                     "godot": {
                         "settings": {
-                            "godot_path": "/bin/true",
-                            "project_diagnostics": false,
-                            "extra_args": ["--verbose"],
+                             "godot_path": "/not-an-executable",
+                             "project_dir": "/not-a-project",
+                             "project_diagnostics": false,
+                             "extra_args": ["--editor"],
                             "startup_timeout_s": 30
                         }
                     }
@@ -341,14 +386,14 @@ mod tests {
         let settings =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap();
-        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
+        assert_eq!(settings.godot_path.as_deref(), Some("/bin/sh"));
         assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
         assert_eq!(settings.lsp_port, None);
         assert_eq!(settings.dap_port, 5555);
         assert_eq!(settings.startup_timeout_s, 30);
         assert!(!settings.project_diagnostics);
         assert!(settings.diagnose_addons);
-        assert_eq!(settings.extra_args, ["--verbose"]);
+        assert!(settings.extra_args.is_empty());
     }
 
     #[test]
@@ -372,8 +417,8 @@ mod tests {
         let settings =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap();
-        assert_eq!(settings.godot_path.as_deref(), Some("/bin/true"));
-        assert_eq!(settings.extra_args, ["--verbose"]);
+        assert_eq!(settings.godot_path, None);
+        assert!(settings.extra_args.is_empty());
     }
 
     #[test]
@@ -382,12 +427,12 @@ mod tests {
         let worktree = tempdir().unwrap();
         write_project_settings(
             worktree.path(),
-            r#"{"lsp": {"godot": {"settings": {"extra_args": ["--editor"]}}}}"#,
+            r#"{"lsp": {"godot": {"settings": {"dap_port": "bad"}}}}"#,
         );
         let error =
             load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
                 .unwrap_err();
         assert!(error.contains(".zed/settings.json"), "{error}");
-        assert!(error.contains("--editor"), "{error}");
+        assert!(error.contains("dap_port"), "{error}");
     }
 }

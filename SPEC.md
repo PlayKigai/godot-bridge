@@ -98,12 +98,15 @@ are ignored today and reserved.
 ### Settings
 
 Zed settings path `lsp.godot.settings` in user settings or
-`.zed/settings.json`. The extension passes the object as
-`initializationOptions` on `initialize`. The bridge requires it to be a JSON
-object or absent; any other type gets `-32602 InvalidParams` on `initialize`
-and the bridge exits 1. Unknown keys are ignored with a log line. The bridge
-removes the whole `initializationOptions` field before forwarding
-`initialize` to Godot. Changes need "restart language server".
+`.zed/settings.json`. User settings control the Godot executable, project path,
+and extra arguments. Those three keys are ignored in project settings, with a
+warning. Other project settings override user settings per key. The extension
+passes the object as `initializationOptions` on `initialize`. The bridge
+requires it to be a JSON object or absent; any other type gets `-32602
+InvalidParams` on `initialize` and the bridge exits 1. Unknown keys are ignored
+with a log line. The bridge removes the whole `initializationOptions` field
+before forwarding `initialize` to Godot. Changes need "restart language
+server".
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -180,16 +183,17 @@ output starting `4.`, else error "Godot at <p> is not 4.x: <output>".
 ### Runtime dir and files
 
 Runtime dir `$XDG_RUNTIME_DIR/godot-bridge/`, fallback `/tmp/godot-bridge-$UID/`,
-created mode 0700. Four files per project, three roles. The lock is
-ownership. The socket is readiness. The state file is information only and
+created mode 0700. Four files per project, three roles. `<hash>` is the FNV
+hash of the project path followed by `-` and the path length in bytes. The
+lock is ownership. The socket is readiness. The state file is information only and
 never used for synchronization.
 
 - `<hash>.lock`: `flock(LOCK_EX | LOCK_NB)`, held by the `lsp` owner for its
   whole life.
-- `<hash>.sock`: Unix socket the owner listens on. Bound after the lock is
-  taken; a stale file at that path is removed first. Removed before the lock
-  is released. Protocol: newline-delimited JSON, one request per line, one
-  response per line, 5 s timeout per request, any number of concurrent
+- `<hash>.sock`: Unix socket the owner listens on. Bound on a private temporary
+  path, chmod 0600, then atomically renamed into place after the lock is taken.
+  Removed before the lock is released. Protocol: newline-delimited JSON, one
+  request per line, one response per line, 5 s timeout per request, any number of concurrent
   clients. Requests: `{"cmd":"status"}`, `{"cmd":"handoff"}` (phase 4).
   Unknown cmd: `{"error":"unknown cmd"}`.
 - `<hash>.json`: state, tmpfile+rename, mode 0600.
