@@ -4,9 +4,8 @@ use crate::framing::connect_with_reader;
 pub(super) fn connection_from_stream(
     stream: TcpStream,
     sender: mpsc::SyncSender<ProxyEvent>,
-) -> Connection {
+) -> io::Result<Connection> {
     connect_with_reader(stream, "godot-bridge-lsp-reader", sender, ProxyEvent::Godot)
-        .expect("Godot reader thread should spawn")
 }
 
 pub(super) fn startup_deadline(seconds: u32) -> Option<Instant> {
@@ -233,7 +232,8 @@ pub(super) fn spawn_one(
         };
         return Ok(Editor {
             child: Some(child),
-            connection: connection_from_stream(stream, event_sender.clone()),
+            connection: connection_from_stream(stream, event_sender.clone())
+                .map_err(|error| StartupError::Io(error.to_string()))?,
             lsp_port,
             dap_port,
         });

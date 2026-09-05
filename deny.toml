@@ -6,7 +6,6 @@ yanked = "deny"
 unmaintained = "all"
 
 [licenses]
-private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",

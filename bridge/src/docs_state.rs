@@ -7,6 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_OPEN_DOCS: usize = 20_000;
 pub const BULK_DOCUMENTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,22 +63,27 @@ impl DocumentState {
         incoming_uri: &str,
         key: &Path,
         action: DocumentAction,
-    ) -> (String, i64) {
+    ) -> Option<(String, i64)> {
         let key = key.to_path_buf();
-        self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
-        self.register_watcher_path(&key, key.clone());
         match action {
             DocumentAction::Change { uri, version, text } => {
                 let Some(doc) = self.open_docs.get_mut(&key) else {
-                    return (uri, version);
+                    return Some((uri, version));
                 };
                 doc.text = Some(text);
                 doc.version = version;
                 doc.owner = DocumentOwner::Zed;
-                (uri, version)
+                self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
+                self.register_watcher_path(&key, key.clone());
+                Some((uri, version))
             }
             DocumentAction::Open { uri, version, text } => {
+                if !self.open_docs.contains_key(&key) && self.open_docs.len() >= MAX_OPEN_DOCS {
+                    crate::warn!("dropping document because the open document limit was reached");
+                    return None;
+                }
                 let generation = self.next_generation();
+                self.register_watcher_path(&key, key.clone());
                 self.open_docs.insert(
                     key.clone(),
                     OpenDoc {
@@ -90,8 +96,9 @@ impl DocumentState {
                         owner: DocumentOwner::Zed,
                     },
                 );
+                self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
                 self.uri_keys.insert(uri.clone(), key.clone());
-                (uri, version)
+                Some((uri, version))
             }
         }
     }
@@ -124,6 +131,10 @@ impl DocumentState {
     pub fn bridge_open_key(&mut self, key: PathBuf, text: String) -> Option<DocumentAction> {
         if let Some(uri) = self.open_docs.get(&key).map(|doc| doc.uri.clone()) {
             self.uri_keys.insert(uri, key);
+            return None;
+        }
+        if self.open_docs.len() >= MAX_OPEN_DOCS {
+            crate::warn!("dropping document because the open document limit was reached");
             return None;
         }
         let uri = path_to_uri(&key);
@@ -449,5 +460,18 @@ mod tests {
         assert!(with_addons
             .iter()
             .any(|doc| doc.path.ends_with("addons/addon.gd")));
+    }
+
+    #[test]
+    fn open_document_limit_is_enforced() {
+        let mut state = DocumentState::new();
+        for index in 0..MAX_OPEN_DOCS {
+            let key = PathBuf::from(format!("/project/{index}.gd"));
+            assert!(state.bridge_open_key(key, String::new()).is_some());
+        }
+        assert!(state
+            .bridge_open_key(PathBuf::from("/project/overflow.gd"), String::new())
+            .is_none());
+        assert_eq!(state.open_docs.len(), MAX_OPEN_DOCS);
     }
 }

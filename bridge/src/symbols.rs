@@ -332,6 +332,9 @@ pub fn search_with_uris<'a>(
     query: &str,
     containers: &ContainerTable,
 ) -> Vec<(&'a str, &'a Symbol)> {
+    if query.len() > 256 {
+        return Vec::new();
+    }
     let container_query = query.contains('.') || query.contains(' ');
     let query = query.to_lowercase();
     let query = if container_query {

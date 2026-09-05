@@ -17,7 +17,11 @@ pub fn write(level: u8, message: Arguments) {
     if level > *MAX_LEVEL {
         return;
     }
-    let label = ["ERROR", "WARN", "DEBUG"][level as usize];
+    let label = match level {
+        ERROR => "ERROR",
+        WARN => "WARN",
+        _ => "DEBUG",
+    };
     let _ = writeln!(std::io::stderr(), "{label} {message}");
 }
 

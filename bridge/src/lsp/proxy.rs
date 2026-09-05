@@ -4,6 +4,8 @@ pub(super) struct InitializeInput<'a> {
     pub(super) events: &'a Receiver<ProxyEvent>,
     pub(super) godot: &'a mut FrameState,
     pub(super) deferred: &'a mut DeferredQueue,
+    pub(super) deadline: Option<Instant>,
+    pub(super) deadline_seconds: u32,
 }
 
 pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitCode> {
@@ -20,6 +22,8 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                 events: &session.events,
                 godot: &mut session.godot,
                 deferred: &mut session.deferred,
+                deadline: startup_deadline(session.settings.startup_timeout_s),
+                deadline_seconds: session.settings.startup_timeout_s,
             },
         ) {
             send_error(
@@ -321,30 +325,48 @@ fn drain_bulk_events(session: &mut Session, unmanaged: bool) -> Result<Option<Ex
     }
 }
 
+pub(super) enum Received {
+    Frame(Vec<u8>),
+    Closed,
+    TimedOut,
+}
+
 pub(super) fn receive_godot_frame(
     events: &Receiver<ProxyEvent>,
     godot: &mut FrameState,
     deferred: &mut DeferredQueue,
-) -> Result<Option<Vec<u8>>> {
+    deadline: Option<Instant>,
+) -> Result<Received> {
     if let Some(body) = godot.frames.pop_front() {
-        return Ok(Some(body));
+        return Ok(Received::Frame(body));
     }
     if godot.eof {
-        return Ok(None);
+        return Ok(Received::Closed);
     }
     loop {
-        let event = events
-            .recv()
-            .map_err(|_| io::Error::other("event channel is closed"))?;
+        let event = match deadline {
+            Some(deadline) => {
+                match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Received::TimedOut),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::other("event channel is closed").into())
+                    }
+                }
+            }
+            None => events
+                .recv()
+                .map_err(|_| io::Error::other("event channel is closed"))?,
+        };
         match event {
             ProxyEvent::Client(event) => deferred.push_back(ProxyEvent::Client(event))?,
             ProxyEvent::Godot(event) => {
                 godot.feed(event)?;
                 if let Some(body) = godot.frames.pop_front() {
-                    return Ok(Some(body));
+                    return Ok(Received::Frame(body));
                 }
                 if godot.eof {
-                    return Ok(None);
+                    return Ok(Received::Closed);
                 }
             }
             event => deferred.push_back(event)?,
@@ -375,8 +397,15 @@ where
     initialize["id"] = crate::json!(bridge_id);
     send_godot(&mut editor.connection.writer, &initialize, true)?;
     loop {
-        let frame = receive_godot_frame(input.events, input.godot, input.deferred)?
-            .ok_or_else(|| crate::error::Error::new("Godot closed during initialize"))?;
+        let frame =
+            match receive_godot_frame(input.events, input.godot, input.deferred, input.deadline)? {
+                Received::Frame(frame) => frame,
+                Received::Closed => crate::bail!("Godot closed during initialize"),
+                Received::TimedOut => crate::bail!(
+                    "Godot did not answer initialize within {}s",
+                    input.deadline_seconds
+                ),
+            };
         let message = parse_message(&frame)?;
         if message.get("method").and_then(Value::as_str) == Some("gdscript_client/changeWorkspace")
         {
@@ -511,9 +540,15 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
             return exit_session(session, 1);
         }
     };
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match receive_godot_frame(&session.events, &mut session.godot, &mut session.deferred)? {
-            Some(body) => {
+        match receive_godot_frame(
+            &session.events,
+            &mut session.godot,
+            &mut session.deferred,
+            Some(deadline),
+        )? {
+            Received::Frame(body) => {
                 let is_response = parse_message(&body)
                     .ok()
                     .and_then(|message| message.get("id").and_then(Value::as_i64))
@@ -530,7 +565,7 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
                     return exit_session(session, 0);
                 }
             }
-            None => return exit_session(session, 1),
+            Received::Closed | Received::TimedOut => return exit_session(session, 1),
         }
     }
 }
@@ -576,4 +611,36 @@ pub(super) fn forward_initialize(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn receive_godot_frame_times_out_when_godot_does_not_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let godot = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let (sender, events) = mpsc::sync_channel(1);
+        let reader =
+            spawn_frame_reader("test-godot-reader", stream, sender, ProxyEvent::Godot).unwrap();
+        let mut frame_state = FrameState::new(GODOT_FRAME_CAP);
+        let mut deferred = DeferredQueue::default();
+        let received = receive_godot_frame(
+            &events,
+            &mut frame_state,
+            &mut deferred,
+            Some(Instant::now() + Duration::from_millis(10)),
+        )
+        .unwrap();
+        assert!(matches!(received, Received::TimedOut));
+        godot.join().unwrap();
+        reader.join().unwrap();
+    }
 }

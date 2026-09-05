@@ -139,6 +139,8 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
         &session.events,
         &mut session.godot,
         &mut session.deferred,
+        startup_deadline(session.settings.startup_timeout_s),
+        session.settings.startup_timeout_s,
     )?;
     session.editor = replacement;
     finish_recovery(session, &mut RecoveryQueue::default())?;
@@ -297,6 +299,8 @@ pub(super) fn replay_initialize(
     events: &Receiver<ProxyEvent>,
     godot: &mut FrameState,
     deferred: &mut DeferredQueue,
+    deadline: Option<Instant>,
+    deadline_seconds: u32,
 ) -> Result<()> {
     let id = proxy.next_id;
     proxy.pending.insert(
@@ -317,6 +321,8 @@ pub(super) fn replay_initialize(
             events,
             godot,
             deferred,
+            deadline,
+            deadline_seconds,
         },
         &mut context,
         move |editor, proxy, _, _, _| {

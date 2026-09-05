@@ -12,4 +12,8 @@ brackets = [
 ]
 hard_tabs = true
 increase_indent_pattern = ":\\s*$"
+decrease_indent_patterns = [
+    { pattern = "^\\s*else\\b.*:", valid_after = ["if", "elif", "for", "while"] },
+    { pattern = "^\\s*elif\\b.*:", valid_after = ["if", "elif"] },
+]
 debuggers = ["godot"]

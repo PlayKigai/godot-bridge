@@ -38,7 +38,6 @@
 
 (function_declaration name: (_) @function)
 (call_expr function: (_) @function)
-(member_expr member: (_) @function.method)
 (member_expr member: (_) @property)
 (uniform_declaration specifier: (var_specifier name: (_) @property))
 (struct_member name: (_) @property)

@@ -1,5 +1,7 @@
-; The pinned grammar hides its external indent tokens, so block boundaries mark the end.
 (body) @indent
 (class_body) @indent
-(body) @end
-(class_body) @end
+
+(if_statement "if" @start.if)
+(elif_clause "elif" @start.elif)
+(for_statement "for" @start.for)
+(while_statement "while" @start.while)

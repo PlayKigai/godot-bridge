@@ -46,6 +46,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let allowed: &[&str] = match subcommand.as_str() {
         "dap" | "project-dir" | "open-editor" => &["--file"],
         "run" => &["--file", "--scene"],
+        "doc" => &["<symbol>"],
         _ => &[],
     };
     let options = collect_options(&mut arguments, allowed)?;
@@ -90,10 +91,11 @@ fn collect_options(
             _ if argument.starts_with('-') => {
                 return Err(format!("unexpected argument {argument:?}"));
             }
-            _ => {
+            _ if allowed.contains(&"<symbol>") => {
                 options.positional = Some(argument);
                 break;
             }
+            _ => return Err(format!("unexpected argument {argument:?}")),
         };
         *target = Some(match inline_value {
             Some(value) => value,

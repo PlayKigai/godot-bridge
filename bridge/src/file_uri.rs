@@ -89,12 +89,12 @@ mod tests {
     const CAPTURED: [(&str, &str); 10] = [
         ("/", "file:///"),
         (
-            "/home/dig/projects/zed-godot",
-            "file:///home/dig/projects/zed-godot",
+            "/home/user/projects/zed-godot",
+            "file:///home/user/projects/zed-godot",
         ),
         (
-            "/home/dig/my project/main.gd",
-            "file:///home/dig/my%20project/main.gd",
+            "/home/user/my project/main.gd",
+            "file:///home/user/my%20project/main.gd",
         ),
         (
             "/tmp/scène/héllo wörld.gd",

@@ -430,7 +430,11 @@ mod tests {
             };
             let (reference, first_checksum) = benchmark(false);
             let (optimized, second_checksum) = benchmark(true);
-            println!("proxy {name}: reference={reference} ns/frame optimized={optimized} ns/frame");
+            if std::env::var_os("GODOT_BRIDGE_BENCH").is_some() {
+                println!(
+                    "proxy {name}: reference={reference} ns/frame optimized={optimized} ns/frame"
+                );
+            }
             assert_ne!(first_checksum, 0);
             assert_eq!(first_checksum, second_checksum);
         }

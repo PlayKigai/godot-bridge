@@ -284,21 +284,38 @@ pub fn kill_group(mut child: GodotChild) -> io::Result<()> {
         return Ok(());
     }
     let deadline = Instant::now() + GROUP_WAIT;
-    while child.child.try_wait()?.is_none() {
+    while !leader_exited_unreaped(child.pid)? {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             break;
         };
         thread::sleep(remaining.min(Duration::from_millis(50)));
     }
-    if child.child.try_wait()?.is_none() {
-        if signal_group(child.pid, child.pgid, child.start_ticks, libc::SIGKILL)? {
-            child.child.wait()?;
-        } else {
-            let _ = child.child.wait();
+    // The unreaped leader pins the pgid, so -pgid cannot name a foreign group here.
+    if unsafe { libc::kill(-child.pgid, libc::SIGKILL) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
         }
     }
+    let _ = child.child.wait();
     child.wait_output();
     Ok(())
+}
+
+fn leader_exited_unreaped(pid: u32) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
@@ -579,15 +596,29 @@ mod tests {
 
     #[test]
     fn group_kill_terminates_grandchild() {
+        assert_group_kill_reaches_grandchild(
+            "/bin/sleep 300 & printf '%s\\n' \"$!\" >&2; wait",
+            41004,
+        );
+    }
+
+    #[test]
+    fn group_kill_reaches_grandchild_after_leader_exits() {
+        assert_group_kill_reaches_grandchild(
+            "/bin/sh -c 'trap \"\" TERM; sleep 300' & printf '%s\\n' \"$!\" >&2; trap 'exit 0' TERM; wait",
+            41006,
+        );
+    }
+
+    fn assert_group_kill_reaches_grandchild(script: &str, port: u16) {
         let directory = TempDir::new().expect("temporary directory");
-        let script = "/bin/sleep 30 & printf '%s\\n' \"$!\" >&2; wait";
         let args = vec!["-c".to_owned(), script.to_owned()];
         let child = spawn_godot(
             Path::new("/bin/sh"),
             &args,
             directory.path(),
-            41004,
-            41005,
+            port,
+            port + 1,
             directory.path().join("godot.log"),
         )
         .expect("shell should spawn");
@@ -604,11 +635,8 @@ mod tests {
         };
 
         kill_group(child).expect("group should be killed");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if !Path::new(&format!("/proc/{grandchild_pid}")).exists() {
-                break;
-            }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Path::new(&format!("/proc/{grandchild_pid}")).exists() {
             assert!(Instant::now() < deadline, "grandchild should exit");
             thread::sleep(Duration::from_millis(10));
         }

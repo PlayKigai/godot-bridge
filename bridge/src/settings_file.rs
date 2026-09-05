@@ -157,18 +157,16 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
 }
 
 pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
-    load_zed_settings_with(worktree, &user_settings_path())
+    load_zed_settings_with(worktree, user_settings_path().as_deref())
 }
 
-fn load_zed_settings_with(worktree: &Path, user_path: &Path) -> Result<Settings, String> {
+fn load_zed_settings_with(worktree: &Path, user_path: Option<&Path>) -> Result<Settings, String> {
     let project_path = worktree.join(".zed").join("settings.json");
 
-    let user_section = read_settings_section(user_path)?;
     let project_section = read_settings_section(&project_path)?;
 
     let mut merged = Map::new();
-    if let Some(section) = user_section {
-        validate_section(user_path, &section)?;
+    if let Some(section) = read_user_section(user_path)? {
         merged.extend(section);
     }
     if let Some(mut section) = project_section {
@@ -186,11 +184,7 @@ pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings
         None if value.is_null() => &empty,
         None => return parse_settings(value),
     };
-    let user_path = user_settings_path();
-    let user_section = read_settings_section(&user_path)?;
-    if let Some(section) = &user_section {
-        validate_section(&user_path, section)?;
-    }
+    let user_section = read_user_section(user_settings_path().as_deref())?;
 
     let project_path = worktree.join(".zed").join("settings.json");
     if let Some(project_section) = read_settings_section(&project_path)? {
@@ -239,7 +233,14 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
 fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -285,15 +286,23 @@ fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     Ok(Some(object.clone()))
 }
 
-fn user_settings_path() -> PathBuf {
+fn read_user_section(path: Option<&Path>) -> Result<Option<Map>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let section = read_settings_section(path)?;
+    if let Some(section) = &section {
+        validate_section(path, section)?;
+    }
+    Ok(section)
+}
+
+fn user_settings_path() -> Option<PathBuf> {
     let config = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::var_os("HOME").map_or_else(
-            || PathBuf::from(".config"),
-            |home| PathBuf::from(home).join(".config"),
-        ),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
-    config.join("zed").join("settings.json")
+    Some(config.join("zed").join("settings.json"))
 }
 
 #[cfg(test)]
@@ -316,6 +325,14 @@ mod tests {
         let dir = worktree.join(".zed");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("settings.json"), contents).unwrap();
+    }
+
+    #[test]
+    fn single_file_worktree_has_no_project_settings() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("main.gd");
+        fs::write(&file, "").unwrap();
+        assert!(load_zed_settings_with(&file, None).is_ok());
     }
 
     #[test]
@@ -387,9 +404,11 @@ mod tests {
                 }
             }"#,
         );
-        let settings =
-            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
-                .unwrap();
+        let settings = load_zed_settings_with(
+            worktree.path(),
+            Some(&user_settings_path_in(config_dir.path())),
+        )
+        .unwrap();
         assert_eq!(settings.godot_path.as_deref(), Some("/bin/sh"));
         assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
         assert_eq!(settings.lsp_port, None);
@@ -408,9 +427,11 @@ mod tests {
             worktree.path(),
             r#"{"lsp":{"godot":{"settings":{"godot_path":"/bin/true","godot_path":"/bin/sh"}}}}"#,
         );
-        let settings =
-            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
-                .unwrap();
+        let settings = load_zed_settings_with(
+            worktree.path(),
+            Some(&user_settings_path_in(config_dir.path())),
+        )
+        .unwrap();
         assert_eq!(settings.godot_path, None);
     }
 
@@ -432,9 +453,11 @@ mod tests {
                 },
             }"#,
         );
-        let settings =
-            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
-                .unwrap();
+        let settings = load_zed_settings_with(
+            worktree.path(),
+            Some(&user_settings_path_in(config_dir.path())),
+        )
+        .unwrap();
         assert_eq!(settings.godot_path, None);
         assert!(settings.extra_args.is_empty());
     }
@@ -447,9 +470,11 @@ mod tests {
             worktree.path(),
             r#"{"lsp": {"godot": {"settings": {"dap_port": "bad"}}}}"#,
         );
-        let error =
-            load_zed_settings_with(worktree.path(), &user_settings_path_in(config_dir.path()))
-                .unwrap_err();
+        let error = load_zed_settings_with(
+            worktree.path(),
+            Some(&user_settings_path_in(config_dir.path())),
+        )
+        .unwrap_err();
         assert!(error.contains(".zed/settings.json"), "{error}");
         assert!(error.contains("dap_port"), "{error}");
     }

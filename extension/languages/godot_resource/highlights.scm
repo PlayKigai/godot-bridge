@@ -10,11 +10,9 @@
 
 (property (path) @property)
 (attribute (identifier) @property)
-(section (identifier) @type)
 (section (identifier) @keyword)
 (constructor (identifier) @function)
 (property (identifier) @variable)
-(attribute (identifier) @variable)
 
 "=" @operator
 ["(" ")" "[" "]"] @punctuation.bracket

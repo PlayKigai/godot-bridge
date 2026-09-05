@@ -31,7 +31,7 @@ pub fn doc_url(symbol: &str) -> crate::error::Result<String> {
     } else {
         Ok(format!(
             "{DOC_BASE}class_{class}.html#class-{class}-method-{}",
-            member.to_ascii_lowercase()
+            member.to_ascii_lowercase().replace('_', "-")
         ))
     }
 }
@@ -60,7 +60,7 @@ mod tests {
     fn builds_member_anchor() {
         assert_eq!(
             doc_url("Node2D.get_position").unwrap(),
-            "https://docs.godotengine.org/en/stable/classes/class_node2d.html#class-node2d-method-get_position"
+            "https://docs.godotengine.org/en/stable/classes/class_node2d.html#class-node2d-method-get-position"
                 .to_owned()
         );
     }

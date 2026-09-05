@@ -414,7 +414,7 @@ fn reconnect_gui(
             set_owner_identity(&mut state);
             Ok(GuiReconnect::Ready {
                 state,
-                connection: connection_from_stream(stream, event_sender.clone()),
+                connection: connection_from_stream(stream, event_sender.clone())?,
             })
         }
         DetachedPorts::Dead => {
@@ -568,7 +568,7 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
                 Ok(())
             })? {
                 DetachedPorts::Ready(stream) => {
-                    connection_from_stream(stream, session.proxy.internal_sender.clone())
+                    connection_from_stream(stream, session.proxy.internal_sender.clone())?
                 }
                 DetachedPorts::Dead => crate::bail!("GUI editor exited during handoff"),
                 DetachedPorts::Deadline => {
@@ -587,6 +587,8 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
             &session.events,
             &mut session.godot,
             &mut session.deferred,
+            startup_deadline(session.settings.startup_timeout_s),
+            session.settings.startup_timeout_s,
         )?;
         session.editor = replacement;
         finish_recovery(session, &mut recovery_queue)
@@ -710,7 +712,7 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-        let connection = connection_from_stream(stream, event_sender.clone());
+        let connection = connection_from_stream(stream, event_sender.clone())?;
         let session = Session {
             events: event_receiver,
             bulk_events: bulk_receiver,
@@ -802,6 +804,8 @@ pub fn run() -> Result<ExitCode> {
                                 events: &event_receiver,
                                 godot: &mut godot,
                                 deferred: &mut deferred,
+                                deadline: startup_deadline(settings.startup_timeout_s),
+                                deadline_seconds: settings.startup_timeout_s,
                             },
                         ) {
                             drop(editor);
@@ -892,6 +896,8 @@ pub fn run() -> Result<ExitCode> {
                         events: &event_receiver,
                         godot: &mut godot,
                         deferred: &mut deferred,
+                        deadline,
+                        deadline_seconds: settings.startup_timeout_s,
                     },
                 ) {
                     Ok(()) => {
@@ -1344,7 +1350,9 @@ fn rewrite_document_messages(
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let (action_uri, version) = proxy.documents.zed_open(&uri, &key, planned);
+            let Some((action_uri, version)) = proxy.documents.zed_open(&uri, &key, planned) else {
+                return Ok(Vec::new());
+            };
             schedule_document(proxy, &action_uri, version);
             return Ok(vec![body]);
         }

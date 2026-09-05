@@ -4,7 +4,7 @@ version = "0.1.0"
 schema_version = 1
 authors = ["Godot Zed contributors"]
 description = "Godot language support for Zed."
-repository = "https://github.com/example/zed-godot"
+repository = "https://github.com/PlayKigai/zed-godot"
 
 [grammars.gdscript]
 repository = "https://github.com/PrestonKnopp/tree-sitter-gdscript"
@@ -19,7 +19,6 @@ repository = "https://github.com/GodOfAvacyn/tree-sitter-gdshader"
 commit = "14e834063e136fa69b6d91f711f4f1981acf424b"
 
 [language_servers.godot]
-name = "godot-bridge"
 languages = ["GDScript"]
 
 [debug_adapters.godot]

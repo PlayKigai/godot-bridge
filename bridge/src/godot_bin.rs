@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_BINARY: &str =
     "No Godot binary. Set lsp.godot.settings.godot_path, or GODOT, or put godot on PATH.";
-const FORBIDDEN_ARGS: [&str; 10] = [
+const FORBIDDEN_ARGS: [&str; 16] = [
     "--path",
     "--editor",
     "-e",
@@ -16,6 +16,12 @@ const FORBIDDEN_ARGS: [&str; 10] = [
     "--audio-driver",
     "--quit",
     "--quit-after",
+    "--script",
+    "-s",
+    "--main-pack",
+    "--export-release",
+    "--export-debug",
+    "--export-pack",
 ];
 
 pub fn resolve_godot(configured: Option<&Path>) -> Result<PathBuf, String> {
@@ -27,7 +33,9 @@ pub fn resolve_godot(configured: Option<&Path>) -> Result<PathBuf, String> {
     }
     if let Some(godot) = std::env::var_os("GODOT") {
         if !godot.is_empty() {
-            return Ok(PathBuf::from(godot));
+            let path = PathBuf::from(godot);
+            validate_godot_path(&path)?;
+            return Ok(path);
         }
     }
     for name in ["godot4", "godot"] {
@@ -282,6 +290,51 @@ mod tests {
             let args = [format!("{flag}=value")];
             let error = validate_extra_args(&args).unwrap_err();
             assert!(error.contains(flag), "{error}");
+        }
+    }
+
+    #[test]
+    fn godot_env_must_be_absolute_executable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = crate::temp::TempDir::new().unwrap();
+        let old_godot = env::var_os("GODOT");
+        let old_path = env::var_os("PATH");
+
+        let missing = dir.path().join("missing");
+        env::set_var("GODOT", &missing);
+        assert!(resolve_godot(None).is_err());
+
+        env::set_var("GODOT", "relative/godot");
+        assert!(resolve_godot(None).is_err());
+
+        env::set_var("PATH", dir.path());
+        env::remove_var("GODOT");
+        assert_eq!(resolve_godot(None).unwrap_err(), NO_BINARY);
+
+        match old_path {
+            Some(value) => env::set_var("PATH", value),
+            None => env::remove_var("PATH"),
+        }
+        match old_godot {
+            Some(value) => env::set_var("GODOT", value),
+            None => env::remove_var("GODOT"),
+        }
+    }
+
+    #[test]
+    fn extra_args_rejects_script_and_export() {
+        for arg in [
+            "--script",
+            "--script=evil.gd",
+            "-s",
+            "--main-pack",
+            "--main-pack=game.pck",
+            "--export-release",
+            "--export-debug",
+            "--export-pack=out.zip",
+        ] {
+            let args = [arg.to_string()];
+            assert!(validate_extra_args(&args).is_err(), "{arg}");
         }
     }
 }
