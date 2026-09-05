@@ -450,7 +450,10 @@ fn wait_for_detached_ports(
         let lsp_address = SocketAddr::from(([127, 0, 0, 1], lsp_port));
         let dap_address = SocketAddr::from(([127, 0, 0, 1], dap_port));
         if let Ok(lsp) = TcpStream::connect_timeout(&lsp_address, Duration::from_millis(50)) {
-            if TcpStream::connect_timeout(&dap_address, Duration::from_millis(50)).is_ok() {
+            if TcpStream::connect_timeout(&dap_address, Duration::from_millis(50)).is_ok()
+                && port_listener_belongs_to_process(pid, lsp_port)?
+                && port_listener_belongs_to_process(pid, dap_port)?
+            {
                 return Ok(DetachedPorts::Ready(lsp));
             }
         }

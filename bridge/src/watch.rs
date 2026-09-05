@@ -237,28 +237,33 @@ impl WatcherState {
                 name_bytes[..end].to_vec(),
             )))
         };
-        if event.mask & libc::IN_DELETE_SELF != 0 {
+        if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
             self.watch_paths.remove(&event.wd);
+            return true;
+        }
+        if event.mask & libc::IN_ISDIR != 0 {
+            if event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
+                && !directory_is_skipped(&path, &self.project, self.diagnose_addons)
+            {
+                if let Err(error) = self.watch_directory(&path) {
+                    crate::warn!(
+                        "skipping unreadable diagnostics watch directory {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            if event.mask
+                & (libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_MOVED_FROM)
+                == 0
+            {
+                return true;
+            }
             return sender
                 .send(ProxyEvent::Watcher(Ok(WatcherChange {
-                    kind: WatcherChangeKind::Removed,
-                    path,
+                    kind: WatcherChangeKind::Rescan,
+                    path: self.project.clone(),
                 })))
                 .is_ok();
-        }
-        if event.mask & libc::IN_MOVE_SELF != 0 {
-            self.watch_paths.remove(&event.wd);
-        }
-        if event.mask & libc::IN_ISDIR != 0
-            && event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
-            && !directory_is_skipped(&path, &self.project, self.diagnose_addons)
-        {
-            if let Err(error) = self.watch_directory(&path) {
-                crate::warn!(
-                    "skipping unreadable diagnostics watch directory {}: {error}",
-                    path.display()
-                );
-            }
         }
         let kind = if event.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
             WatcherChangeKind::Removed
@@ -386,8 +391,7 @@ mod tests {
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
         loop {
-            let change = receive_change(&receiver);
-            if change.kind == WatcherChangeKind::Created && change.path == nested {
+            if receive_change(&receiver).kind == WatcherChangeKind::Rescan {
                 break;
             }
         }
@@ -396,6 +400,38 @@ mod tests {
         loop {
             let change = receive_change(&receiver);
             if change.kind == WatcherChangeKind::Created && change.path == path {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn moved_directories_trigger_rescan() {
+        let outside = TempDir::new().unwrap();
+        let directory = TempDir::new().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4096);
+        let _watcher = watch_project_into(directory.path(), false, sender).unwrap();
+        let source = outside.path().join("scripts");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a.gd"), "one").unwrap();
+        let moved = directory.path().join("scripts");
+        fs::rename(&source, &moved).unwrap();
+        loop {
+            let change = receive_change(&receiver);
+            if change.kind == WatcherChangeKind::Rescan {
+                break;
+            }
+        }
+        fs::write(moved.join("b.gd"), "two").unwrap();
+        loop {
+            let change = receive_change(&receiver);
+            if change.kind == WatcherChangeKind::Created && change.path == moved.join("b.gd") {
+                break;
+            }
+        }
+        fs::rename(&moved, outside.path().join("gone")).unwrap();
+        loop {
+            if receive_change(&receiver).kind == WatcherChangeKind::Rescan {
                 break;
             }
         }

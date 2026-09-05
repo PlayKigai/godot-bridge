@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::godot_bin::{check_version, resolve_godot};
-use crate::process::{kill_recorded, pick_free_port, spawn_gui};
+use crate::process::{kill_recorded, pick_free_port, port_listener_belongs_to_process, spawn_gui};
 use crate::root::{cwd_root, find_project_dir};
 use crate::settings_file::{load_zed_settings, Settings};
 use crate::state::{
@@ -186,6 +186,8 @@ fn wait_for_ports(
         let dap = SocketAddr::from(([127, 0, 0, 1], dap_port));
         if TcpStream::connect_timeout(&lsp, POLL_INTERVAL).is_ok()
             && TcpStream::connect_timeout(&dap, POLL_INTERVAL).is_ok()
+            && matches!(port_listener_belongs_to_process(pid, lsp_port), Ok(true))
+            && matches!(port_listener_belongs_to_process(pid, dap_port), Ok(true))
         {
             return PortReadiness::Ready;
         }
