@@ -10,9 +10,9 @@ pub struct Symbol {
     pub range: Value,
 }
 
-#[derive(Clone, Debug)]
-struct Match {
-    symbol: Symbol,
+#[derive(Debug)]
+struct Match<'a> {
+    symbol: &'a Symbol,
     gap: usize,
     offset: usize,
     indices: Vec<usize>,
@@ -105,7 +105,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
         .filter_map(|symbol| {
             let matched = best_match(&symbol.folded_name, &query)?;
             Some(Match {
-                symbol: symbol.clone(),
+                symbol,
                 gap: matched.0,
                 offset: matched.1,
                 indices: matched.2,
@@ -124,7 +124,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
     matches
         .into_iter()
         .take(200)
-        .map(|matched| matched.symbol)
+        .map(|matched| matched.symbol.clone())
         .collect()
 }
 
