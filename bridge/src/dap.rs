@@ -461,7 +461,7 @@ fn run_session_inner(
                 .reader
                 .as_mut()
                 .ok_or_else(|| crate::error::Error::new("reader is closed"))?
-                .try_with_next_frame(|body| parse_message(body))?;
+                .try_with_next_frame(parse_message)?;
             match event {
                 FramePoll::Frame(Ok(mut message)) => {
                     processed = true;
@@ -553,7 +553,7 @@ fn wait_for_initialize(
                 .reader
                 .as_mut()
                 .ok_or_else(|| crate::error::Error::new("reader is closed"))?
-                .try_with_next_frame(|body| parse_message(body))?;
+                .try_with_next_frame(parse_message)?;
             match event {
                 FramePoll::Frame(Ok(mut message)) => {
                     processed = true;

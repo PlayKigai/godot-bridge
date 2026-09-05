@@ -797,14 +797,16 @@ fn forward_client_body(
             || method.string_eq("textDocument/didClose")
             || method.string_eq("$/cancelRequest")
     });
-    if fields.id.is_some() && fields.method.is_none() {
-        let id = fields.id.expect("checked above").request_key();
-        if proxy.server_requests.remove(&id) {
-            send_godot_body(&mut editor.connection.writer, body, false)?;
-        } else if proxy.stale_server_ids.remove(&id) {
-            crate::debug!("dropping response to stale Godot request {id:?}");
+    if fields.method.is_none() {
+        if let Some(raw_id) = fields.id {
+            let id = raw_id.request_key();
+            if proxy.server_requests.remove(&id) {
+                send_godot_body(&mut editor.connection.writer, body, false)?;
+            } else if proxy.stale_server_ids.remove(&id) {
+                crate::debug!("dropping response to stale Godot request {id:?}");
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     if fields.id.is_some() || intercepted {
         return forward_client_message(editor, output, proxy, settings, parse_message(body)?);
