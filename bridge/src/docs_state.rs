@@ -10,7 +10,7 @@ use crate::root::{canonical_or_normalized, doc_key, path_to_uri};
 pub use crate::root::normalize_absolute as normalize_path;
 
 pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
-pub const BULK_DOCUMENTS: usize = 20;
+pub const BULK_DOCUMENTS: usize = 100;
 pub const BULK_INTERVAL_MS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

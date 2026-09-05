@@ -77,6 +77,10 @@ struct ProxyState {
     symbol_cache: HashMap<String, Vec<Symbol>>,
     symbol_scheduled: HashMap<String, (u64, i64, Instant)>,
     bulk_generation: u64,
+    bulk_documents: VecDeque<docs_state::ScannedDocument>,
+    bulk_batch_uris: HashSet<String>,
+    bulk_complete: bool,
+    bulk_deadline: Option<Instant>,
 }
 
 enum InternalEvent {
@@ -85,6 +89,7 @@ enum InternalEvent {
         generation: u64,
         document: docs_state::ScannedDocument,
     },
+    BulkComplete { generation: u64 },
 }
 
 struct Connection {
@@ -534,6 +539,10 @@ pub fn run() -> Result<ExitCode> {
         symbol_cache: HashMap::new(),
         symbol_scheduled: HashMap::new(),
         bulk_generation: 0,
+        bulk_documents: VecDeque::new(),
+        bulk_batch_uris: HashSet::new(),
+        bulk_complete: false,
+        bulk_deadline: None,
     };
 
     if let Some(lsp_port) = settings.lsp_port {
@@ -966,6 +975,18 @@ fn forward_server_message(
             }
             return Ok(());
         }
+        if method == "textDocument/publishDiagnostics" && message.get("id").is_none() {
+            let uri = message
+                .get("params")
+                .and_then(|params| params.get("uri"))
+                .and_then(Value::as_str);
+            if uri.is_some_and(|uri| proxy.bulk_batch_uris.remove(uri))
+                && proxy.bulk_batch_uris.is_empty()
+            {
+                proxy.bulk_deadline = None;
+                pump_bulk_documents(proxy, editor)?;
+            }
+        }
         if let Some(id) = message.get("id") {
             proxy.server_requests.insert(id.to_string());
         }
@@ -1180,6 +1201,10 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
     proxy.project_diagnostics_started = true;
     proxy.bulk_generation += 1;
     let generation = proxy.bulk_generation;
+    proxy.bulk_documents.clear();
+    proxy.bulk_batch_uris.clear();
+    proxy.bulk_complete = false;
+    proxy.bulk_deadline = None;
     let project = proxy.project.clone();
     let diagnose_addons = settings.diagnose_addons;
     let sender = proxy.internal_sender.clone();
@@ -1188,7 +1213,6 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
         .stack_size(256 * 1024)
         .spawn(move || {
             let documents = docs_state::scan_project(&project, diagnose_addons);
-            let mut opened = 0;
             for document in documents {
                 if sender
                     .send(InternalEvent::Bulk {
@@ -1199,11 +1223,8 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
                 {
                     return;
                 }
-                opened += 1;
-                if opened % BULK_DOCUMENTS == 0 {
-                    thread::sleep(Duration::from_millis(BULK_INTERVAL_MS));
-                }
             }
+            let _ = sender.send(InternalEvent::BulkComplete { generation });
         });
 }
 
@@ -1211,24 +1232,61 @@ fn process_bulk_document(
     proxy: &mut ProxyState,
     editor: &mut Editor,
     document: docs_state::ScannedDocument,
-) -> Result<()> {
+) -> Result<Option<String>> {
     proxy
         .documents
         .register_watcher_path(&document.path, document.key.clone());
     if proxy.documents.open_docs.contains_key(&document.key) {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(action) = proxy
         .documents
         .bridge_open_path(&document.path, document.text)
     {
+        let uri = match &action {
+            DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
+        };
         send_godot(
             &mut editor.connection.writer,
             &document_action_message(action),
             false,
         )?;
+        return Ok(Some(uri));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn bulk_can_advance(proxy: &ProxyState, now: Instant) -> bool {
+    proxy.bulk_batch_uris.is_empty()
+        || proxy.pending.len() < IN_FLIGHT_CAP
+        || proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
+}
+
+fn pump_bulk_documents(proxy: &mut ProxyState, editor: &mut Editor) -> Result<()> {
+    loop {
+        if !bulk_can_advance(proxy, Instant::now()) {
+            return Ok(());
+        }
+        proxy.bulk_batch_uris.clear();
+        proxy.bulk_deadline = None;
+        let mut sent = 0;
+        while sent < BULK_DOCUMENTS {
+            let Some(document) = proxy.bulk_documents.pop_front() else {
+                break;
+            };
+            if let Some(uri) = process_bulk_document(proxy, editor, document)? {
+                proxy.bulk_batch_uris.insert(uri);
+            }
+            sent += 1;
+        }
+        if !proxy.bulk_batch_uris.is_empty() {
+            proxy.bulk_deadline = Some(Instant::now() + Duration::from_millis(BULK_INTERVAL_MS));
+            return Ok(());
+        }
+        if proxy.bulk_documents.is_empty() {
+            return Ok(());
+        }
+    }
 }
 
 fn process_watcher_changes(
@@ -1572,6 +1630,10 @@ mod tests {
             symbol_cache: HashMap::new(),
             symbol_scheduled: HashMap::new(),
             bulk_generation: 0,
+            bulk_documents: VecDeque::new(),
+            bulk_batch_uris: HashSet::new(),
+            bulk_complete: false,
+            bulk_deadline: None,
         };
         let message = crate::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/a.gd","version":42,"text":"x"}}});
         let rewritten =

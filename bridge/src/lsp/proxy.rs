@@ -54,6 +54,22 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                 recover(&mut session, &error.to_string(), true)?;
             }
         }
+        if (!session.proxy.bulk_documents.is_empty()
+            && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS
+                || session.proxy.bulk_complete))
+            && (session.proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
+                || session.proxy.pending.len() < IN_FLIGHT_CAP)
+        {
+            if let Err(error) = pump_bulk_documents(
+                &mut session.proxy,
+                &mut session.editor,
+            ) {
+                if unmanaged {
+                    return exit_session(&mut session, 1);
+                }
+                recover(&mut session, &error.to_string(), true)?;
+            }
+        }
         if session
             .watch
             .deadline
@@ -195,18 +211,34 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                 generation,
                                 document,
                             } if generation == session.proxy.bulk_generation => {
-                                if let Err(error) = process_bulk_document(
-                                    &mut session.proxy,
-                                    &mut session.editor,
-                                    document,
-                                ) {
-                                    if unmanaged {
-                                        return exit_session(&mut session, 1);
+                                session.proxy.bulk_documents.push_back(document);
+                                if session.proxy.bulk_documents.len() >= BULK_DOCUMENTS {
+                                    if let Err(error) = pump_bulk_documents(
+                                        &mut session.proxy,
+                                        &mut session.editor,
+                                    ) {
+                                        if unmanaged {
+                                            return exit_session(&mut session, 1);
+                                        }
+                                        recover(&mut session, &error.to_string(), true)?;
                                     }
-                                    recover(&mut session, &error.to_string(), true)?;
                                 }
                             }
+                            InternalEvent::BulkComplete { generation }
+                                if generation == session.proxy.bulk_generation => {
+                                    session.proxy.bulk_complete = true;
+                                    if let Err(error) = pump_bulk_documents(
+                                        &mut session.proxy,
+                                        &mut session.editor,
+                                    ) {
+                                        if unmanaged {
+                                            return exit_session(&mut session, 1);
+                                        }
+                                        recover(&mut session, &error.to_string(), true)?;
+                                    }
+                                }
                             InternalEvent::Bulk { .. } => {}
+                            InternalEvent::BulkComplete { .. } => {}
                         }
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
