@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Write};
 use std::ops::{Index, IndexMut};
 use std::str;
 
@@ -56,11 +57,6 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Number {
-    fn new(value: impl Into<String>) -> Self {
-        let value = value.into();
-        Self::from_bytes(value.as_bytes())
-    }
-
     fn from_bytes(value: &[u8]) -> Self {
         if value.len() <= 24 {
             let mut bytes = [0; 24];
@@ -74,6 +70,16 @@ impl Number {
                 String::from_utf8(value.to_vec()).expect("number syntax is ASCII"),
             ))
         }
+    }
+
+    fn from_integer(value: impl fmt::Display) -> Self {
+        let mut bytes = [0; 24];
+        let len = {
+            let mut writer = io::Cursor::new(&mut bytes[..]);
+            write!(writer, "{value}").expect("integer fits in number buffer");
+            writer.position() as usize
+        };
+        Self::from_bytes(&bytes[..len])
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -352,7 +358,7 @@ macro_rules! integer_value {
         $(
             impl From<$type> for Value {
                 fn from(value: $type) -> Self {
-                    Self::Number(Number::new(value.to_string()))
+                    Self::Number(Number::from_integer(value))
                 }
             }
         )*
@@ -610,7 +616,7 @@ fn write_value(value: &Value, output: &mut Vec<u8>) {
     }
 }
 
-fn write_string(string: &str, output: &mut Vec<u8>) {
+pub(crate) fn write_string(string: &str, output: &mut Vec<u8>) {
     output.push(b'"');
     let mut run_start = 0;
     for (index, character) in string.char_indices() {

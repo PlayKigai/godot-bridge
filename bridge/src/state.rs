@@ -182,46 +182,31 @@ pub enum Mode {
 
 impl State {
     pub fn to_value(&self) -> Value {
-        let mut object = Map::new();
-        object.insert("version".to_owned(), self.version.into());
-        object.insert("project".to_owned(), self.project.clone().into());
-        object.insert(
-            "status".to_owned(),
-            match self.status {
-                Status::Starting => "starting",
-                Status::Ready => "ready",
-                Status::Recovering => "recovering",
-            }
-            .into(),
-        );
-        object.insert(
-            "mode".to_owned(),
-            match self.mode {
-                Mode::Headless => "headless",
-                Mode::Gui => "gui",
-                Mode::Unmanaged => "unmanaged",
-            }
-            .into(),
-        );
-        object.insert("godot_pid".to_owned(), self.godot_pid.into());
-        object.insert("godot_pgid".to_owned(), self.godot_pgid.into());
-        object.insert("lsp_port".to_owned(), self.lsp_port.into());
-        object.insert("dap_port".to_owned(), self.dap_port.into());
-        object.insert("owner_pid".to_owned(), self.owner_pid.into());
-        object.insert(
-            "owner_start_ticks".to_owned(),
-            self.owner_start_ticks.into(),
-        );
-        object.insert(
-            "godot_start_ticks".to_owned(),
-            self.godot_start_ticks.into(),
-        );
-        object.insert("started_at".to_owned(), self.started_at.clone().into());
-        object.insert(
-            "bridge_version".to_owned(),
-            self.bridge_version.clone().into(),
-        );
-        Value::Object(object)
+        let status = match self.status {
+            Status::Starting => "starting",
+            Status::Ready => "ready",
+            Status::Recovering => "recovering",
+        };
+        let mode = match self.mode {
+            Mode::Headless => "headless",
+            Mode::Gui => "gui",
+            Mode::Unmanaged => "unmanaged",
+        };
+        crate::json!({
+            "version": (self.version),
+            "project": (self.project.clone()),
+            "status": status,
+            "mode": mode,
+            "godot_pid": (self.godot_pid),
+            "godot_pgid": (self.godot_pgid),
+            "lsp_port": (self.lsp_port),
+            "dap_port": (self.dap_port),
+            "owner_pid": (self.owner_pid),
+            "owner_start_ticks": (self.owner_start_ticks),
+            "godot_start_ticks": (self.godot_start_ticks),
+            "started_at": (self.started_at.clone()),
+            "bridge_version": (self.bridge_version.clone())
+        })
     }
 
     pub fn from_value(value: &Value) -> Result<Self, String> {

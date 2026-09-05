@@ -967,10 +967,18 @@ fn forward_client_message(
                 query,
                 &proxy.symbol_containers,
             );
-            send_client(
-                output,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(matches.iter().map(|(uri, symbol)| symbols::symbol_information(symbol, uri, &proxy.symbol_containers)).collect::<Vec<_>>()) }),
-            )?;
+            let mut body = Vec::new();
+            body.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":");
+            body.extend_from_slice(&crate::json::to_vec(&message["id"]));
+            body.extend_from_slice(b",\"result\":[");
+            for (index, (uri, symbol)) in matches.iter().enumerate() {
+                if index != 0 {
+                    body.push(b',');
+                }
+                symbols::write_symbol_information(symbol, uri, &proxy.symbol_containers, &mut body);
+            }
+            body.extend_from_slice(b"]}");
+            send_client_body(output, &body)?;
             return Ok(());
         }
         if method == "initialized" {
@@ -1285,20 +1293,15 @@ fn rewrite_document_messages(
             return Ok(vec![body]);
         }
         "textDocument/didChange" => {
-            let changes = params
-                .get("contentChanges")
-                .and_then(Value::as_array)
-                .cloned();
+            let changes = params.get("contentChanges").and_then(Value::as_array);
             let full_sync = changes
-                .as_ref()
                 .is_some_and(|changes| changes.len() == 1 && changes[0].get("range").is_none());
             if !full_sync {
                 crate::warn!("didChange was not a full synchronization {uri}");
                 return Ok(vec![crate::json::to_vec(&message)]);
             }
             let text = changes
-                .as_ref()
-                .and_then(|changes| changes[0].get("text"))
+                .and_then(|changes| changes.first().and_then(|change| change.get("text")))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if text.len() > GODOT_WRITE_CAP {
@@ -1786,16 +1789,20 @@ fn coalesce_watcher_changes(changes: Vec<WatcherChange>) -> Vec<WatcherChange> {
 }
 
 fn next_symbol_deadline(proxy: &ProxyState) -> Option<Instant> {
+    if proxy.pending.len() >= IN_FLIGHT_CAP {
+        return None;
+    }
     proxy
         .symbol_scheduled
         .iter()
-        .filter(|(uri, _)| {
-            !(proxy.bulk_active
-                && proxy.documents.owner(&proxy.documents.key_for_uri(uri))
-                    == Some(DocumentOwner::Bridge))
-        })
+        .filter(|(uri, _)| !bulk_owned_symbol(proxy, uri))
         .map(|(_, (_, _, deadline))| *deadline)
         .min()
+}
+
+fn bulk_owned_symbol(proxy: &ProxyState, uri: &str) -> bool {
+    proxy.bulk_active
+        && proxy.documents.owner(&proxy.documents.key_for_uri(uri)) == Some(DocumentOwner::Bridge)
 }
 
 fn send_due_symbol_requests(
@@ -1805,17 +1812,17 @@ fn send_due_symbol_requests(
     if !proxy.zed_initialized {
         return Ok(None);
     }
+    if proxy.pending.len() >= IN_FLIGHT_CAP {
+        return Ok(None);
+    }
     let now = Instant::now();
+    let available = IN_FLIGHT_CAP - proxy.pending.len();
     let due = proxy
         .symbol_scheduled
         .iter()
-        .filter(|(uri, (_, _, deadline))| {
-            *deadline <= now
-                && !(proxy.bulk_active
-                    && proxy.documents.owner(&proxy.documents.key_for_uri(uri))
-                        == Some(DocumentOwner::Bridge))
-        })
+        .filter(|(uri, (_, _, deadline))| *deadline <= now && !bulk_owned_symbol(proxy, uri))
         .map(|(uri, (generation, version, _))| (uri.clone(), *generation, *version))
+        .take(available)
         .collect::<Vec<_>>();
     for (uri, generation, version) in due {
         if proxy.pending.len() >= IN_FLIGHT_CAP {
@@ -1837,6 +1844,9 @@ fn send_due_symbol_requests(
             &crate::json!({"jsonrpc":"2.0","id":id,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}),
             true,
         )?;
+    }
+    if proxy.pending.len() >= IN_FLIGHT_CAP {
+        return Ok(None);
     }
     Ok(next_symbol_deadline(proxy))
 }

@@ -1,6 +1,7 @@
 use crate::json::Value;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::io::Write;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
@@ -573,6 +574,32 @@ fn range_value(position: &Value, key: &str) -> u32 {
 pub fn symbol_information(symbol: &Symbol, uri: &str, containers: &ContainerTable) -> Value {
     let [start_line, start_character, end_line, end_character] = symbol.range;
     crate::json!({"name": (symbol.name.clone()), "kind": (u64::from(symbol.kind)), "containerName": (containers.get(symbol.container).to_owned()), "location": {"uri": (uri.to_owned()), "range": {"start": {"line": (u64::from(start_line)), "character": (u64::from(start_character))}, "end": {"line": (u64::from(end_line)), "character": (u64::from(end_character))}}}})
+}
+
+pub fn write_symbol_information(
+    symbol: &Symbol,
+    uri: &str,
+    containers: &ContainerTable,
+    output: &mut Vec<u8>,
+) {
+    let [start_line, start_character, end_line, end_character] = symbol.range;
+    output.extend_from_slice(b"{\"name\":");
+    crate::json::write_string(&symbol.name, output);
+    output.extend_from_slice(b",\"kind\":");
+    write!(output, "{}", u64::from(symbol.kind)).expect("writing to Vec cannot fail");
+    output.extend_from_slice(b",\"containerName\":");
+    crate::json::write_string(containers.get(symbol.container), output);
+    output.extend_from_slice(b",\"location\":{\"uri\":");
+    crate::json::write_string(uri, output);
+    output.extend_from_slice(b",\"range\":{\"start\":{\"line\":");
+    write!(output, "{}", start_line).expect("writing to Vec cannot fail");
+    output.extend_from_slice(b",\"character\":");
+    write!(output, "{}", start_character).expect("writing to Vec cannot fail");
+    output.extend_from_slice(b"},\"end\":{\"line\":");
+    write!(output, "{}", end_line).expect("writing to Vec cannot fail");
+    output.extend_from_slice(b",\"character\":");
+    write!(output, "{}", end_character).expect("writing to Vec cannot fail");
+    output.extend_from_slice(b"}}}}");
 }
 
 #[cfg(test)]
