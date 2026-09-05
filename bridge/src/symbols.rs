@@ -138,7 +138,7 @@ fn boundary_positions(value: &str) -> Vec<usize> {
         .collect()
 }
 
-pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
+pub fn search<'a>(symbols: impl IntoIterator<Item = &'a Symbol>, query: &str) -> Vec<Symbol> {
     let container_query = query.contains('.') || query.contains(' ');
     let query = query.to_lowercase();
     let query = if container_query {
@@ -147,7 +147,7 @@ pub fn search(symbols: &[Symbol], query: &str) -> Vec<Symbol> {
         query
     };
     let mut matches = symbols
-        .iter()
+        .into_iter()
         .filter_map(|symbol| {
             let target = if container_query {
                 &symbol.folded_container_name

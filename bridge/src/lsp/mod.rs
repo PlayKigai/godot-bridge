@@ -832,15 +832,9 @@ fn forward_client_message(
                 .and_then(|params| params.get("query"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let result = proxy
-                .symbol_cache
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>();
             send_client(
                 output,
-                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(symbols::search(&result, query).iter().map(symbols::symbol_information).collect::<Vec<_>>()) }),
+                &crate::json!({"jsonrpc":"2.0","id":(message["id"].clone()),"result":(symbols::search(proxy.symbol_cache.values().flatten(), query).iter().map(symbols::symbol_information).collect::<Vec<_>>()) }),
             )?;
             return Ok(());
         }
