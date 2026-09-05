@@ -45,7 +45,7 @@ pub struct DocumentState {
     pub(crate) open_docs: HashMap<PathBuf, OpenDoc>,
     pub(crate) uri_keys: HashMap<String, PathBuf>,
     pub(crate) watcher_keys: HashMap<PathBuf, PathBuf>,
-    generations: HashMap<PathBuf, u64>,
+    generation: u64,
 }
 
 impl DocumentState {
@@ -54,17 +54,16 @@ impl DocumentState {
             open_docs: HashMap::new(),
             uri_keys: HashMap::new(),
             watcher_keys: HashMap::new(),
-            generations: HashMap::new(),
+            generation: 0,
         }
     }
 
     pub fn zed_open(&mut self, incoming_uri: &str, text: String) -> DocumentAction {
         let key = self.key_for_uri(incoming_uri);
         self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
-        self.watcher_keys.insert(normalize_path(&key), key.clone());
+        self.register_watcher_path(&key, key.clone());
         if let Some(doc) = self.open_docs.get_mut(&key) {
             doc.text = Some(text.clone());
-            doc.text_hash = text_hash(&text);
             doc.version += 1;
             doc.owner = DocumentOwner::Zed;
             return DocumentAction::Change {
@@ -75,7 +74,7 @@ impl DocumentState {
         }
 
         let uri = path_to_uri(&key);
-        let generation = self.next_generation(&key);
+        let generation = self.next_generation();
         let version = 1;
         self.open_docs.insert(
             key.clone(),
@@ -84,7 +83,7 @@ impl DocumentState {
                 version,
                 generation,
                 text: Some(text.clone()),
-                text_hash: text_hash(&text),
+                text_hash: 0,
                 owner: DocumentOwner::Zed,
             },
         );
@@ -96,7 +95,6 @@ impl DocumentState {
         let key = self.key_for_uri(incoming_uri);
         let doc = self.open_docs.get_mut(&key)?;
         doc.text = Some(text.clone());
-        doc.text_hash = text_hash(&text);
         doc.version += 1;
         doc.owner = DocumentOwner::Zed;
         let uri = doc.uri.clone();
@@ -124,7 +122,7 @@ impl DocumentState {
         }
         let uri = path_to_uri(&key);
         let version = 1;
-        let generation = self.next_generation(&key);
+        let generation = self.next_generation();
         self.open_docs.insert(
             key.clone(),
             OpenDoc {
@@ -174,11 +172,20 @@ impl DocumentState {
     }
 
     pub fn register_watcher_path(&mut self, path: &Path, key: PathBuf) {
-        self.watcher_keys.insert(normalize_path(path), key);
+        let path = normalize_path(path);
+        if path == key {
+            self.watcher_keys.remove(&path);
+        } else {
+            self.watcher_keys.insert(path, key);
+        }
     }
 
     pub fn watcher_key(&self, path: &Path) -> Option<PathBuf> {
-        self.watcher_keys.get(&normalize_path(path)).cloned()
+        let path = normalize_path(path);
+        self.open_docs
+            .contains_key(&path)
+            .then_some(path.clone())
+            .or_else(|| self.watcher_keys.get(&path).cloned())
     }
 
     pub fn owner(&self, key: &Path) -> Option<DocumentOwner> {
@@ -202,10 +209,9 @@ impl DocumentState {
         self.watcher_keys.retain(|_, value| value != key);
     }
 
-    fn next_generation(&mut self, key: &Path) -> u64 {
-        let generation = self.generations.entry(key.to_path_buf()).or_insert(0);
-        *generation += 1;
-        *generation
+    fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
 }
 

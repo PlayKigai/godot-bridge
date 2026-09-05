@@ -454,12 +454,12 @@ fn compare_matches(left: &Match<'_>, right: &Match<'_>) -> Ordering {
 fn compare_match_parts(left: &Match<'_>, left_indices: &[usize], right: &Match<'_>) -> Ordering {
     left.gap
         .cmp(&right.gap)
-        .then(right.boundary_count.cmp(&left.boundary_count))
-        .then(left.offset.cmp(&right.offset))
-        .then(left.symbol.name.cmp(&right.symbol.name))
-        .then(left.uri.cmp(right.uri))
-        .then(left.range_start.cmp(&right.range_start))
-        .then(left_indices.cmp(&right.indices))
+        .then_with(|| right.boundary_count.cmp(&left.boundary_count))
+        .then_with(|| left.offset.cmp(&right.offset))
+        .then_with(|| left.symbol.name.cmp(&right.symbol.name))
+        .then_with(|| left.uri.cmp(right.uri))
+        .then_with(|| left.range_start.cmp(&right.range_start))
+        .then_with(|| left_indices.cmp(&right.indices))
 }
 
 fn best_match_into(

@@ -938,15 +938,9 @@ fn forward_client_body(
     settings: &Settings,
     body: &[u8],
     fields: crate::json::TopLevel<'_>,
+    parsed: Option<Value>,
 ) -> Result<()> {
-    let intercepted = fields.method.is_some_and(|method| {
-        method.string_eq("workspace/symbol")
-            || method.string_eq("initialized")
-            || method.string_eq("textDocument/didOpen")
-            || method.string_eq("textDocument/didChange")
-            || method.string_eq("textDocument/didClose")
-            || method.string_eq("$/cancelRequest")
-    });
+    let intercepted = fields.method.is_some_and(client_method_intercepted);
     if fields.method.is_none() {
         if let Some(raw_id) = fields.id {
             let Some(id) = raw_id.request_key() else {
@@ -957,9 +951,41 @@ fn forward_client_body(
         }
     }
     if fields.id.is_some() || intercepted {
-        return forward_client_message(editor, output, proxy, settings, parse_message(body)?);
+        let partial = parsed.is_some();
+        let message = parsed.map_or_else(|| parse_message(body), Ok)?;
+        if partial
+            && !message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(client_method_intercepted_str)
+            && message.get("id").is_none()
+        {
+            return send_godot_body(&mut editor.connection.writer, body, false);
+        }
+        return forward_client_message(editor, output, proxy, settings, message);
     }
     send_godot_body(&mut editor.connection.writer, body, false)
+}
+
+fn client_method_intercepted(method: crate::json::RawJson<'_>) -> bool {
+    method.string_eq("workspace/symbol")
+        || method.string_eq("initialized")
+        || method.string_eq("textDocument/didOpen")
+        || method.string_eq("textDocument/didChange")
+        || method.string_eq("textDocument/didClose")
+        || method.string_eq("$/cancelRequest")
+}
+
+fn client_method_intercepted_str(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/symbol"
+            | "initialized"
+            | "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didClose"
+            | "$/cancelRequest"
+    )
 }
 
 fn forward_client_message(
@@ -1137,16 +1163,10 @@ fn forward_server_message<W: Write>(
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
-    let fields = crate::json::scan_top_level(body)?;
-    if fields
-        .method
-        .is_some_and(|method| method.string_eq("textDocument/publishDiagnostics"))
-        && fields.id.is_none()
-        && proxy.bulk_batch_uris.is_empty()
-    {
-        send_client_body(output, body)?;
-        return Ok(());
-    }
+    let (fields, _) = crate::json::scan_top_level_until_method(body, |method| {
+        method.string_eq("textDocument/publishDiagnostics")
+            || method.string_eq("gdscript_client/changeWorkspace")
+    })?;
     let intercepted = fields.method.is_some_and(|method| {
         method.string_eq("textDocument/publishDiagnostics")
             || method.string_eq("gdscript_client/changeWorkspace")
@@ -1156,6 +1176,11 @@ fn forward_server_message<W: Write>(
         return Ok(());
     }
     let message = parse_message(body)?;
+    let request_key = if intercepted {
+        message.get("id").and_then(crate::json::value_request_key)
+    } else {
+        fields.id.and_then(|id| id.request_key())
+    };
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if method == "gdscript_client/changeWorkspace" {
             check_workspace(&message, &proxy.project, Some(lsp_port))?;
@@ -1184,7 +1209,7 @@ fn forward_server_message<W: Write>(
             send_client_body(output, body)?;
             return Ok(());
         }
-        let Some(id) = fields.id.and_then(|id| id.request_key()) else {
+        let Some(id) = request_key else {
             return Ok(());
         };
         proxy.server_requests.insert(id);
@@ -1195,12 +1220,14 @@ fn forward_server_message<W: Write>(
         send_client(output, &message)?;
         return Ok(());
     };
-    let Some(id_number) = fields.id.and_then(|id| id.as_i64()) else {
+    let id_number = if intercepted {
+        message.get("id").and_then(Value::as_i64)
+    } else {
+        fields.id.and_then(|id| id.as_i64())
+    };
+    let Some(id_number) = id_number else {
         if !shutdown_response {
-            let stale = fields
-                .id
-                .and_then(|id| id.request_key())
-                .is_some_and(|id| proxy.stale_server_ids.contains(&id));
+            let stale = request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id));
             if !stale {
                 crate::debug!("dropping unknown Godot response id {id}");
             }
@@ -1233,6 +1260,9 @@ fn forward_server_message<W: Write>(
                             .or_default()
                             .push(symbol);
                     }
+                    if let Some(symbols) = proxy.symbol_cache.get_mut(&uri) {
+                        symbols.shrink_to_fit();
+                    }
                 }
             }
             flush_queued(output, writer, proxy)?;
@@ -1242,10 +1272,7 @@ fn forward_server_message<W: Write>(
         response["id"] = pending.zed_id;
         send_client(output, &response)?;
         flush_queued(output, writer, proxy)?;
-    } else if !fields
-        .id
-        .and_then(|id| id.request_key())
-        .is_some_and(|id| proxy.stale_server_ids.contains(&id))
+    } else if !request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id))
         && !shutdown_response
     {
         crate::debug!("dropping unknown Godot response id {id}");

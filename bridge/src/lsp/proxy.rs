@@ -377,7 +377,26 @@ fn process_client_frame(
     settings: &Settings,
     body: &[u8],
 ) -> std::result::Result<ClientFrame, String> {
-    let fields = crate::json::scan_top_level(body).map_err(|error| error.to_string())?;
+    let (fields, stopped) =
+        crate::json::scan_top_level_until_method(body, super::client_method_intercepted)
+            .map_err(|error| error.to_string())?;
+    if stopped {
+        let message = parse_message(body).map_err(|error| error.to_string())?;
+        match message.get("method").and_then(Value::as_str) {
+            Some("exit") => return Ok(ClientFrame::Exit),
+            Some("shutdown") => return Ok(ClientFrame::Shutdown(message)),
+            _ => {}
+        }
+        return Ok(ClientFrame::Forward(forward_client_body(
+            editor,
+            output,
+            proxy,
+            settings,
+            body,
+            fields,
+            Some(message),
+        )));
+    }
     if fields.method.is_some_and(|method| method.string_eq("exit")) {
         return Ok(ClientFrame::Exit);
     }
@@ -390,7 +409,7 @@ fn process_client_frame(
             .map_err(|error| error.to_string());
     }
     Ok(ClientFrame::Forward(forward_client_body(
-        editor, output, proxy, settings, body, fields,
+        editor, output, proxy, settings, body, fields, None,
     )))
 }
 

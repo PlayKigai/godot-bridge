@@ -498,6 +498,16 @@ pub(crate) struct TopLevel<'a> {
 }
 
 pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
+    scan_top_level_until_method(bytes, |_| false).map(|(fields, _)| fields)
+}
+
+pub(crate) fn scan_top_level_until_method<F>(
+    bytes: &[u8],
+    is_intercepted: F,
+) -> Result<(TopLevel<'_>, bool), Error>
+where
+    F: Fn(RawJson<'_>) -> bool,
+{
     let mut parser = Parser::new(bytes, false, false);
     parser.skip_space()?;
     if !parser.take(b'{') {
@@ -513,7 +523,7 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
     if parser.take(b'}') {
         parser.skip_space()?;
         return if parser.index == bytes.len() {
-            Ok(fields)
+            Ok((fields, false))
         } else {
             Err(Error::new(parser.index, "trailing characters"))
         };
@@ -533,6 +543,9 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
             fields.id = Some(value);
         } else if key.string_eq("method") {
             fields.method = Some(value);
+            if is_intercepted(value) {
+                return Ok((fields, true));
+            }
         } else if key.string_eq("type") {
             fields.type_ = Some(value);
         } else if key.string_eq("command") {
@@ -544,7 +557,7 @@ pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
             if parser.index != bytes.len() {
                 return Err(Error::new(parser.index, "trailing characters"));
             }
-            return Ok(fields);
+            return Ok((fields, false));
         }
         if !parser.take(b',') {
             return Err(Error::new(parser.index, "expected ',' or '}' in object"));
