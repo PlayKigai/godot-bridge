@@ -6,12 +6,14 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::framing::{parse_json_object, spawn_frame_reader, write_json, FrameEvent, FrameReader};
+use crate::framing::{
+    parse_json_object, spawn_frame_reader, write_frame, write_json, FrameInput, FramePoll,
+};
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
 use crate::settings_file::{parse_settings, Settings};
@@ -31,7 +33,7 @@ struct Prepared {
 
 struct Connection {
     socket: TcpStream,
-    reader: Option<Receiver<FrameEvent>>,
+    reader: Option<FrameInput>,
     reader_thread: Option<JoinHandle<()>>,
     writer: TcpStream,
 }
@@ -45,14 +47,10 @@ impl Connection {
             spawn_frame_reader("godot-bridge-dap-reader", reader_stream, FRAME_CAP, sender)?;
         Ok(Self {
             socket: stream,
-            reader: Some(receiver),
+            reader: Some(FrameInput::new(receiver, FRAME_CAP)),
             reader_thread: Some(reader_thread),
             writer,
         })
-    }
-
-    fn try_read_frame(&self) -> Option<FrameEvent> {
-        self.reader.as_ref()?.try_recv().ok()
     }
 
     fn close(&mut self) {
@@ -81,7 +79,7 @@ impl Drop for DapLock {
 }
 
 struct ClientBuffer {
-    messages: VecDeque<Value>,
+    messages: VecDeque<Vec<u8>>,
     bytes: usize,
 }
 
@@ -93,7 +91,7 @@ impl ClientBuffer {
         }
     }
 
-    fn push(&mut self, body: Vec<u8>) -> std::result::Result<(), ()> {
+    fn push(&mut self, body: &[u8]) -> std::result::Result<(), ()> {
         let size = body.len();
         if self
             .bytes
@@ -102,17 +100,15 @@ impl ClientBuffer {
         {
             return Err(());
         }
-        let message = parse_message(&body).map_err(|_| ())?;
+        crate::json::scan_top_level(body).map_err(|_| ())?;
         self.bytes += size;
-        self.messages.push_back(message);
+        self.messages.push_back(body.to_owned());
         Ok(())
     }
 
-    fn pop(&mut self) -> Option<Value> {
+    fn pop(&mut self) -> Option<Vec<u8>> {
         let message = self.messages.pop_front()?;
-        self.bytes = self
-            .bytes
-            .saturating_sub(crate::json::to_vec(&message).len());
+        self.bytes = self.bytes.saturating_sub(message.len());
         Some(message)
     }
 }
@@ -198,29 +194,25 @@ enum InitializeWait {
 }
 
 pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
-    let mut input_reader = FrameReader::new(std::io::stdin(), FRAME_CAP);
-    let first = match input_reader.read_frame() {
-        Ok(Some(body)) => body,
-        Ok(None) => return Ok(ExitCode::SUCCESS),
-        Err(_) => return Ok(ExitCode::from(1)),
-    };
-    let initialize = match parse_message(&first) {
-        Ok(message)
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _input_thread = spawn_frame_reader(
+        "godot-bridge-dap-client-reader",
+        std::io::stdin(),
+        FRAME_CAP,
+        sender,
+    )?;
+    let mut input = FrameInput::new(receiver, FRAME_CAP);
+    let initialize = match input.with_next_frame(parse_message)? {
+        Some(Ok(message))
             if message.get("type").and_then(Value::as_str) == Some("request")
                 && message.get("command").and_then(Value::as_str) == Some("initialize") =>
         {
             message
         }
-        Ok(_) | Err(_) => return Ok(ExitCode::from(1)),
+        Some(Ok(_)) | Some(Err(_)) => return Ok(ExitCode::from(1)),
+        None => return Ok(ExitCode::SUCCESS),
     };
 
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _input_thread = spawn_frame_reader(
-        "godot-bridge-dap-client-reader",
-        input_reader.into_inner(),
-        FRAME_CAP,
-        sender,
-    )?;
     let mut output = ClientOutput::new(std::io::stdout());
     let mut buffer = ClientBuffer::new();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -241,22 +233,17 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
             }
             Err(TryRecvError::Empty) => {}
         }
-        match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(Some(body))) => {
-                if buffer.push(body).is_err() {
-                    cancel.store(true, Ordering::Release);
-                    return Ok(ExitCode::from(1));
-                }
-            }
-            Ok(Ok(None)) => {
-                cancel.store(true, Ordering::Release);
-                return Ok(ExitCode::SUCCESS);
-            }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+        match input.recv_timeout_with_frame(Duration::from_millis(20), |body| buffer.push(body))? {
+            FramePoll::Frame(Ok(())) => {}
+            FramePoll::Frame(Err(())) => {
                 cancel.store(true, Ordering::Release);
                 return Ok(ExitCode::from(1));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            FramePoll::End => {
+                cancel.store(true, Ordering::Release);
+                return Ok(ExitCode::from(1));
+            }
+            FramePoll::Empty => {}
         }
     };
     let prepared = match prepared {
@@ -266,7 +253,7 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     };
-    let result = run_session(initialize, prepared, &mut output, &receiver, &mut buffer);
+    let result = run_session(initialize, prepared, &mut output, &mut input, &mut buffer);
     let _ = worker.join();
     result
 }
@@ -404,7 +391,7 @@ fn run_session(
     initialize: Value,
     mut prepared: Prepared,
     output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
+    input: &mut FrameInput,
     buffer: &mut ClientBuffer,
 ) -> Result<ExitCode> {
     let project = prepared.project.clone();
@@ -413,7 +400,7 @@ fn run_session(
         &initialize,
         &mut prepared.connection,
         output,
-        receiver,
+        input,
         buffer,
         &project,
         file.as_deref(),
@@ -426,7 +413,7 @@ fn run_session_inner(
     initialize: &Value,
     connection: &mut Connection,
     output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
+    input: &mut FrameInput,
     buffer: &mut ClientBuffer,
     project: &Path,
     file: Option<&Path>,
@@ -437,7 +424,7 @@ fn run_session_inner(
         initialize,
         connection,
         output,
-        receiver,
+        input,
         buffer,
         &mut server_requests,
     )? {
@@ -448,9 +435,9 @@ fn run_session_inner(
         }
     }
 
-    while let Some(message) = buffer.pop() {
+    while let Some(body) = buffer.pop() {
         if let Some(result) =
-            forward_client(message, &mut server_requests, connection, project, file)?
+            forward_client_body(&body, &mut server_requests, connection, project, file)?
         {
             let ForwardClient::Failure {
                 request_seq,
@@ -464,91 +451,67 @@ fn run_session_inner(
     let mut process_seen = false;
     let mut turn = false;
     loop {
-        let server_event = turn;
-        let event = if server_event {
-            connection.try_read_frame()
-        } else {
-            receiver.try_recv().ok()
-        };
-        turn = !turn;
-        if let Some(event) = event {
+        let mut processed = false;
+        if turn {
+            let event = connection
+                .reader
+                .as_mut()
+                .ok_or_else(|| crate::error::Error::new("reader is closed"))?
+                .try_with_next_frame(|body| parse_message(body))?;
             match event {
-                Ok(Some(body)) => {
-                    if !server_event {
-                        let message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => return Ok(ExitCode::from(1)),
-                        };
-                        if let Some(result) = forward_client(
-                            message,
-                            &mut server_requests,
-                            connection,
-                            project,
-                            file,
-                        )? {
-                            let ForwardClient::Failure {
-                                request_seq,
-                                command,
-                                message,
-                            } = result;
-                            send_request_failure(output, request_seq, command, message)?;
-                        }
-                    } else {
-                        let mut message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => return godot_died(output),
-                        };
-                        if !should_forward_server_event(&message, &mut process_seen) {
-                            continue;
-                        }
+                FramePoll::Frame(Ok(mut message)) => {
+                    processed = true;
+                    if should_forward_server_event(&message, &mut process_seen) {
                         server_requests.restore_response(&mut message);
                         let seq = output.next_seq;
                         server_requests.rewrite(&mut message, seq);
                         output.send(message)?;
                     }
                 }
-                Ok(None) => {
-                    if server_event {
-                        return godot_died(output);
-                    }
-                    return Ok(ExitCode::SUCCESS);
-                }
-                Err(_) => {
-                    return if server_event {
-                        godot_died(output)
-                    } else {
-                        Ok(ExitCode::from(1))
-                    }
-                }
+                FramePoll::Frame(Err(_)) | FramePoll::End => return godot_died(output),
+                FramePoll::Empty => {}
             }
-            continue;
-        }
-        let event = if turn {
-            receiver.recv_timeout(Duration::from_millis(20))
         } else {
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        };
-        match event {
-            Ok(Ok(Some(body))) => {
-                let message = match parse_message(&body) {
-                    Ok(message) => message,
-                    Err(_) => return Ok(ExitCode::from(1)),
-                };
-                if let Some(result) =
-                    forward_client(message, &mut server_requests, connection, project, file)?
-                {
-                    let ForwardClient::Failure {
+            let event = input.try_with_next_frame(|body| {
+                forward_client_body(body, &mut server_requests, connection, project, file)
+            })?;
+            match event {
+                FramePoll::Frame(Ok(result)) => {
+                    processed = true;
+                    if let Some(ForwardClient::Failure {
                         request_seq,
                         command,
                         message,
-                    } = result;
-                    send_request_failure(output, request_seq, command, message)?;
+                    }) = result
+                    {
+                        send_request_failure(output, request_seq, command, message)?;
+                    }
                 }
+                FramePoll::Frame(Err(_)) => return Ok(ExitCode::from(1)),
+                FramePoll::End => return Ok(ExitCode::SUCCESS),
+                FramePoll::Empty => {}
             }
-            Ok(Ok(None)) => return Ok(ExitCode::SUCCESS),
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ExitCode::from(1)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        turn = !turn;
+        if processed {
+            continue;
+        }
+        if !turn {
+            match input.recv_timeout_with_frame(Duration::from_millis(20), |body| {
+                forward_client_body(body, &mut server_requests, connection, project, file)
+            })? {
+                FramePoll::Frame(Ok(Some(ForwardClient::Failure {
+                    request_seq,
+                    command,
+                    message,
+                }))) => send_request_failure(output, request_seq, command, message)?,
+                FramePoll::Frame(Ok(None)) => {}
+                FramePoll::Frame(Err(_)) => return Ok(ExitCode::from(1)),
+                FramePoll::End => return Ok(ExitCode::SUCCESS),
+                FramePoll::Empty => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -573,82 +536,90 @@ fn wait_for_initialize(
     initialize: &Value,
     connection: &mut Connection,
     output: &mut ClientOutput<std::io::Stdout>,
-    receiver: &Receiver<FrameEvent>,
+    input: &mut FrameInput,
     buffer: &mut ClientBuffer,
     server_requests: &mut ServerRequests,
 ) -> Result<InitializeWait> {
     let initialize_seq = initialize.get("seq").cloned().unwrap_or(Value::Null);
     let mut turn = false;
     loop {
-        let server_event = turn;
-        let event = if server_event {
-            connection.try_read_frame()
-        } else {
-            receiver.try_recv().ok()
-        };
-        turn = !turn;
-        if let Some(event) = event {
+        let mut processed = false;
+        if turn {
+            let event = connection
+                .reader
+                .as_mut()
+                .ok_or_else(|| crate::error::Error::new("reader is closed"))?
+                .try_with_next_frame(|body| parse_message(body))?;
             match event {
-                Ok(Some(body)) => {
-                    if !server_event {
-                        if buffer.push(body).is_err() {
-                            return Ok(InitializeWait::ClientInvalid);
-                        }
-                    } else {
-                        let mut message = match parse_message(&body) {
-                            Ok(message) => message,
-                            Err(_) => {
-                                godot_died(output)?;
-                                return Ok(InitializeWait::GodotDead);
-                            }
-                        };
-                        let is_initialize_response = message.get("type").and_then(Value::as_str)
-                            == Some("response")
-                            && message.get("command") == Some(&crate::json!("initialize"))
-                            && message.get("request_seq") == Some(&initialize_seq);
-                        server_requests.restore_response(&mut message);
-                        let seq = output.next_seq;
-                        server_requests.rewrite(&mut message, seq);
-                        output.send(message)?;
-                        if is_initialize_response {
-                            return Ok(InitializeWait::Ready);
-                        }
+                FramePoll::Frame(Ok(mut message)) => {
+                    processed = true;
+                    let is_initialize_response = message.get("type").and_then(Value::as_str)
+                        == Some("response")
+                        && message.get("command") == Some(&crate::json!("initialize"))
+                        && message.get("request_seq") == Some(&initialize_seq);
+                    server_requests.restore_response(&mut message);
+                    let seq = output.next_seq;
+                    server_requests.rewrite(&mut message, seq);
+                    output.send(message)?;
+                    if is_initialize_response {
+                        return Ok(InitializeWait::Ready);
                     }
                 }
-                Ok(None) => {
-                    return if server_event {
-                        Ok(InitializeWait::GodotDead)
-                    } else {
-                        Ok(InitializeWait::ClientEof)
-                    }
-                }
-                Err(_) => {
-                    return if server_event {
-                        Ok(InitializeWait::GodotDead)
-                    } else {
-                        Ok(InitializeWait::ClientInvalid)
-                    }
-                }
+                FramePoll::Frame(Err(_)) | FramePoll::End => return Ok(InitializeWait::GodotDead),
+                FramePoll::Empty => {}
             }
+        } else {
+            match input.try_with_next_frame(|body| buffer.push(body))? {
+                FramePoll::Frame(Ok(())) => processed = true,
+                FramePoll::Frame(Err(())) => return Ok(InitializeWait::ClientInvalid),
+                FramePoll::End => return Ok(InitializeWait::ClientEof),
+                FramePoll::Empty => {}
+            }
+        }
+        turn = !turn;
+        if processed {
             continue;
         }
         if turn {
-            match receiver.recv_timeout(Duration::from_millis(20)) {
-                Ok(Ok(Some(body))) => {
-                    if buffer.push(body).is_err() {
-                        return Ok(InitializeWait::ClientInvalid);
-                    }
-                }
-                Ok(Ok(None)) => return Ok(InitializeWait::ClientEof),
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(InitializeWait::ClientInvalid)
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            match input
+                .recv_timeout_with_frame(Duration::from_millis(20), |body| buffer.push(body))?
+            {
+                FramePoll::Frame(Ok(())) => {}
+                FramePoll::Frame(Err(())) => return Ok(InitializeWait::ClientInvalid),
+                FramePoll::End => return Ok(InitializeWait::ClientEof),
+                FramePoll::Empty => {}
             }
         } else {
             thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+fn forward_client_body(
+    body: &[u8],
+    server_requests: &mut ServerRequests,
+    connection: &mut Connection,
+    project: &Path,
+    file: Option<&Path>,
+) -> Result<Option<ForwardClient>> {
+    let fields = crate::json::scan_top_level(body)?;
+    let rewrite = fields.type_.is_some_and(|value| {
+        value.string_eq("response")
+            || (value.string_eq("request")
+                && fields.command.is_some_and(|command| {
+                    command.string_eq("launch") || command.string_eq("attach")
+                }))
+    });
+    if rewrite {
+        return forward_client(
+            parse_message(body)?,
+            server_requests,
+            connection,
+            project,
+            file,
+        );
+    }
+    send_to_godot_body(&mut connection.writer, body)
 }
 
 fn forward_client(
@@ -753,6 +724,11 @@ fn rewrite_launch_or_attach(
 fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
     write_json(writer, message, FRAME_CAP, true)?;
     Ok(())
+}
+
+fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<Option<ForwardClient>> {
+    write_frame(writer, body, FRAME_CAP)?;
+    Ok(None)
 }
 
 fn godot_died(output: &mut ClientOutput<std::io::Stdout>) -> Result<ExitCode> {

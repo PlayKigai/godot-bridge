@@ -15,7 +15,7 @@ use crate::docs_state::{
     WatcherChangeKind, BULK_DOCUMENTS, BULK_INTERVAL_MS,
 };
 use crate::framing::{
-    parse_json_object, spawn_frame_reader, write_frame, write_json, FrameEvent, FrameReader,
+    parse_json_object, spawn_frame_reader, write_frame, write_json, FrameInput, FramePoll,
 };
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{
@@ -92,27 +92,24 @@ enum InternalEvent {
         generation: u64,
         document: docs_state::ScannedDocument,
     },
-    BulkComplete { generation: u64 },
+    BulkComplete {
+        generation: u64,
+    },
 }
 
 struct Connection {
     socket: TcpStream,
-    reader: Option<Receiver<FrameEvent>>,
+    reader: Option<FrameInput>,
     reader_thread: Option<JoinHandle<()>>,
     writer: TcpStream,
 }
 
 impl Connection {
-    fn read_frame(&self) -> std::result::Result<Option<Vec<u8>>, crate::framing::FrameError> {
+    fn read_frame(&mut self) -> std::result::Result<Option<Vec<u8>>, crate::framing::FrameError> {
         self.reader
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| crate::framing::FrameError::Io(io::Error::other("reader is closed")))?
-            .recv()
-            .map_err(|_| crate::framing::FrameError::Io(io::Error::other("reader is closed")))?
-    }
-
-    fn try_read_frame(&self) -> Option<FrameEvent> {
-        self.reader.as_ref()?.try_recv().ok()
+            .with_next_frame(|body| body.to_owned())
     }
 
     fn close(&mut self) {
@@ -155,7 +152,7 @@ struct Watch {
 }
 
 struct Session {
-    input: Receiver<FrameEvent>,
+    input: FrameInput,
     output: ClientWriter,
     proxy: ProxyState,
     runtime: Runtime,
@@ -349,14 +346,12 @@ fn wait_for_detached_ports_during_handoff(
                 .unwrap_or(Duration::ZERO)
                 .min(Duration::from_millis(200))
         });
-        match session.input.recv_timeout(sleep_for) {
-            Ok(Ok(Some(body))) => queue_recovery_message(queue, &mut session.output, &body)?,
-            Ok(Ok(None)) => crate::bail!("Zed closed during GUI handoff"),
-            Ok(Err(error)) => return Err(error.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                crate::bail!("Zed closed during GUI handoff")
-            }
+        match session.input.recv_timeout_with_frame(sleep_for, |body| {
+            queue_recovery_message(queue, &mut session.output, body)
+        })? {
+            FramePoll::Frame(result) => result?,
+            FramePoll::End => crate::bail!("Zed closed during GUI handoff"),
+            FramePoll::Empty => {}
         }
     }
 }
@@ -465,10 +460,19 @@ fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> 
 }
 
 pub fn run() -> Result<ExitCode> {
-    let mut input_reader = FrameReader::new(std::io::stdin(), CLIENT_FRAME_CAP);
+    let (input_sender, input_receiver) = mpsc::sync_channel(1);
+    let _input_thread = spawn_frame_reader(
+        "godot-bridge-lsp-client-reader",
+        std::io::stdin(),
+        CLIENT_FRAME_CAP,
+        input_sender,
+    )
+    .map_err(|error| crate::error::Error::new(error.to_string()))?;
+    let mut input = FrameInput::new(input_receiver, CLIENT_FRAME_CAP);
     let mut output = BufWriter::new(std::io::stdout());
-    let initialize = match input_reader.read_frame() {
-        Ok(Some(body)) => parse_message(&body)?,
+    let initialize = match input.with_next_frame(parse_message) {
+        Ok(Some(Ok(message))) => message,
+        Ok(Some(Err(error))) => return Err(error.into()),
         Ok(None) => return Ok(ExitCode::SUCCESS),
         Err(error) => {
             crate::error!("invalid initialize frame: {error}");
@@ -570,14 +574,6 @@ pub fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-        let (input_sender, input) = mpsc::sync_channel(1);
-        let _input_thread = spawn_frame_reader(
-            "godot-bridge-lsp-client-reader",
-            input_reader.into_inner(),
-            CLIENT_FRAME_CAP,
-            input_sender,
-        )
-        .map_err(|error| crate::error::Error::new(error.to_string()))?;
         let connection = connection_from_stream(stream);
         let session = Session {
             input,
@@ -672,14 +668,6 @@ pub fn run() -> Result<ExitCode> {
                             return Ok(ExitCode::from(1));
                         }
                         set_ready(&runtime, &editor)?;
-                        let (input_sender, input) = mpsc::sync_channel(1);
-                        let _input_thread = spawn_frame_reader(
-                            "godot-bridge-lsp-client-reader",
-                            input_reader.into_inner(),
-                            CLIENT_FRAME_CAP,
-                            input_sender,
-                        )
-                        .map_err(|error| crate::error::Error::new(error.to_string()))?;
                         return run_session(
                             Session {
                                 input,
@@ -779,14 +767,6 @@ pub fn run() -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
     set_ready(&runtime, &editor)?;
-    let (input_sender, input) = mpsc::sync_channel(1);
-    let _input_thread = spawn_frame_reader(
-        "godot-bridge-lsp-client-reader",
-        input_reader.into_inner(),
-        CLIENT_FRAME_CAP,
-        input_sender,
-    )
-    .map_err(|error| crate::error::Error::new(error.to_string()))?;
     run_session(
         Session {
             input,
@@ -799,6 +779,37 @@ pub fn run() -> Result<ExitCode> {
         },
         false,
     )
+}
+
+fn forward_client_body(
+    editor: &mut Editor,
+    output: &mut ClientWriter,
+    proxy: &mut ProxyState,
+    settings: &Settings,
+    body: &[u8],
+    fields: crate::json::TopLevel<'_>,
+) -> Result<()> {
+    let intercepted = fields.method.is_some_and(|method| {
+        method.string_eq("workspace/symbol")
+            || method.string_eq("initialized")
+            || method.string_eq("textDocument/didOpen")
+            || method.string_eq("textDocument/didChange")
+            || method.string_eq("textDocument/didClose")
+            || method.string_eq("$/cancelRequest")
+    });
+    if fields.id.is_some() && fields.method.is_none() {
+        let id = fields.id.expect("checked above").lexical();
+        if proxy.server_requests.remove(&id) {
+            send_godot_body(&mut editor.connection.writer, body, false)?;
+        } else if proxy.stale_server_ids.remove(&id) {
+            crate::debug!("dropping response to stale Godot request {id}");
+        }
+        return Ok(());
+    }
+    if fields.id.is_some() || intercepted {
+        return forward_client_message(editor, output, proxy, settings, parse_message(body)?);
+    }
+    send_godot_body(&mut editor.connection.writer, body, false)
 }
 
 fn forward_client_message(
@@ -960,19 +971,29 @@ fn cancel_request(
 }
 
 fn forward_server_message(
-    editor: &mut Editor,
+    writer: &mut TcpStream,
+    lsp_port: u16,
     output: &mut ClientWriter,
     proxy: &mut ProxyState,
     body: &[u8],
     shutdown_response: bool,
 ) -> Result<()> {
+    let fields = crate::json::scan_top_level(body)?;
+    let intercepted = fields.method.is_some_and(|method| {
+        method.string_eq("textDocument/publishDiagnostics")
+            || method.string_eq("gdscript_client/changeWorkspace")
+    });
+    if !intercepted && fields.method.is_some() && fields.id.is_none() {
+        send_client_body(output, body)?;
+        return Ok(());
+    }
     let message = parse_message(body)?;
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if method == "gdscript_client/changeWorkspace" {
-            check_workspace(&message, &proxy.project, Some(editor.lsp_port))?;
+            check_workspace(&message, &proxy.project, Some(lsp_port))?;
             if let Some(id) = message.get("id") {
                 send_godot(
-                    &mut editor.connection.writer,
+                    writer,
                     &crate::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     false,
                 )?;
@@ -988,12 +1009,11 @@ fn forward_server_message(
                 && proxy.bulk_batch_uris.is_empty()
             {
                 proxy.bulk_deadline = None;
-                pump_bulk_documents(proxy, editor)?;
+                pump_bulk_documents(proxy, writer)?;
             }
         }
         if message.get("id").is_none() {
-            write_frame(output, body, CLIENT_FRAME_CAP)?;
-            output.flush()?;
+            send_client_body(output, body)?;
             return Ok(());
         }
         if let Some(id) = message.get("id") {
@@ -1024,13 +1044,13 @@ fn forward_server_message(
                     );
                 }
             }
-            flush_queued(output, editor, proxy)?;
+            flush_queued(output, writer, proxy)?;
             return Ok(());
         }
         let mut response = message;
         response["id"] = pending.zed_id;
         send_client(output, &response)?;
-        flush_queued(output, editor, proxy)?;
+        flush_queued(output, writer, proxy)?;
     } else if !proxy.stale_server_ids.contains(&id.to_string()) && !shutdown_response {
         crate::debug!("dropping unknown Godot response id {id}");
     }
@@ -1039,7 +1059,7 @@ fn forward_server_message(
 
 fn flush_queued(
     output: &mut ClientWriter,
-    editor: &mut Editor,
+    writer: &mut TcpStream,
     proxy: &mut ProxyState,
 ) -> Result<()> {
     while proxy.pending.len() < IN_FLIGHT_CAP {
@@ -1066,10 +1086,7 @@ fn flush_queued(
                 symbol: None,
             },
         );
-        editor
-            .connection
-            .writer
-            .write_all(&crate::framing::encode_frame(&body))?;
+        send_godot_body(writer, &body, true)?;
     }
     Ok(())
 }
@@ -1240,7 +1257,7 @@ fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
 
 fn process_bulk_document(
     proxy: &mut ProxyState,
-    editor: &mut Editor,
+    writer: &mut TcpStream,
     document: docs_state::ScannedDocument,
 ) -> Result<Option<String>> {
     proxy
@@ -1256,11 +1273,7 @@ fn process_bulk_document(
         let uri = match &action {
             DocumentAction::Open { uri, .. } | DocumentAction::Change { uri, .. } => uri.clone(),
         };
-        send_godot(
-            &mut editor.connection.writer,
-            &document_action_message(action),
-            false,
-        )?;
+        send_godot(writer, &document_action_message(action), false)?;
         return Ok(Some(uri));
     }
     Ok(None)
@@ -1272,7 +1285,7 @@ fn bulk_can_advance(proxy: &ProxyState, now: Instant) -> bool {
         || proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
 }
 
-fn pump_bulk_documents(proxy: &mut ProxyState, editor: &mut Editor) -> Result<()> {
+fn pump_bulk_documents(proxy: &mut ProxyState, writer: &mut TcpStream) -> Result<()> {
     loop {
         if !bulk_can_advance(proxy, Instant::now()) {
             return Ok(());
@@ -1284,7 +1297,7 @@ fn pump_bulk_documents(proxy: &mut ProxyState, editor: &mut Editor) -> Result<()
             let Some(document) = proxy.bulk_documents.pop_front() else {
                 break;
             };
-            if let Some(uri) = process_bulk_document(proxy, editor, document)? {
+            if let Some(uri) = process_bulk_document(proxy, writer, document)? {
                 proxy.bulk_batch_uris.insert(uri);
             }
             sent += 1;
@@ -1433,6 +1446,12 @@ fn send_client<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
     Ok(())
 }
 
+fn send_client_body(writer: &mut ClientWriter, body: &[u8]) -> Result<()> {
+    write_frame(writer, body, CLIENT_FRAME_CAP)?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn send_error<W: Write>(writer: &mut W, id: &Value, code: i64, message: &str) -> Result<()> {
     send_client(
         writer,
@@ -1457,6 +1476,10 @@ fn send_message_type<W: Write>(writer: &mut W, message_type: i64, message: &str)
 
 fn send_godot(writer: &mut TcpStream, message: &Value, request: bool) -> Result<()> {
     let body = crate::json::to_vec(message);
+    send_godot_body(writer, &body, request)
+}
+
+fn send_godot_body(writer: &mut TcpStream, body: &[u8], request: bool) -> Result<()> {
     if body.len() > GODOT_WRITE_CAP {
         if request {
             crate::bail!("message too large for Godot");
@@ -1467,9 +1490,7 @@ fn send_godot(writer: &mut TcpStream, message: &Value, request: bool) -> Result<
         );
         return Ok(());
     }
-    writer
-        .write_all(&crate::framing::encode_frame(&body))
-        .context("Godot write failed")?;
+    write_frame(writer, body, GODOT_WRITE_CAP).context("Godot write failed")?;
     Ok(())
 }
 

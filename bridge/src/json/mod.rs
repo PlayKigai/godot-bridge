@@ -408,6 +408,418 @@ impl PartialEq<&str> for Value {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RawJson<'a>(&'a [u8]);
+
+impl RawJson<'_> {
+    pub(crate) fn as_i64(self) -> Option<i64> {
+        self.is_number()
+            .then(|| str::from_utf8(self.0).ok())??
+            .parse()
+            .ok()
+    }
+
+    pub(crate) fn is_number(self) -> bool {
+        matches!(self.0.first(), Some(b'-' | b'0'..=b'9'))
+    }
+
+    pub(crate) fn lexical(self) -> String {
+        String::from_utf8(self.0.to_vec()).expect("scanned JSON is UTF-8")
+    }
+
+    pub(crate) fn string_eq(self, expected: &str) -> bool {
+        let Some(bytes) = self
+            .0
+            .strip_prefix(b"\"")
+            .and_then(|bytes| bytes.strip_suffix(b"\""))
+        else {
+            return false;
+        };
+        let expected = expected.as_bytes();
+        let mut input_index = 0;
+        let mut expected_index = 0;
+        while input_index < bytes.len() {
+            let mut decoded = [0; 4];
+            let decoded = if bytes[input_index] == b'\\' {
+                input_index += 1;
+                let Some(escape) = bytes.get(input_index).copied() else {
+                    return false;
+                };
+                input_index += 1;
+                match escape {
+                    b'"' | b'\\' | b'/' => &[escape],
+                    b'b' => b"\x08",
+                    b'f' => b"\x0c",
+                    b'n' => b"\n",
+                    b'r' => b"\r",
+                    b't' => b"\t",
+                    b'u' => {
+                        let Some(hex) = bytes.get(input_index..input_index + 4) else {
+                            return false;
+                        };
+                        let Some(code) = hex_code(hex) else {
+                            return false;
+                        };
+                        input_index += 4;
+                        let code = match code {
+                            0xd800..=0xdbff => {
+                                if bytes.get(input_index..input_index + 2) != Some(b"\\u") {
+                                    return false;
+                                }
+                                let Some(hex) = bytes.get(input_index + 2..input_index + 6) else {
+                                    return false;
+                                };
+                                let Some(low) = hex_code(hex) else {
+                                    return false;
+                                };
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return false;
+                                }
+                                input_index += 6;
+                                0x10000 + (u32::from(code - 0xd800) << 10) + u32::from(low - 0xdc00)
+                            }
+                            0xdc00..=0xdfff => return false,
+                            code => u32::from(code),
+                        };
+                        let Some(character) = char::from_u32(code) else {
+                            return false;
+                        };
+                        character.encode_utf8(&mut decoded).as_bytes()
+                    }
+                    _ => return false,
+                }
+            } else {
+                let Some(character) = str::from_utf8(&bytes[input_index..])
+                    .ok()
+                    .and_then(|value| value.chars().next())
+                else {
+                    return false;
+                };
+                let length = character.len_utf8();
+                let value = &bytes[input_index..input_index + length];
+                input_index += length;
+                value
+            };
+            if expected.get(expected_index..expected_index + decoded.len()) != Some(decoded) {
+                return false;
+            }
+            expected_index += decoded.len();
+        }
+        expected_index == expected.len()
+    }
+}
+
+pub(crate) struct TopLevel<'a> {
+    pub(crate) id: Option<RawJson<'a>>,
+    pub(crate) method: Option<RawJson<'a>>,
+    pub(crate) type_: Option<RawJson<'a>>,
+    pub(crate) command: Option<RawJson<'a>>,
+    pub(crate) event: Option<RawJson<'a>>,
+    pub(crate) seq: Option<RawJson<'a>>,
+    pub(crate) request_seq: Option<RawJson<'a>>,
+}
+
+pub(crate) fn scan_top_level(bytes: &[u8]) -> Result<TopLevel<'_>, Error> {
+    let mut scanner = Scanner {
+        input: bytes,
+        index: 0,
+    };
+    scanner.skip_space();
+    if !scanner.take(b'{') {
+        return Err(Error::new(scanner.index, "message is not an object"));
+    }
+    let mut fields = TopLevel {
+        id: None,
+        method: None,
+        type_: None,
+        command: None,
+        event: None,
+        seq: None,
+        request_seq: None,
+    };
+    scanner.skip_space();
+    if scanner.take(b'}') {
+        scanner.skip_space();
+        return if scanner.index == bytes.len() {
+            Ok(fields)
+        } else {
+            Err(Error::new(scanner.index, "trailing characters"))
+        };
+    }
+    loop {
+        let (key_start, key_end) = scanner.parse_string()?;
+        scanner.skip_space();
+        if !scanner.take(b':') {
+            return Err(Error::new(scanner.index, "expected ':' after object key"));
+        }
+        scanner.skip_space();
+        let value_start = scanner.index;
+        scanner.skip_value(1)?;
+        let value = RawJson(&bytes[value_start..scanner.index]);
+        let key = RawJson(&bytes[key_start..key_end]);
+        if key.string_eq("id") {
+            fields.id = Some(value);
+        } else if key.string_eq("method") {
+            fields.method = Some(value);
+        } else if key.string_eq("type") {
+            fields.type_ = Some(value);
+        } else if key.string_eq("command") {
+            fields.command = Some(value);
+        } else if key.string_eq("event") {
+            fields.event = Some(value);
+        } else if key.string_eq("seq") {
+            fields.seq = Some(value);
+        } else if key.string_eq("request_seq") {
+            fields.request_seq = Some(value);
+        }
+        scanner.skip_space();
+        if scanner.take(b'}') {
+            scanner.skip_space();
+            if scanner.index != bytes.len() {
+                return Err(Error::new(scanner.index, "trailing characters"));
+            }
+            return Ok(fields);
+        }
+        if !scanner.take(b',') {
+            return Err(Error::new(scanner.index, "expected ',' or '}' in object"));
+        }
+        scanner.skip_space();
+    }
+}
+
+struct Scanner<'a> {
+    input: &'a [u8],
+    index: usize,
+}
+
+impl Scanner<'_> {
+    fn skip_space(&mut self) {
+        while self
+            .input
+            .get(self.index)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.index += 1;
+        }
+    }
+
+    fn take(&mut self, byte: u8) -> bool {
+        if self.input.get(self.index) == Some(&byte) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<(usize, usize), Error> {
+        let start = self.index;
+        if !self.take(b'"') {
+            return Err(Error::new(self.index, "object keys must be strings"));
+        }
+        loop {
+            let Some(byte) = self.input.get(self.index).copied() else {
+                return Err(Error::new(self.index, "unterminated string"));
+            };
+            match byte {
+                b'"' => {
+                    self.index += 1;
+                    if str::from_utf8(&self.input[start + 1..self.index - 1]).is_err() {
+                        return Err(Error::new(self.index, "string is not UTF-8"));
+                    }
+                    return Ok((start, self.index));
+                }
+                b'\\' => {
+                    self.index += 1;
+                    let Some(escape) = self.input.get(self.index).copied() else {
+                        return Err(Error::new(self.index, "unterminated escape"));
+                    };
+                    self.index += 1;
+                    if escape == b'u' {
+                        let start = self.index;
+                        self.index += 4;
+                        let Some(hex) = self.input.get(start..self.index) else {
+                            return Err(Error::new(start, "invalid Unicode escape"));
+                        };
+                        let Some(code) = hex_code(hex) else {
+                            return Err(Error::new(start, "invalid Unicode escape"));
+                        };
+                        if (0xd800..=0xdbff).contains(&code) {
+                            if self.input.get(self.index..self.index + 2) != Some(b"\\u") {
+                                return Err(Error::new(
+                                    self.index,
+                                    "high surrogate is not followed by a low surrogate",
+                                ));
+                            }
+                            let low_start = self.index + 2;
+                            self.index += 6;
+                            let Some(hex) = self.input.get(low_start..self.index) else {
+                                return Err(Error::new(low_start, "invalid Unicode escape"));
+                            };
+                            let Some(low) = hex_code(hex) else {
+                                return Err(Error::new(low_start, "invalid Unicode escape"));
+                            };
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return Err(Error::new(
+                                    low_start,
+                                    "high surrogate is not followed by a low surrogate",
+                                ));
+                            }
+                        } else if (0xdc00..=0xdfff).contains(&code) {
+                            return Err(Error::new(start, "unexpected low surrogate"));
+                        }
+                    } else if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return Err(Error::new(self.index - 1, "invalid escape sequence"));
+                    }
+                }
+                byte if byte < 0x20 => {
+                    return Err(Error::new(self.index, "control character in string"));
+                }
+                _ => self.index += 1,
+            }
+        }
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), Error> {
+        if depth >= MAX_DEPTH {
+            return Err(Error::new(self.index, "nesting exceeds 128 levels"));
+        }
+        let Some(byte) = self.input.get(self.index).copied() else {
+            return Err(Error::new(self.index, "expected a value"));
+        };
+        match byte {
+            b'"' => {
+                self.parse_string()?;
+            }
+            b'[' => {
+                self.index += 1;
+                self.skip_space();
+                if self.take(b']') {
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value(depth + 1)?;
+                    self.skip_space();
+                    if self.take(b']') {
+                        return Ok(());
+                    }
+                    if !self.take(b',') {
+                        return Err(Error::new(self.index, "expected ',' or ']' in array"));
+                    }
+                    self.skip_space();
+                }
+            }
+            b'{' => {
+                self.index += 1;
+                self.skip_space();
+                if self.take(b'}') {
+                    return Ok(());
+                }
+                loop {
+                    self.parse_string()?;
+                    self.skip_space();
+                    if !self.take(b':') {
+                        return Err(Error::new(self.index, "expected ':' after object key"));
+                    }
+                    self.skip_space();
+                    self.skip_value(depth + 1)?;
+                    self.skip_space();
+                    if self.take(b'}') {
+                        return Ok(());
+                    }
+                    if !self.take(b',') {
+                        return Err(Error::new(self.index, "expected ',' or '}' in object"));
+                    }
+                    self.skip_space();
+                }
+            }
+            b'n' if self.take_keyword(b"null") => {}
+            b't' if self.take_keyword(b"true") => {}
+            b'f' if self.take_keyword(b"false") => {}
+            b'-' | b'0'..=b'9' => self.skip_number()?,
+            _ => return Err(Error::new(self.index, "expected a value")),
+        }
+        Ok(())
+    }
+
+    fn take_keyword(&mut self, keyword: &[u8]) -> bool {
+        if self.input.get(self.index..self.index + keyword.len()) == Some(keyword) {
+            self.index += keyword.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_number(&mut self) -> Result<(), Error> {
+        self.take(b'-');
+        match self.input.get(self.index).copied() {
+            Some(b'0') => {
+                self.index += 1;
+                if self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    return Err(Error::new(self.index, "leading zero in number"));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.index += 1;
+                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    self.index += 1;
+                }
+            }
+            _ => return Err(Error::new(self.index, "invalid number")),
+        }
+        if self.take(b'.') {
+            let start = self.index;
+            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                self.index += 1;
+            }
+            if self.index == start {
+                return Err(Error::new(self.index, "fraction has no digits"));
+            }
+        }
+        if self
+            .input
+            .get(self.index)
+            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
+        {
+            self.index += 1;
+            if self
+                .input
+                .get(self.index)
+                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+            {
+                self.index += 1;
+            }
+            let start = self.index;
+            while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                self.index += 1;
+            }
+            if self.index == start {
+                return Err(Error::new(self.index, "exponent has no digits"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hex_code(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    bytes.iter().try_fold(0u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        Some(value * 16 + u16::from(digit))
+    })
+}
+
 macro_rules! value_number_eq {
     ($($type:ty),* $(,)?) => {
         $(
@@ -943,5 +1355,30 @@ break"}"#,
         let rejected = format!("{}0{}", "[".repeat(129), "]".repeat(129));
         assert!(from_str(&accepted).is_ok());
         assert!(from_str(&rejected).is_err());
+    }
+
+    #[test]
+    fn top_level_scan_ignores_nested_keys() {
+        let fields =
+            scan_top_level(br#"{"params":{"method":"nested"},"method":"initialized","id":12}"#)
+                .unwrap();
+        assert!(fields.method.unwrap().string_eq("initialized"));
+        assert_eq!(fields.id.unwrap().as_i64(), Some(12));
+    }
+
+    #[test]
+    fn top_level_scan_matches_escaped_and_duplicate_keys() {
+        let fields = scan_top_level(
+            br#"{"met\u0068od":"ignored","method":"init\u0069alized","id":1,"id":2}"#,
+        )
+        .unwrap();
+        assert!(fields.method.unwrap().string_eq("initialized"));
+        assert_eq!(fields.id.unwrap().as_i64(), Some(2));
+    }
+
+    #[test]
+    fn top_level_scan_rejects_invalid_nested_values() {
+        assert!(scan_top_level(br#"{"params":{"x":}}"#).is_err());
+        assert!(scan_top_level(br#"[1]"#).is_err());
     }
 }

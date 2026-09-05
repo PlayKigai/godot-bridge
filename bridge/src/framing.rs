@@ -2,10 +2,13 @@ use std::fmt;
 
 use crate::json::Value;
 use std::io::{Read, Write};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const HEADER_CAP: usize = 16 * 1024;
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+const READ_CHUNK_SIZE: usize = 8192;
 
 #[derive(Debug)]
 pub enum FrameError {
@@ -29,6 +32,7 @@ impl std::error::Error for FrameError {}
 pub struct FrameDecoder {
     cap: usize,
     buf: Vec<u8>,
+    consumed: usize,
 }
 
 impl FrameDecoder {
@@ -36,6 +40,7 @@ impl FrameDecoder {
         Self {
             cap,
             buf: Vec::new(),
+            consumed: 0,
         }
     }
 
@@ -43,16 +48,20 @@ impl FrameDecoder {
         self.buf.extend_from_slice(bytes);
     }
 
-    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+    pub fn next_frame(&mut self) -> Result<Option<&[u8]>, FrameError> {
+        if self.consumed >= COMPACT_THRESHOLD {
+            self.compact();
+        }
+        let input = &self.buf[self.consumed..];
         let (header_end, delimiter_len) = match (
-            self.buf.windows(4).position(|window| window == b"\r\n\r\n"),
-            self.buf.windows(2).position(|window| window == b"\n\n"),
+            input.windows(4).position(|window| window == b"\r\n\r\n"),
+            input.windows(2).position(|window| window == b"\n\n"),
         ) {
             (Some(crlf_end), Some(lf_end)) if lf_end < crlf_end => (lf_end, 2),
             (Some(crlf_end), _) => (crlf_end, 4),
             (None, Some(lf_end)) => (lf_end, 2),
             (None, None) => {
-                if self.buf.len() > HEADER_CAP {
+                if input.len() > HEADER_CAP {
                     return Err(FrameError::Malformed("frame header is too long".to_owned()));
                 }
                 return Ok(None);
@@ -63,7 +72,7 @@ impl FrameDecoder {
             return Err(FrameError::Malformed("frame header is too long".to_owned()));
         }
 
-        let header = &self.buf[..header_end];
+        let header = &input[..header_end];
         let mut content_length = None;
         for line in header.split(|byte| *byte == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -73,18 +82,18 @@ impl FrameDecoder {
                 ));
             };
             let name = &line[..separator];
-            let value = line[separator + 1..]
+            let value_start = line[separator + 1..]
                 .iter()
-                .copied()
-                .skip_while(u8::is_ascii_whitespace)
-                .collect::<Vec<_>>();
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map_or(line.len(), |offset| separator + 1 + offset);
+            let value = &line[value_start..];
             if name.eq_ignore_ascii_case(b"Content-Length") {
                 if content_length.is_some() {
                     return Err(FrameError::Malformed(
                         "duplicate Content-Length header".to_string(),
                     ));
                 }
-                let value = std::str::from_utf8(&value).map_err(|_| {
+                let value = std::str::from_utf8(value).map_err(|_| {
                     FrameError::Malformed("Content-Length is not ASCII".to_string())
                 })?;
                 let length = value.trim().parse::<usize>().map_err(|_| {
@@ -104,17 +113,28 @@ impl FrameDecoder {
         let body_end = body_start
             .checked_add(length)
             .ok_or(FrameError::Oversized(usize::MAX))?;
-        if self.buf.len() < body_end {
+        if input.len() < body_end {
             return Ok(None);
         }
 
-        let body = self.buf[body_start..body_end].to_vec();
-        self.buf.drain(..body_end);
-        Ok(Some(body))
+        let body_start = self.consumed + body_start;
+        let body_end = self.consumed + body_end;
+        self.consumed = body_end;
+        Ok(Some(&self.buf[body_start..body_end]))
     }
 
     fn has_pending_bytes(&self) -> bool {
-        !self.buf.is_empty()
+        self.consumed < self.buf.len()
+    }
+
+    fn compact(&mut self) {
+        if self.consumed == self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.buf.copy_within(self.consumed.., 0);
+            self.buf.truncate(self.buf.len() - self.consumed);
+        }
+        self.consumed = 0;
     }
 }
 
@@ -123,22 +143,38 @@ pub struct FrameReader<R: Read> {
     decoder: FrameDecoder,
 }
 
-pub type FrameEvent = Result<Option<Vec<u8>>, FrameError>;
+pub struct ReadChunk {
+    bytes: [u8; READ_CHUNK_SIZE],
+    len: usize,
+}
+
+pub(crate) type ReadEvent = Result<Option<ReadChunk>, std::io::Error>;
 
 pub fn spawn_frame_reader<R: Read + Send + 'static>(
     name: &str,
-    reader: R,
-    cap: usize,
-    sender: SyncSender<FrameEvent>,
+    mut reader: R,
+    _cap: usize,
+    sender: SyncSender<ReadEvent>,
 ) -> std::io::Result<JoinHandle<()>> {
     let name = name.to_owned();
     thread::Builder::new()
         .name(name)
         .stack_size(256 * 1024)
         .spawn(move || {
-            let mut reader = FrameReader::new(reader, cap);
+            let mut bytes = [0; READ_CHUNK_SIZE];
             loop {
-                let event = reader.read_frame();
+                let event = match reader.read(&mut bytes) {
+                    Ok(0) => Ok(None),
+                    Ok(len) => {
+                        let mut chunk = ReadChunk {
+                            bytes: [0; READ_CHUNK_SIZE],
+                            len,
+                        };
+                        chunk.bytes[..len].copy_from_slice(&bytes[..len]);
+                        Ok(Some(chunk))
+                    }
+                    Err(error) => Err(error),
+                };
                 let done = matches!(&event, Ok(None) | Err(_));
                 if sender.send(event).is_err() {
                     return;
@@ -148,6 +184,95 @@ pub fn spawn_frame_reader<R: Read + Send + 'static>(
                 }
             }
         })
+}
+
+pub enum FramePoll<T> {
+    Frame(T),
+    Empty,
+    End,
+}
+
+pub struct FrameInput {
+    receiver: Receiver<ReadEvent>,
+    decoder: FrameDecoder,
+    eof: bool,
+}
+
+impl FrameInput {
+    pub fn new(receiver: Receiver<ReadEvent>, cap: usize) -> Self {
+        Self {
+            receiver,
+            decoder: FrameDecoder::new(cap),
+            eof: false,
+        }
+    }
+
+    pub fn with_next_frame<T>(
+        &mut self,
+        callback: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, FrameError> {
+        loop {
+            if let Some(body) = self.decoder.next_frame()? {
+                return Ok(Some(callback(body)));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            match self.receiver.recv() {
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(None)) => self.eof = true,
+                Ok(Err(error)) => return Err(FrameError::Io(error)),
+                Err(_) => return Err(FrameError::Io(std::io::Error::other("reader is closed"))),
+            }
+        }
+    }
+
+    pub fn try_with_next_frame<T>(
+        &mut self,
+        callback: impl FnOnce(&[u8]) -> T,
+    ) -> Result<FramePoll<T>, FrameError> {
+        loop {
+            if let Some(body) = self.decoder.next_frame()? {
+                return Ok(FramePoll::Frame(callback(body)));
+            }
+            if self.eof {
+                return Ok(FramePoll::End);
+            }
+            match self.receiver.try_recv() {
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(None)) => self.eof = true,
+                Ok(Err(error)) => return Err(FrameError::Io(error)),
+                Err(TryRecvError::Empty) => return Ok(FramePoll::Empty),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(FrameError::Io(std::io::Error::other("reader is closed")))
+                }
+            }
+        }
+    }
+
+    pub fn recv_timeout_with_frame<T>(
+        &mut self,
+        timeout: Duration,
+        callback: impl FnOnce(&[u8]) -> T,
+    ) -> Result<FramePoll<T>, FrameError> {
+        loop {
+            if let Some(body) = self.decoder.next_frame()? {
+                return Ok(FramePoll::Frame(callback(body)));
+            }
+            if self.eof {
+                return Ok(FramePoll::End);
+            }
+            match self.receiver.recv_timeout(timeout) {
+                Ok(Ok(Some(chunk))) => self.decoder.push(&chunk.bytes[..chunk.len]),
+                Ok(Ok(None)) => self.eof = true,
+                Ok(Err(error)) => return Err(FrameError::Io(error)),
+                Err(RecvTimeoutError::Timeout) => return Ok(FramePoll::Empty),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(FrameError::Io(std::io::Error::other("reader is closed")))
+                }
+            }
+        }
+    }
 }
 
 impl<R: Read> FrameReader<R> {
@@ -167,7 +292,7 @@ impl<R: Read> FrameReader<R> {
         let mut bytes = [0u8; 8192];
         loop {
             if let Some(frame) = self.decoder.next_frame()? {
-                return Ok(Some(frame));
+                return Ok(Some(frame.to_owned()));
             }
 
             let count = self.reader.read(&mut bytes).map_err(FrameError::Io)?;
@@ -193,9 +318,11 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8], cap: usize) -> Result<
     if body.len() > cap {
         return Err(FrameError::Oversized(body.len()));
     }
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer
-        .write_all(&encode_frame(body))
-        .map_err(FrameError::Io)
+        .write_all(header.as_bytes())
+        .map_err(FrameError::Io)?;
+    writer.write_all(body).map_err(FrameError::Io)
 }
 
 pub fn parse_json_object(body: &[u8], protocol: &str) -> Result<Value, String> {
@@ -237,15 +364,24 @@ mod tests {
         decoder.push(b"Content-Length: 5\r\n");
         assert!(decoder.next_frame().unwrap().is_none());
         decoder.push(b"\r\nhello");
-        assert_eq!(decoder.next_frame().unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(
+            decoder.next_frame().unwrap().map(|body| body.to_vec()),
+            Some(b"hello".to_vec())
+        );
     }
 
     #[test]
     fn two_messages_in_one_read() {
         let mut decoder = FrameDecoder::new(64);
         decoder.push(b"Content-Length: 1\n\naContent-Length: 1\r\n\nb");
-        assert_eq!(decoder.next_frame().unwrap(), Some(b"a".to_vec()));
-        assert_eq!(decoder.next_frame().unwrap(), Some(b"b".to_vec()));
+        assert_eq!(
+            decoder.next_frame().unwrap().map(|body| body.to_vec()),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            decoder.next_frame().unwrap().map(|body| body.to_vec()),
+            Some(b"b".to_vec())
+        );
     }
 
     #[test]
@@ -282,6 +418,69 @@ mod tests {
     fn eof_mid_frame() {
         let mut reader = FrameReader::new(Cursor::new(b"Content-Length: 4\r\n\r\nabc"), 64);
         assert!(matches!(reader.read_frame(), Err(FrameError::Malformed(_))));
+    }
+
+    #[test]
+    fn consumed_prefix_is_compacted_after_threshold() {
+        let frame = encode_frame(b"x");
+        let mut decoder = FrameDecoder::new(64);
+        decoder.push(&frame);
+        assert_eq!(decoder.next_frame().unwrap(), Some(&b"x"[..]));
+        assert!(decoder.consumed < COMPACT_THRESHOLD);
+
+        let frames = frame.repeat(COMPACT_THRESHOLD / frame.len() + 1);
+        decoder.push(&frames);
+        let mut count = 0;
+        while decoder.next_frame().unwrap().is_some() {
+            count += 1;
+        }
+        assert!(count > COMPACT_THRESHOLD / frame.len());
+        assert!(decoder.consumed < COMPACT_THRESHOLD);
+    }
+
+    #[test]
+    fn proxy_forwarding_benchmark() {
+        let frames = [
+            (
+                "didChange",
+                br#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/main.gd","version":2},"contentChanges":[{"text":"extends Node\n"}]}}"#
+                    .as_slice(),
+            ),
+            (
+                "publishDiagnostics",
+                br#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///tmp/main.gd","diagnostics":[]}}"#
+                    .as_slice(),
+            ),
+            (
+                "completionResponse",
+                br#"{"jsonrpc":"2.0","id":17,"result":{"isIncomplete":false,"items":[{"label":"ready","kind":3}]}}"#
+                    .as_slice(),
+            ),
+        ];
+        for (name, body) in frames {
+            let mut output = Vec::new();
+            let mut checksum = 0usize;
+            let start = std::time::Instant::now();
+            for _ in 0..10_000 {
+                let value = parse_json_object(body, "LSP").unwrap();
+                let serialized = crate::json::to_vec(&value);
+                write_frame(&mut output, &serialized, 64 * 1024 * 1024).unwrap();
+                checksum = checksum.wrapping_add(output.len());
+                output.clear();
+            }
+            let reference = start.elapsed().as_nanos() / 10_000;
+            let start = std::time::Instant::now();
+            for _ in 0..10_000 {
+                crate::json::scan_top_level(body).unwrap();
+                write_frame(&mut output, body, 64 * 1024 * 1024).unwrap();
+                checksum = checksum.wrapping_add(output.len());
+                output.clear();
+            }
+            let optimized = start.elapsed().as_nanos() / 10_000;
+            println!("proxy {name}: reference={reference} ns/frame optimized={optimized} ns/frame");
+            std::hint::black_box(checksum);
+            assert_ne!(checksum, 0);
+        }
     }
 
     #[test]

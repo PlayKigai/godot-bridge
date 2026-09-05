@@ -198,7 +198,11 @@ pub(super) fn finish_recovery(session: &mut Session, queue: &mut RecoveryQueue) 
             message,
         )?;
     }
-    flush_queued(&mut session.output, &mut session.editor, &mut session.proxy)
+    flush_queued(
+        &mut session.output,
+        &mut session.editor.connection.writer,
+        &mut session.proxy,
+    )
 }
 
 fn replay_open_documents(session: &mut Session) -> Result<()> {

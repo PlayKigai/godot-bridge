@@ -12,7 +12,7 @@ pub(super) fn connection_from_stream(stream: TcpStream) -> Connection {
     .expect("Godot reader thread should spawn");
     Connection {
         socket: stream.try_clone().expect("Godot stream should clone"),
-        reader: Some(receiver),
+        reader: Some(FrameInput::new(receiver, GODOT_FRAME_CAP)),
         reader_thread: Some(reader_thread),
         writer: stream,
     }

@@ -57,13 +57,15 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         if (!session.proxy.bulk_documents.is_empty()
             && (session.proxy.bulk_documents.len() >= BULK_DOCUMENTS
                 || session.proxy.bulk_complete))
-            && (session.proxy.bulk_deadline.is_some_and(|deadline| deadline <= now)
+            && (session
+                .proxy
+                .bulk_deadline
+                .is_some_and(|deadline| deadline <= now)
                 || session.proxy.pending.len() < IN_FLIGHT_CAP)
         {
-            if let Err(error) = pump_bulk_documents(
-                &mut session.proxy,
-                &mut session.editor,
-            ) {
+            if let Err(error) =
+                pump_bulk_documents(&mut session.proxy, &mut session.editor.connection.writer)
+            {
                 if unmanaged {
                     return exit_session(&mut session, 1);
                 }
@@ -95,77 +97,73 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         for offset in 0..5 {
             match (turn + offset) % 5 {
                 0 => {
-                    if let Ok(event) = session.input.try_recv() {
-                        processed = true;
-                        match event {
-                            Ok(Some(body)) => {
-                                let message = match parse_message(&body) {
-                                    Ok(message) => message,
-                                    Err(error) => {
-                                        crate::error!("malformed client message: {error}");
-                                        return exit_session(&mut session, 1);
-                                    }
-                                };
-                                match message.get("method").and_then(Value::as_str) {
-                                    Some("exit") => return exit_session(&mut session, 0),
-                                    Some("shutdown") => {
-                                        return shutdown_session(&mut session, message)
-                                    }
-                                    _ => {}
-                                }
-                                if let Err(error) = forward_client_message(
-                                    &mut session.editor,
-                                    &mut session.output,
-                                    &mut session.proxy,
-                                    &session.settings,
-                                    message,
-                                ) {
-                                    crate::error!("cannot forward client message: {error}");
-                                    if unmanaged {
-                                        return exit_session(&mut session, 1);
-                                    }
-                                    recover(&mut session, &error.to_string(), true)?;
-                                }
+                    let event = {
+                        let input = &mut session.input;
+                        let editor = &mut session.editor;
+                        let output = &mut session.output;
+                        let proxy = &mut session.proxy;
+                        let settings = &session.settings;
+                        input.try_with_next_frame(|body| {
+                            process_client_frame(editor, output, proxy, settings, body)
+                        })
+                    };
+                    match event {
+                        Ok(FramePoll::Frame(Ok(frame))) => {
+                            processed = true;
+                            if let Some(code) = handle_client_frame(&mut session, unmanaged, frame)?
+                            {
+                                return Ok(code);
                             }
-                            Ok(None) => return exit_session(&mut session, 0),
-                            Err(error) => {
-                                crate::error!("malformed client frame: {error}");
-                                return exit_session(&mut session, 1);
-                            }
+                        }
+                        Ok(FramePoll::End) => return exit_session(&mut session, 0),
+                        Ok(FramePoll::Empty) => {}
+                        Ok(FramePoll::Frame(Err(error))) => {
+                            crate::error!("malformed client message: {error}");
+                            return exit_session(&mut session, 1);
+                        }
+                        Err(error) => {
+                            crate::error!("malformed client frame: {error}");
+                            return exit_session(&mut session, 1);
                         }
                     }
                 }
                 1 => {
-                    if let Some(event) = session.editor.connection.try_read_frame() {
-                        processed = true;
-                        match event {
-                            Ok(Some(body)) => match forward_server_message(
-                                &mut session.editor,
-                                &mut session.output,
-                                &mut session.proxy,
-                                &body,
-                                false,
-                            ) {
-                                Ok(()) => {}
-                                Err(error) => {
-                                    crate::error!("cannot forward server message: {error}");
-                                    if unmanaged {
-                                        return exit_session(&mut session, 1);
-                                    }
-                                    recover(&mut session, &error.to_string(), true)?;
-                                }
-                            },
-                            Ok(None) | Err(_) => {
-                                if unmanaged {
-                                    return exit_session(&mut session, 1);
-                                }
-                                let reason = session
-                                    .editor
-                                    .child
-                                    .as_mut()
-                                    .and_then(|child| child.child.try_wait().ok().flatten());
-                                recover_with_status(&mut session, reason)?;
+                    let lsp_port = session.editor.lsp_port;
+                    let event = {
+                        let connection = &mut session.editor.connection;
+                        let reader = connection.reader.as_mut();
+                        let writer = &mut connection.writer;
+                        let output = &mut session.output;
+                        let proxy = &mut session.proxy;
+                        reader
+                            .ok_or_else(|| {
+                                crate::framing::FrameError::Io(io::Error::other("reader is closed"))
+                            })?
+                            .try_with_next_frame(|body| {
+                                forward_server_message(writer, lsp_port, output, proxy, body, false)
+                            })
+                    };
+                    match event {
+                        Ok(FramePoll::Frame(Ok(()))) => processed = true,
+                        Ok(FramePoll::Frame(Err(error))) => {
+                            processed = true;
+                            crate::error!("cannot forward server message: {error}");
+                            if unmanaged {
+                                return exit_session(&mut session, 1);
                             }
+                            recover(&mut session, &error.to_string(), true)?;
+                        }
+                        Ok(FramePoll::Empty) => {}
+                        Ok(FramePoll::End) | Err(_) => {
+                            if unmanaged {
+                                return exit_session(&mut session, 1);
+                            }
+                            let reason = session
+                                .editor
+                                .child
+                                .as_mut()
+                                .and_then(|child| child.child.try_wait().ok().flatten());
+                            recover_with_status(&mut session, reason)?;
                         }
                     }
                 }
@@ -215,7 +213,7 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                 if session.proxy.bulk_documents.len() >= BULK_DOCUMENTS {
                                     if let Err(error) = pump_bulk_documents(
                                         &mut session.proxy,
-                                        &mut session.editor,
+                                        &mut session.editor.connection.writer,
                                     ) {
                                         if unmanaged {
                                             return exit_session(&mut session, 1);
@@ -225,18 +223,19 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
                                 }
                             }
                             InternalEvent::BulkComplete { generation }
-                                if generation == session.proxy.bulk_generation => {
-                                    session.proxy.bulk_complete = true;
-                                    if let Err(error) = pump_bulk_documents(
-                                        &mut session.proxy,
-                                        &mut session.editor,
-                                    ) {
-                                        if unmanaged {
-                                            return exit_session(&mut session, 1);
-                                        }
-                                        recover(&mut session, &error.to_string(), true)?;
+                                if generation == session.proxy.bulk_generation =>
+                            {
+                                session.proxy.bulk_complete = true;
+                                if let Err(error) = pump_bulk_documents(
+                                    &mut session.proxy,
+                                    &mut session.editor.connection.writer,
+                                ) {
+                                    if unmanaged {
+                                        return exit_session(&mut session, 1);
                                     }
+                                    recover(&mut session, &error.to_string(), true)?;
                                 }
+                            }
                             InternalEvent::Bulk { .. } => {}
                             InternalEvent::BulkComplete { .. } => {}
                         }
@@ -276,33 +275,76 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         if wait.is_zero() {
             continue;
         }
-        match session.input.recv_timeout(wait) {
-            Ok(Ok(Some(body))) => {
-                let message = parse_message(&body)?;
-                match message.get("method").and_then(Value::as_str) {
-                    Some("exit") => return exit_session(&mut session, 0),
-                    Some("shutdown") => return shutdown_session(&mut session, message),
-                    _ => {
-                        if let Err(error) = forward_client_message(
-                            &mut session.editor,
-                            &mut session.output,
-                            &mut session.proxy,
-                            &session.settings,
-                            message,
-                        ) {
-                            if unmanaged {
-                                return exit_session(&mut session, 1);
-                            }
-                            recover(&mut session, &error.to_string(), true)?;
-                        }
-                    }
+        let event = {
+            let input = &mut session.input;
+            let editor = &mut session.editor;
+            let output = &mut session.output;
+            let proxy = &mut session.proxy;
+            let settings = &session.settings;
+            input.recv_timeout_with_frame(wait, |body| {
+                process_client_frame(editor, output, proxy, settings, body)
+            })
+        };
+        match event {
+            Ok(FramePoll::Frame(Ok(frame))) => {
+                if let Some(code) = handle_client_frame(&mut session, unmanaged, frame)? {
+                    return Ok(code);
                 }
             }
-            Ok(Ok(None)) => return exit_session(&mut session, 0),
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return exit_session(&mut session, 1)
+            Ok(FramePoll::End) => return exit_session(&mut session, 0),
+            Ok(FramePoll::Empty) => {}
+            Ok(FramePoll::Frame(Err(error))) => return Err(error.into()),
+            Err(_) => return exit_session(&mut session, 1),
+        }
+    }
+}
+
+enum ClientFrame {
+    Exit,
+    Shutdown(Value),
+    Forward(Result<()>),
+}
+
+fn process_client_frame(
+    editor: &mut Editor,
+    output: &mut ClientWriter,
+    proxy: &mut ProxyState,
+    settings: &Settings,
+    body: &[u8],
+) -> std::result::Result<ClientFrame, String> {
+    let fields = crate::json::scan_top_level(body).map_err(|error| error.to_string())?;
+    if fields.method.is_some_and(|method| method.string_eq("exit")) {
+        return Ok(ClientFrame::Exit);
+    }
+    if fields
+        .method
+        .is_some_and(|method| method.string_eq("shutdown"))
+    {
+        return parse_message(body)
+            .map(ClientFrame::Shutdown)
+            .map_err(|error| error.to_string());
+    }
+    Ok(ClientFrame::Forward(forward_client_body(
+        editor, output, proxy, settings, body, fields,
+    )))
+}
+
+fn handle_client_frame(
+    session: &mut Session,
+    unmanaged: bool,
+    frame: ClientFrame,
+) -> Result<Option<ExitCode>> {
+    match frame {
+        ClientFrame::Exit => Ok(Some(exit_session(session, 0)?)),
+        ClientFrame::Shutdown(message) => Ok(Some(shutdown_session(session, message)?)),
+        ClientFrame::Forward(Ok(())) => Ok(None),
+        ClientFrame::Forward(Err(error)) => {
+            crate::error!("cannot forward client message: {error}");
+            if unmanaged {
+                return Ok(Some(exit_session(session, 1)?));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            recover(session, &error.to_string(), true)?;
+            Ok(None)
         }
     }
 }
@@ -339,7 +381,8 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
                     .and_then(|message| message.get("id").and_then(Value::as_i64))
                     == Some(bridge_id);
                 forward_server_message(
-                    &mut session.editor,
+                    &mut session.editor.connection.writer,
+                    session.editor.lsp_port,
                     &mut session.output,
                     &mut session.proxy,
                     &body,
