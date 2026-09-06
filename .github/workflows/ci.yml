@@ -32,6 +32,18 @@ jobs:
       - run: cargo build --locked --offline --target wasm32-wasip2 -p godot-zed-extension
       - run: python3 scripts/check_build_scripts.py
 
+  check-windows:
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+        with:
+          components: clippy
+      - run: cargo fetch --locked
+      - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - run: cargo test --locked --offline -p godot-bridge
+
   supply-chain:
     runs-on: ubuntu-latest
     permissions:

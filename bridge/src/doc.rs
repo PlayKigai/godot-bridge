@@ -1,14 +1,9 @@
-use std::process::Command;
-
 const DOC_BASE: &str = "https://docs.godotengine.org/en/stable/classes/";
 
 pub fn open_doc(symbol: &str) -> crate::error::Result<()> {
     let root = crate::root::cwd_root()?;
     crate::settings_file::load_zed_settings(&root)?;
-    let status = Command::new("xdg-open").arg(doc_url(symbol)?).status()?;
-    if !status.success() {
-        crate::bail!("xdg-open exited {status}");
-    }
+    crate::sys::open_url(&doc_url(symbol)?)?;
     Ok(())
 }
 

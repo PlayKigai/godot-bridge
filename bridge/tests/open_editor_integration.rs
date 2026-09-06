@@ -20,18 +20,15 @@ impl Drop for GuiEditorGuard<'_> {
         if value["mode"] != "gui" {
             return;
         }
-        if let Some(pid) = value["godot_pid"].as_i64() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+        if let Some(pid) = value["godot_pid"].as_u64() {
+            kill_process(pid as u32);
         }
     }
 }
 
 #[test]
 fn open_editor_handoff_and_gui_recovery() {
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        println!("skipping open-editor integration test: DISPLAY and WAYLAND_DISPLAY are unset");
+    if !display_available("open-editor integration test") {
         return;
     }
     if !godot_available("open-editor integration test") {
@@ -45,7 +42,10 @@ fn open_editor_handoff_and_gui_recovery() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("settings.json"),
-        r#"{"lsp":{"godot":{"settings":{"godot_path":"/usr/bin/godot","startup_timeout_s":60}}}}"#,
+        format!(
+            r#"{{"lsp":{{"godot":{{"settings":{{"godot_path":{},"startup_timeout_s":60}}}}}}}}"#,
+            godot_path_json()
+        ),
     )
     .unwrap();
     let project = fixture("minimal-project");
@@ -70,14 +70,13 @@ fn open_editor_handoff_and_gui_recovery() {
         project: &project,
         config: config.path(),
     };
-    let output = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_godot-bridge"));
+    command
         .args(["open-editor", "--file", "fixtures/minimal-project/main.gd"])
         .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("XDG_CONFIG_HOME", config.path())
-        .env("GODOT_BRIDGE_LOG", "error")
-        .output()
-        .unwrap();
+        .env("GODOT_BRIDGE_LOG", "error");
+    common::redirect_directories(&mut command, runtime.path(), config.path());
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -89,7 +88,7 @@ fn open_editor_handoff_and_gui_recovery() {
     let gui = wait_for_status(runtime.path(), &project, config.path(), |value| {
         value["status"] == "ready" && value["mode"] == "gui"
     });
-    let gui_pid = gui["godot_pid"].as_i64().unwrap();
+    let gui_pid = gui["godot_pid"].as_u64().unwrap() as u32;
     client.send(json!({
         "jsonrpc":"2.0",
         "id":2,
@@ -101,9 +100,7 @@ fn open_editor_handoff_and_gui_recovery() {
     });
     assert!(completion.get("error").is_none(), "{completion}");
 
-    unsafe {
-        libc::kill(gui_pid as libc::pid_t, libc::SIGKILL);
-    }
+    kill_process(gui_pid);
     wait_for_status(runtime.path(), &project, config.path(), |value| {
         value["status"] == "ready" && value["mode"] == "headless"
     });

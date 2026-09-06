@@ -1,6 +1,7 @@
+use std::ffi::OsString;
+use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::{io, os::unix::fs::OpenOptionsExt};
 
 use crate::json::{Map, Value};
 
@@ -254,10 +255,7 @@ fn read_settings_section(path: &Path) -> Result<Option<Map>, String> {
     if metadata.len() > SETTINGS_FILE_CAP {
         return Err(format!("{}: settings file exceeds 1 MiB", path.display()));
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    let file = crate::sys::open_nofollow_read(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut text = String::new();
     file.take(SETTINGS_FILE_CAP + 1)
@@ -298,12 +296,31 @@ fn read_user_section(path: Option<&Path>) -> Result<Option<Map>, String> {
     Ok(section)
 }
 
+#[cfg(unix)]
+const CONFIG_HOME_FALLBACK: &str = "HOME";
+#[cfg(windows)]
+const CONFIG_HOME_FALLBACK: &str = "APPDATA";
+
 fn user_settings_path() -> Option<PathBuf> {
-    let config = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
-    };
-    Some(config.join("zed").join("settings.json"))
+    let directory = zed_config_dir(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os(CONFIG_HOME_FALLBACK),
+    )?;
+    Some(directory.join("settings.json"))
+}
+
+/// Zed reads its user settings from `$XDG_CONFIG_HOME/zed`, falling back to
+/// `~/.config/zed` and, on Windows, to `%APPDATA%\Zed`.
+fn zed_config_dir(config_home: Option<OsString>, fallback: Option<OsString>) -> Option<PathBuf> {
+    if let Some(directory) = config_home {
+        return Some(PathBuf::from(directory).join("zed"));
+    }
+    let fallback = PathBuf::from(fallback?);
+    #[cfg(unix)]
+    let directory = fallback.join(".config").join("zed");
+    #[cfg(windows)]
+    let directory = fallback.join("Zed");
+    Some(directory)
 }
 
 #[cfg(test)]
@@ -311,6 +328,25 @@ mod tests {
     use super::*;
     use crate::temp::TempDir;
     use std::fs;
+
+    #[test]
+    fn user_settings_live_where_zed_keeps_them() {
+        assert_eq!(
+            zed_config_dir(Some(OsString::from("/config")), None),
+            Some(PathBuf::from("/config").join("zed"))
+        );
+        assert_eq!(zed_config_dir(None, None), None);
+        #[cfg(unix)]
+        assert_eq!(
+            zed_config_dir(None, Some(OsString::from("/home/user"))),
+            Some(PathBuf::from("/home/user/.config/zed"))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            zed_config_dir(None, Some(OsString::from(r"C:\Users\u\AppData\Roaming"))),
+            Some(PathBuf::from(r"C:\Users\u\AppData\Roaming\Zed"))
+        );
+    }
 
     fn user_settings_path_in(config_dir: &Path) -> PathBuf {
         config_dir.join("zed").join("settings.json")
@@ -370,23 +406,31 @@ mod tests {
         }
     }
 
+    /// An absolute path to a real executable the settings loader will accept.
+    #[cfg(unix)]
+    const TRUSTED_GODOT_PATH: &str = "/bin/sh";
+    #[cfg(windows)]
+    const TRUSTED_GODOT_PATH: &str = "C:/Windows/System32/cmd.exe";
+
     #[test]
     fn project_settings_override_user_per_key() {
         let config_dir = TempDir::new().unwrap();
         write_user_settings(
             config_dir.path(),
-            r#"{
-                "lsp": {
-                    "godot": {
-                        "settings": {
-                            "godot_path": "/bin/sh",
+            &format!(
+                r#"{{
+                "lsp": {{
+                    "godot": {{
+                        "settings": {{
+                            "godot_path": "{TRUSTED_GODOT_PATH}",
                             "project_dir": "user-project",
                             "dap_port": 5555,
                             "diagnose_addons": true
-                        }
-                    }
-                }
-            }"#,
+                        }}
+                    }}
+                }}
+            }}"#
+            ),
         );
         let worktree = TempDir::new().unwrap();
         write_project_settings(
@@ -410,7 +454,7 @@ mod tests {
             Some(&user_settings_path_in(config_dir.path())),
         )
         .unwrap();
-        assert_eq!(settings.godot_path.as_deref(), Some("/bin/sh"));
+        assert_eq!(settings.godot_path.as_deref(), Some(TRUSTED_GODOT_PATH));
         assert_eq!(settings.project_dir.as_deref(), Some("user-project"));
         assert_eq!(settings.lsp_port, None);
         assert_eq!(settings.dap_port, 5555);
@@ -476,7 +520,11 @@ mod tests {
             Some(&user_settings_path_in(config_dir.path())),
         )
         .unwrap_err();
-        assert!(error.contains(".zed/settings.json"), "{error}");
+        let expected = Path::new(".zed").join("settings.json");
+        assert!(
+            error.contains(&expected.to_string_lossy().into_owned()),
+            "{error}"
+        );
         assert!(error.contains("dap_port"), "{error}");
     }
 }

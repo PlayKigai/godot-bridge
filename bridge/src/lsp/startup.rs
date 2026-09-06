@@ -56,7 +56,7 @@ pub(super) fn cleanup_runtime(runtime: &mut Runtime, child: Option<GodotChild>) 
 pub(super) fn stale_cleanup(files: &ProjectFiles, project: &Path) {
     if let Ok(Some(state)) = read_state(&files.state) {
         if state.mode == Mode::Gui {
-            let _ = std::fs::remove_file(&files.sock);
+            let _ = crate::sys::remove_socket(&files.sock);
             return;
         }
         if !matches_project(&state, project) {
@@ -66,7 +66,7 @@ pub(super) fn stale_cleanup(files: &ProjectFiles, project: &Path) {
             (state.godot_pid, state.godot_pgid, state.godot_start_ticks)
         {
             if crate::state::pid_alive_with_ticks(pid, ticks) {
-                if let Err(error) = kill_recorded(pid, pgid as i32, ticks) {
+                if let Err(error) = kill_recorded(pid, pgid, ticks) {
                     crate::warn!("cannot terminate stale Godot editor: {error}");
                 }
             }
@@ -78,7 +78,7 @@ pub(super) fn stale_cleanup(files: &ProjectFiles, project: &Path) {
 
 pub(super) fn cleanup_files(files: &ProjectFiles) {
     let _ = std::fs::remove_file(&files.state);
-    let _ = std::fs::remove_file(&files.sock);
+    let _ = crate::sys::remove_socket(&files.sock);
 }
 
 pub(super) fn update_state_spawned(
@@ -93,7 +93,7 @@ pub(super) fn update_state_spawned(
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.godot_pid = Some(child.pid);
-        state.godot_pgid = Some(child.pgid as u32);
+        state.godot_pgid = Some(child.pgid);
         state.lsp_port = Some(lsp_port);
         state.dap_port = Some(dap_port);
         state.godot_start_ticks = Some(child.start_ticks);
@@ -110,7 +110,7 @@ pub(super) fn set_ready(runtime: &Runtime, editor: &Editor) -> Result<()> {
         state.status = Status::Ready;
         if let Some(child) = editor.child.as_ref() {
             state.godot_pid = Some(child.pid);
-            state.godot_pgid = Some(child.pgid as u32);
+            state.godot_pgid = Some(child.pgid);
             state.godot_start_ticks = Some(child.start_ticks);
         }
         state.lsp_port = Some(editor.lsp_port);

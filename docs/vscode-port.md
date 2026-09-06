@@ -17,5 +17,5 @@ already uses, and skip the Zed files when it is set. About 30 lines.
 | settings | `godot.godotPath`, `projectDir`, `extraArgs`, `lspPort`, `dapPort`, `startupTimeoutS`, `projectDiagnostics`, `diagnoseAddons`, mapped 1:1 |
 
 Restart the client on settings change. Document uninstalling godot-tools,
-which claims `.gd` and its own debug type. The bridge is Linux only, which
-matters more for VS Code users than for Zed.
+which claims `.gd` and its own debug type. The bridge runs on Linux and
+Windows, not macOS, which matters more for VS Code users than for Zed.

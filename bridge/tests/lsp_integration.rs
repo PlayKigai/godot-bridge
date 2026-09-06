@@ -13,7 +13,8 @@ fn minimal_project_diagnostics_and_cleanup() {
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
-    assert!(initialize_lsp(&mut client, &project).get("error").is_none());
+    let initialize = initialize_lsp(&mut client, &project);
+    assert!(initialize.get("error").is_none(), "{initialize}");
     client.send(json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didOpen",
@@ -45,9 +46,10 @@ fn nested_project_is_selected() {
     let _godot_lock = lock_godot();
     let runtime = TempDir::new().unwrap();
     let project = fixture("nested");
-    let expected = fixture("nested/repo/game").canonicalize().unwrap();
+    let expected = canonical(&fixture("nested/repo/game"));
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
-    assert!(initialize_lsp(&mut client, &project).get("error").is_none());
+    let initialize = initialize_lsp(&mut client, &project);
+    assert!(initialize.get("error").is_none(), "{initialize}");
     let (_, state) = runtime_state(runtime.path(), &expected);
     assert_eq!(state["project"], expected.to_string_lossy().as_ref());
     close_and_wait(&mut client, runtime.path(), &expected);
@@ -62,7 +64,8 @@ fn second_owner_is_rejected() {
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut first = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
-    assert!(initialize_lsp(&mut first, &project).get("error").is_none());
+    let initialize = initialize_lsp(&mut first, &project);
+    assert!(initialize.get("error").is_none(), "{initialize}");
     let mut second = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
     let response = initialize_lsp(&mut second, &project);
     assert_eq!(response["error"]["code"], -32002);
@@ -82,13 +85,12 @@ fn godot_crash_recovers_completion() {
     let runtime = TempDir::new().unwrap();
     let project = fixture("minimal-project");
     let mut client = BridgeClient::start(Protocol::Lsp, &project, runtime.path(), None, None);
-    assert!(initialize_lsp(&mut client, &project).get("error").is_none());
+    let initialize = initialize_lsp(&mut client, &project);
+    assert!(initialize.get("error").is_none(), "{initialize}");
     client.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
     let (_, state) = runtime_state(runtime.path(), &project);
-    let pid = state["godot_pid"].as_i64().unwrap();
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-    }
+    let pid = state["godot_pid"].as_u64().unwrap() as u32;
+    kill_process(pid);
     let message = client.receive_until(Duration::from_secs(60), |message| {
         message["method"] == "window/showMessage"
     });

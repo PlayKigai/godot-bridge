@@ -128,7 +128,7 @@ fn launch_or_reuse(files: &ProjectFiles, project: &Path, settings: &Settings) ->
     )?;
     let mut state = detached_gui_state(project, Status::Starting);
     state.godot_pid = Some(pid);
-    state.godot_pgid = Some(pgid as u32);
+    state.godot_pgid = Some(pgid);
     state.godot_start_ticks = Some(ticks);
     state.lsp_port = Some(lsp_port);
     state.dap_port = Some(dap_port);
@@ -202,7 +202,7 @@ fn print_state(state: State) -> Result<ExitCode> {
 
 fn remove_files(files: &ProjectFiles) {
     let _ = std::fs::remove_file(&files.state);
-    let _ = std::fs::remove_file(&files.sock);
+    let _ = crate::sys::remove_socket(&files.sock);
 }
 
 fn log_tail(path: &Path) -> String {

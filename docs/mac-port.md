@@ -15,6 +15,7 @@ TCP proxying, JSON, LSP and DAP logic, the wasm extension.
 | `state.rs` runtime dir | `$XDG_RUNTIME_DIR` | `$TMPDIR`, keep the uid check | 5 |
 | `godot_bin.rs` | PATH | also `/Applications/Godot.app/Contents/MacOS/Godot`. Launch the inner binary, not `open`, so pid and ports are the child's. | 10 |
 
-Steps: split Linux code into `sys/linux.rs`, add `sys/macos.rs` with the
-same signatures, then the table top to bottom. Run the full suite with Godot
-4 installed, including GUI hand-off.
+Steps: `bridge/src/sys/` already splits the platforms; the Linux specifics
+sit in `sys/unix/`, so split those out into a `sys/macos/` with the same
+signatures, then the table top to bottom. Run the full suite with Godot 4
+installed, including GUI hand-off.

@@ -1,84 +1,39 @@
 use crate::json::{Map, Value};
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use crate::sys::{self, OpenMode};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const SOCKET_CLIENT_CAP: usize = 16;
+use crate::sys::process_start_ticks;
+pub use crate::sys::{
+    fallback_runtime_dir, pid_alive_with_ticks, runtime_dir, LockGuard, SocketHandle,
+};
+
 const SOCKET_LINE_CAP: usize = 64 * 1024;
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
-const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const STATE_FILE_CAP: u64 = 64 * 1024;
 
-fn not_found_ok(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+/// Take the exclusive lock on `path` without blocking. `Ok(None)` means
+/// another process holds it.
+pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
+    sys::try_lock(path)
 }
 
-pub fn runtime_dir() -> io::Result<PathBuf> {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => ensure_private_dir(&PathBuf::from(dir).join("godot-bridge")),
-        None => fallback_runtime_dir(),
-    }
+/// Answer JSON requests on `path` until the returned handle is dropped.
+pub fn serve_socket<F>(path: impl AsRef<Path>, handler: F) -> io::Result<SocketHandle>
+where
+    F: Fn(Value) -> Value + Send + Sync + 'static,
+{
+    sys::serve_socket(path.as_ref(), handler)
 }
 
-pub fn fallback_runtime_dir() -> io::Result<PathBuf> {
-    ensure_private_dir(&PathBuf::from(format!(
-        "/tmp/godot-bridge-{}",
-        effective_uid()
-    )))
+/// Send one JSON request to the owner listening on `path` and read its reply.
+pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) -> io::Result<Value> {
+    sys::socket_request(path.as_ref(), req, timeout)
 }
 
-fn ensure_private_dir(path: &Path) -> io::Result<PathBuf> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => validate_private_dir(path)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(path)?;
-            validate_private_dir(path)?;
-        }
-        Err(error) => return Err(error),
-    }
-    let _directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot securely open runtime directory {}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
-    Ok(path.to_path_buf())
-}
-
-fn validate_private_dir(path: &Path) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::other(format!(
-            "runtime directory {} is not a directory without symlinks",
-            path.display()
-        )));
-    }
-    if metadata.uid() != effective_uid() || metadata.mode() & 0o777 != 0o700 {
-        return Err(io::Error::other(format!(
-            "runtime directory {} must be owned by the current user with mode 0700",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
+/// The runtime paths that belong to one project: the owner lock, the request
+/// socket, the state file and the debug session lock. On Windows the socket is
+/// a named pipe rather than a file under the runtime directory.
 pub struct ProjectFiles {
     pub lock: PathBuf,
     pub sock: PathBuf,
@@ -99,56 +54,14 @@ impl ProjectFiles {
             crate::fnv::hash_hex(project_str.as_bytes()),
             project_str.len()
         );
-        let mut runtime = runtime_dir()?;
-        let socket = runtime.join(format!("{hash}.sock"));
-        if socket.as_os_str().len() > 100 {
-            crate::warn!(
-                "socket path {} is too long; using fallback runtime directory",
-                socket.display()
-            );
-            runtime = fallback_runtime_dir()?;
-        }
+        let (runtime, sock) = sys::socket_path(&sys::runtime_dir()?, &hash)?;
         let prefix = runtime.join(&hash);
         Ok(Self {
             lock: prefix.with_extension("lock"),
-            sock: prefix.with_extension("sock"),
+            sock,
             state: prefix.with_extension("json"),
             dap_lock: prefix.with_extension("dap.lock"),
         })
-    }
-}
-
-fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
-}
-
-pub struct LockGuard {
-    file: std::fs::File,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-pub fn try_lock(path: &Path) -> io::Result<Option<LockGuard>> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(LockGuard { file }));
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(None)
-    } else {
-        Err(error)
     }
 }
 
@@ -335,7 +248,7 @@ pub fn clear_owner_identity(state: &mut State) {
 }
 
 pub fn matches_project(state: &State, project: &Path) -> bool {
-    state.project == project.to_string_lossy()
+    crate::root::paths_equal(Path::new(&state.project), project)
 }
 
 pub fn gui_process_alive(state: &State) -> bool {
@@ -349,13 +262,7 @@ pub fn gui_process_alive(state: &State) -> bool {
 pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
     let temp = path.with_extension("json.tmp");
     let bytes = crate::json::to_vec(&state.to_value());
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)?;
+    let mut file = sys::open_private(&temp, OpenMode::Truncate)?;
     use std::io::Write;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -363,16 +270,17 @@ pub fn write_state(path: &Path, state: &State) -> io::Result<()> {
 }
 
 pub fn read_state(path: &Path) -> io::Result<Option<State>> {
-    let bytes = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+    let bytes = match sys::open_nofollow_read(path) {
         Ok(file) => {
             use std::io::Read;
             let mut bytes = Vec::new();
-            let mut file = file;
-            file.read_to_end(&mut bytes)?;
+            file.take(STATE_FILE_CAP + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > STATE_FILE_CAP {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("state file {} is larger than 64 KiB", path.display()),
+                ));
+            }
             bytes
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -388,22 +296,10 @@ pub fn start_ticks(pid: u32) -> Option<u64> {
     process_start_ticks(pid).ok()
 }
 
-pub fn process_start_ticks(pid: u32) -> io::Result<u64> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let after_name = text
-        .rsplit_once(')')
-        .map(|(_, rest)| rest)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
-    after_name
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
-}
-
-pub fn pid_alive_with_ticks(pid: u32, ticks: u64) -> bool {
-    start_ticks(pid) == Some(ticks)
+/// The rendezvous address that belongs to a state file in the runtime
+/// directory, used by `status` to reach an owner it did not start.
+pub fn socket_path_for_state(state: &Path) -> PathBuf {
+    sys::socket_path_for_state(state)
 }
 
 pub fn remove_if_stale(state_path: &Path, sock_path: &Path) -> io::Result<bool> {
@@ -418,165 +314,18 @@ pub fn remove_if_stale(state_path: &Path, sock_path: &Path) -> io::Result<bool> 
     if !stale {
         return Ok(false);
     }
-    not_found_ok(std::fs::remove_file(state_path))?;
-    not_found_ok(std::fs::remove_file(sock_path))?;
+    match std::fs::remove_file(state_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        other => other?,
+    }
+    sys::remove_socket(sock_path)?;
     Ok(true)
 }
 
-pub struct SocketHandle {
-    path: PathBuf,
-    stop: Arc<AtomicBool>,
-    listener: Option<JoinHandle<()>>,
-    clients: Arc<Mutex<Vec<JoinHandle<()>>>>,
-}
-
-impl Drop for SocketHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = UnixStream::connect(&self.path);
-        if let Some(listener) = self.listener.take() {
-            let _ = listener.join();
-        }
-        if let Ok(mut clients) = self.clients.lock() {
-            for client in clients.drain(..) {
-                let _ = client.join();
-            }
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-pub fn serve_socket<F>(path: impl AsRef<Path>, handler: F) -> io::Result<SocketHandle>
-where
-    F: Fn(Value) -> Value + Send + Sync + 'static,
-{
-    let path = path.as_ref().to_path_buf();
-    let temporary = path.with_extension("tmp");
-    not_found_ok(std::fs::remove_file(&temporary))?;
-    let listener = UnixListener::bind(&temporary)?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&temporary, &path)?;
-    let handler = Arc::new(handler);
-    let stop = Arc::new(AtomicBool::new(false));
-    let clients = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
-    let count = Arc::new(AtomicUsize::new(0));
-    let stop_for_thread = Arc::clone(&stop);
-    let clients_for_thread = Arc::clone(&clients);
-    let count_for_thread = Arc::clone(&count);
-    let listener_thread = thread::Builder::new()
-        .name("godot-bridge-socket".to_owned())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            while !stop_for_thread.load(Ordering::Acquire) {
-                let (stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(_) => break,
-                };
-                if count_for_thread.load(Ordering::Acquire) >= SOCKET_CLIENT_CAP {
-                    continue;
-                }
-                count_for_thread.fetch_add(1, Ordering::AcqRel);
-                let handler = Arc::clone(&handler);
-                let stop = Arc::clone(&stop_for_thread);
-                let count = Arc::clone(&count_for_thread);
-                let client = thread::Builder::new()
-                    .name("godot-bridge-socket-client".to_owned())
-                    .stack_size(256 * 1024)
-                    .spawn(move || {
-                        handle_client(stream, handler, stop);
-                        count.fetch_sub(1, Ordering::AcqRel);
-                    });
-                if let Ok(client) = client {
-                    if let Ok(mut clients) = clients_for_thread.lock() {
-                        clients.retain(|client| !client.is_finished());
-                        clients.push(client);
-                    }
-                } else {
-                    count_for_thread.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-        })?;
-    Ok(SocketHandle {
-        path,
-        stop,
-        listener: Some(listener_thread),
-        clients,
-    })
-}
-
-fn handle_client<F>(stream: UnixStream, handler: Arc<F>, stop: Arc<AtomicBool>)
-where
-    F: Fn(Value) -> Value + Send + Sync + 'static,
-{
-    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let reader_stream = match stream.try_clone() {
-        Ok(reader_stream) => reader_stream,
-        Err(_) => return,
-    };
-    if reader_stream.set_nonblocking(true).is_err() {
-        return;
-    }
-    let mut reader = BufReader::new(reader_stream);
-    let mut write = stream;
-    let mut partial = Vec::new();
-    let mut idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        if reader.buffer().is_empty() {
-            match poll_for_read(reader.get_ref().as_raw_fd(), idle_deadline) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => break,
-            }
-        }
-        let line = match read_line_limited(&mut reader, &mut partial) {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(_) => break,
-        };
-        idle_deadline = Instant::now() + SOCKET_IDLE_TIMEOUT;
-        let response = match crate::json::from_slice(&line) {
-            Ok(request) => handler(request),
-            Err(_) => crate::json!({"error": "invalid json"}),
-        };
-        let mut bytes = crate::json::to_vec(&response);
-        bytes.push(b'\n');
-        if write.write_all(&bytes).is_err() {
-            break;
-        }
-    }
-}
-
-fn poll_for_read(fd: RawFd, deadline: Instant) -> io::Result<bool> {
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(false);
-        };
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        let timeout = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
-        let mut descriptor = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if result >= 0 {
-            return Ok(result != 0);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error);
-        }
-    }
-}
-
-fn read_line_limited<R: BufRead>(
+/// Read one newline-terminated request from a socket, refusing a line that
+/// would grow past [`SOCKET_LINE_CAP`]. `partial` carries the bytes read so
+/// far across a `WouldBlock`.
+pub(crate) fn read_line_limited<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
 ) -> io::Result<Option<Vec<u8>>> {
@@ -613,26 +362,10 @@ fn read_line_limited<R: BufRead>(
     }
 }
 
-pub fn socket_request(path: impl AsRef<Path>, req: &Value, timeout: Duration) -> io::Result<Value> {
-    let stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let mut write = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-    let mut bytes = crate::json::to_vec(req);
-    bytes.push(b'\n');
-    write.write_all(&bytes)?;
-    let mut partial = Vec::new();
-    let line = read_line_limited(&mut reader, &mut partial)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"))?;
-    crate::json::from_slice(&line).map_err(io::Error::other)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::temp::TempDir;
-    use std::os::unix::fs::PermissionsExt;
 
     fn files(dir: &Path) -> ProjectFiles {
         ProjectFiles {
@@ -661,6 +394,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn project_path_with_invalid_utf8_is_rejected() {
         use std::ffi::OsStr;
@@ -679,6 +413,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dir_is_a_usable_directory() {
+        let dir = runtime_dir().unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(runtime_dir().unwrap(), dir);
+    }
+
+    #[test]
+    fn start_ticks_identify_this_process() {
+        let pid = std::process::id();
+        let ticks = start_ticks(pid).expect("this process has a start time");
+        assert_eq!(start_ticks(pid), Some(ticks));
+        assert!(pid_alive_with_ticks(pid, ticks));
+        assert!(!pid_alive_with_ticks(pid, ticks.wrapping_add(1)));
+        assert!(start_ticks(u32::MAX).is_none());
+    }
+
+    #[test]
     fn dead_owner_state_is_removed() {
         let dir = TempDir::new().unwrap();
         let project_files = files(dir.path());
@@ -686,7 +437,24 @@ mod tests {
         std::fs::write(&project_files.sock, b"stale").unwrap();
         assert!(remove_if_stale(&project_files.state, &project_files.sock).unwrap());
         assert!(!project_files.state.exists());
+        #[cfg(unix)]
         assert!(!project_files.sock.exists());
+    }
+
+    #[test]
+    fn oversized_state_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.json");
+        let mut bytes = crate::json::to_vec(&state(None, None).to_value());
+        bytes.resize(STATE_FILE_CAP as usize + 1, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        let error = read_state(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("larger than 64 KiB"), "{error}");
+
+        bytes.truncate(STATE_FILE_CAP as usize);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_state(&path).unwrap(), Some(state(None, None)));
     }
 
     #[test]
@@ -744,14 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_dap_lock_is_rejected_when_held() {
-        let dir = TempDir::new().unwrap();
-        let first = try_lock(&dir.path().join("dap.lock")).unwrap().unwrap();
-        assert!(try_lock(&dir.path().join("dap.lock")).unwrap().is_none());
-        drop(first);
-    }
-
-    #[test]
     fn detached_gui_state_has_null_owner_fields() {
         let value = detached_gui_state(Path::new("/project"), Status::Starting).to_value();
         assert_eq!(value["mode"], "gui");
@@ -763,8 +523,21 @@ mod tests {
         assert!(value["dap_port"].is_null());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn project_files_use_a_named_pipe() {
+        let files = ProjectFiles::new(Path::new(r"C:\projects\game")).unwrap();
+        let sock = files.sock.to_string_lossy().into_owned();
+        assert!(sock.starts_with(r"\\.\pipe\godot-bridge-"), "{sock}");
+        assert_eq!(socket_path_for_state(&files.state), files.sock);
+        assert_eq!(files.lock.extension().unwrap(), "lock");
+        assert_eq!(files.state.extension().unwrap(), "json");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_status_round_trip() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("status.sock");
         let handle = serve_socket(&path, |request| {

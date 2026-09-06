@@ -52,7 +52,8 @@ forwarding `initialize` to Godot. A non-object gets `-32602`, exit 1.
 | `extra_args` | [] | Before the bridge's flags. Rejected: `--path`, `--editor`, `-e`, `--headless`, `--lsp-port`, `--dap-port`, `--display-driver`, `--audio-driver`, `--quit`, `--quit-after`, `--script`, `-s`, `--main-pack`, `--export-release`, `--export-debug`, `--export-pack`. |
 
 `dap` gets the merged object in `GODOT_BRIDGE_SETTINGS`. The other commands
-read `$XDG_CONFIG_HOME/zed/settings.json` (no `HOME`: skipped) and
+read `$XDG_CONFIG_HOME/zed/settings.json`, else `~/.config/zed` and on
+Windows `%APPDATA%\Zed` (neither set: skipped), and
 `<worktree>/.zed/settings.json` as JSON with comments, each at most 1 MiB, a
 regular file, opened without following symlinks. Missing files contribute
 nothing. Parse or validation errors name the file.
@@ -61,7 +62,10 @@ nothing. Parse or validation errors name the file.
 
 Worktree root for `lsp`: first `file` entry of `workspaceFolders`, else
 `rootUri`, else `rootPath`, else cwd. Host must be empty or `localhost`.
-Percent-decoded, canonicalized. Failure: `-32002`, exit 1. Other commands
+Percent-decoded, canonicalized. On Windows a URI is `file:///C:/x` with the
+drive upper-cased, `file:///c%3A/x` decodes the same, UNC is refused, the
+`\\?\` prefix is stripped before hashing or display, and paths compare
+case-insensitively. Failure: `-32002`, exit 1. Other commands
 use cwd. A single-file worktree has no project settings.
 
 Project dir, first input yielding exactly one `project.godot` wins, several
@@ -72,18 +76,30 @@ root, then a breadth-first scan to depth 3 skipping `.git`, `.godot`,
 lsp.godot.settings.project_dir."
 
 Godot binary: `godot_path`, `GODOT` (absolute, executable), then `godot4`,
-`godot` on PATH. Must answer `--version` within 5 s with `4.`.
+`godot` on PATH. Must answer `--version` within 5 s with `4.`. On Windows the
+PATH search appends `PATHEXT`, then `%LOCALAPPDATA%\Programs\Godot`, the
+WinGet store and Steam are searched, and the plain `.exe` is preferred over
+its `_console` launcher, which would put the engine in a child process.
 
 ## Runtime files
 
 `$XDG_RUNTIME_DIR/godot-bridge/`, fallback `/tmp/godot-bridge-$UID/`, 0700,
-verified on every use. Files 0600, opened `O_NOFOLLOW`. `<hash>` is FNV-1a of
-the canonical project path, `-`, path length.
+verified on every use. Files 0600, opened `O_NOFOLLOW`. On Windows the
+directory is `%LOCALAPPDATA%\godot-bridge`, fallback `%TEMP%\godot-bridge`,
+created with the protected DACL
+`D:P(A;OICI;FA;;;<user>)` and verified on every use: an existing directory is
+refused, never repaired, unless its owner and every access-allowed entry name
+the current user, `SYSTEM` or `BUILTIN\Administrators`. Reads refuse reparse
+points instead of `O_NOFOLLOW`. `<hash>` is FNV-1a of the canonical project
+path, `-`, path length.
 
-- `<hash>.lock`: `flock` held by the `lsp` owner for its life. Ownership.
+- `<hash>.lock`: `flock`, on Windows `LockFileEx` exclusive and immediate,
+  held by the `lsp` owner for its life. Ownership.
 - `<hash>.sock`: owner's Unix socket, bound on a temp path and renamed in
-  after the lock. Readiness. Newline JSON, 5 s per request, 16 clients, 30 s
-  idle. `{"cmd":"status"}`, `{"cmd":"handoff"}`, else `{"error":"unknown cmd"}`.
+  after the lock; on Windows a named pipe `\\.\pipe\godot-bridge-<hash>`
+  whose security descriptor grants the current user only. Readiness. Newline
+  JSON, 5 s per request, 16 clients, 30 s idle. `{"cmd":"status"}`,
+  `{"cmd":"handoff"}`, else `{"error":"unknown cmd"}`.
 - `<hash>.json`: state, tmpfile and rename. Information only.
 - `<hash>.dap.lock`: one `dap` session at a time.
 - `<hash>.godot.log`, `<hash>.gui.log`: Godot output, rotated to `.1` at 20 MiB.
@@ -98,8 +114,9 @@ State and status object:
 ```
 
 Numbers are null before the spawn. Owner fields are null only for a detached
-GUI. `*_start_ticks` is `/proc/<pid>/stat` field 22; a pid with other ticks is
-another process. A state file whose owner is dead is removed.
+GUI. `*_start_ticks` is `/proc/<pid>/stat` field 22, on Windows the
+`GetProcessTimes` creation time; a pid with other ticks is another process. A
+state file whose owner is dead is removed.
 
 ## `lsp` startup
 
@@ -121,11 +138,16 @@ another process. A state file whose owner is dead is removed.
    `changeWorkspace` path is the project dir. Add
    `workspaceSymbolProvider: true`. Return the response. Proxy.
 
-Spawn: `pre_exec` with `setpgid(0,0)`, `PR_SET_PDEATHSIG`, parent check.
-`<godot> [extra_args] --editor --headless --path <project> --lsp-port <p>
---dap-port <q>`, stdio piped to the log, last 20 lines kept. Kill: SIGTERM
-the group, 5 s, SIGKILL the group, reap. Games the editor launches die with
-the group.
+Spawn: `pre_exec` with `setpgid(0,0)`, `PR_SET_PDEATHSIG`, parent check; on
+Windows a job object with `KILL_ON_JOB_CLOSE`, which the GUI editor breaks
+away from before joining a named job of its own,
+`Local\godot-bridge-<pid>-<ticks>`, with no `KILL_ON_JOB_CLOSE` and a
+current-user descriptor. `<godot> [extra_args] --editor --headless --path
+<project> --lsp-port <p> --dap-port <q>`, stdio piped to the log, last 20
+lines kept. Kill: SIGTERM the group, 5 s, SIGKILL the group, reap; on Windows
+`TerminateJobObject`, and for a recorded GUI editor the named job reopened
+from the state file, falling back to a recursive walk of the descendants when
+there is none. Games the editor launches die with the group.
 
 ## LSP proxy
 
@@ -202,10 +224,12 @@ or invalid UTF-8: skipped.
 
 Zed `didOpen` on a Bridge doc becomes `didChange`, owner `Zed`. Zed
 `didClose` forwards, then reopens from disk as `Bridge` if the file exists.
-Watcher (inotify, 300 ms debounce): create opens, modify of a Bridge doc
+Watcher (inotify, on Windows `ReadDirectoryChangesW` over the project subtree,
+300 ms debounce): create opens, modify of a Bridge doc
 changes, remove of a Bridge doc closes and clears Zed's diagnostics, Zed
 docs are ignored, moved directories rescan. While `recovering` the watcher
-only updates text; recovery replays it.
+only updates text; recovery replays it. If the watch cannot be created the
+session continues without it and logs a warning.
 
 Symbols: after open and each change, debounced 300 ms, an internal
 `documentSymbol` tagged with the version; stale responses are dropped.
@@ -222,7 +246,8 @@ only.
 `accepted:true`. No socket: take the lock (held: retry 5 s, "An owner exists
 but does not answer"). A live detached GUI: wait for its ports, print state.
 Else launch `<godot> [extra_args] --editor --path <project> --lsp-port <p>
---dap-port <q>` detached (`setsid`, stdio to `<hash>.gui.log`), `mode: gui`,
+--dap-port <q>` detached (`setsid`, on Windows `CREATE_BREAKAWAY_FROM_JOB`,
+stdio to `<hash>.gui.log`), `mode: gui`,
 wait for ports, `ready`, release the lock, print state. Failure: kill the
 group, remove state, exit 1 with the last 20 lines.
 
@@ -250,10 +275,13 @@ Debug adapter: `get_dap_binary` runs the bridge with `["dap", "--file",
 file]` when present, cwd the worktree, `GODOT_BRIDGE_SETTINGS` set.
 `dap_config_to_scenario`: `Launch` uses `program` as `scene` when it ends in
 `.tscn`, else `main`; `Attach` ignores `process_id`. Zed substitutes
-`$ZED_FILE` in `debug.json`.
+`$ZED_FILE` in `debug.json`. The `godot` debug locator accepts a
+`godot-bridge run` task and returns a launch scenario with its `--scene` and
+`--file` values, so the shipped `godot: run` tasks debug without a
+`debug.json`.
 
 GDScript indent: increase after `:`, `@indent` on bodies, `@start.<kw>`
 captures so `else`/`elif` dedent to `if`, `elif`, `for`, `while`.
 
-Out of scope: macOS, Windows, VS Code (see the port docs), Godot 3.x, two
+Out of scope: macOS, VS Code (see the port docs), Godot 3.x, two
 windows or two debug sessions on one project, auto-download.

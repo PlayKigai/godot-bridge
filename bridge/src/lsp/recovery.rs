@@ -39,6 +39,25 @@ pub(super) fn fail_in_flight(session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// The reader of the connection that just closed may have queued an end of
+/// stream, or on Windows the reset a killed peer sends; either would abort the
+/// replacement editor while it is still being initialized.
+fn drop_stale_godot_events(
+    events: &Receiver<ProxyEvent>,
+    deferred: &mut DeferredQueue,
+) -> Result<()> {
+    let mut kept = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if !matches!(event, ProxyEvent::Godot(_)) {
+            kept.push(event);
+        }
+    }
+    for event in kept {
+        deferred.push_back(event)?;
+    }
+    Ok(())
+}
+
 pub(super) fn recover_with_status(session: &mut Session, status: Option<ExitStatus>) -> Result<()> {
     let code = status.and_then(|status| status.code()).unwrap_or(-1);
     let count_recovery =
@@ -85,6 +104,7 @@ pub(super) fn recover(session: &mut Session, reason: &str, count_recovery: bool)
     )?;
     fail_in_flight(session)?;
     session.editor.connection.close();
+    drop_stale_godot_events(&session.events, &mut session.deferred)?;
     if let Some(child) = session.editor.child.take() {
         terminate_editor_child(child);
     }
@@ -348,4 +368,34 @@ pub(super) fn replay_initialize(
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_godot_events_are_dropped_and_the_rest_kept() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        sender
+            .send(ProxyEvent::Godot(Err(io::Error::from(
+                io::ErrorKind::ConnectionReset,
+            ))))
+            .unwrap();
+        sender
+            .send(ProxyEvent::Client(Ok(Some(b"client".to_vec()))))
+            .unwrap();
+        sender.send(ProxyEvent::Godot(Ok(None))).unwrap();
+        let mut deferred = DeferredQueue::default();
+
+        drop_stale_godot_events(&receiver, &mut deferred).unwrap();
+
+        assert!(receiver.try_recv().is_err());
+        let kept = deferred.pop_front();
+        assert!(
+            matches!(&kept, Some(ProxyEvent::Client(Ok(Some(chunk)))) if chunk == b"client"),
+            "the client event was not kept"
+        );
+        assert!(deferred.pop_front().is_none());
+    }
 }

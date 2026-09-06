@@ -146,6 +146,43 @@ impl zed::Extension for GodotExtension {
             tcp_connection: None,
         })
     }
+    /// Turns a `godot-bridge run` task into a launch scenario, so the debug
+    /// picker offers the shipped run tasks without a `debug.json`.
+    fn dap_locator_create_scenario(
+        &mut self,
+        _locator_name: String,
+        build_task: zed::TaskTemplate,
+        resolved_label: String,
+        debug_adapter_name: String,
+    ) -> Option<zed::DebugScenario> {
+        if debug_adapter_name != "godot"
+            || build_task.command != "godot-bridge"
+            || build_task.args.first().map(String::as_str) != Some("run")
+        {
+            return None;
+        }
+        let value_after = |flag: &str| {
+            build_task
+                .args
+                .iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| build_task.args.get(index + 1))
+        };
+        let mut adapter_config = zed::serde_json::json!({
+            "request": "launch",
+            "scene": value_after("--scene").map_or("main", String::as_str),
+        });
+        if let Some(file) = value_after("--file") {
+            adapter_config["file"] = zed::serde_json::Value::String(file.clone());
+        }
+        Some(zed::DebugScenario {
+            label: resolved_label,
+            adapter: debug_adapter_name,
+            build: None,
+            config: adapter_config.to_string(),
+            tcp_connection: None,
+        })
+    }
 }
 
 zed::register_extension!(GodotExtension);

@@ -222,6 +222,14 @@ criteria = "safe-to-deploy"
 version = "2.5.8"
 criteria = "safe-to-deploy"
 
+[[exemptions.windows-link]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-sys]]
+version = "0.61.2"
+criteria = "safe-to-deploy"
+
 [[exemptions.writeable]]
 version = "0.6.4"
 criteria = "safe-to-deploy"

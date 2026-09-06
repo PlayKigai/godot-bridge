@@ -1,13 +1,13 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum Protocol {
     Lsp,
@@ -22,6 +22,16 @@ pub fn lock_godot() -> MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Point the bridge under test at the temporary runtime and config trees.
+/// Unix reads `XDG_RUNTIME_DIR`, Windows reads `LOCALAPPDATA`, and both look
+/// for Zed's settings under `XDG_CONFIG_HOME`.
+pub(crate) fn redirect_directories(command: &mut Command, runtime: &Path, config: &Path) {
+    command
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("LOCALAPPDATA", runtime)
+        .env("XDG_CONFIG_HOME", config);
 }
 
 pub struct BridgeClient {
@@ -50,12 +60,11 @@ impl BridgeClient {
         process
             .arg(command)
             .current_dir(project)
-            .env("XDG_RUNTIME_DIR", runtime)
-            .env("XDG_CONFIG_HOME", &config)
             .env("GODOT_BRIDGE_LOG", "debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        redirect_directories(&mut process, runtime, &config);
         if let Some(settings) = settings {
             process.env("GODOT_BRIDGE_SETTINGS", settings);
         }
@@ -131,8 +140,14 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The path the bridge itself would record, so hashes, URIs and the `project`
+/// field of a state file all compare equal on both platforms.
+pub fn canonical(path: &Path) -> PathBuf {
+    godot_bridge::root::canonicalize(path).unwrap()
+}
+
 pub fn file_uri(path: &Path) -> String {
-    godot_bridge::file_uri::path_to_uri(&path.canonicalize().unwrap())
+    godot_bridge::file_uri::path_to_uri(&canonical(path))
 }
 
 pub fn godot_available(test: &str) -> bool {
@@ -144,17 +159,29 @@ pub fn godot_available(test: &str) -> bool {
     }
 }
 
-fn godot_path() -> Option<PathBuf> {
-    let mut candidates = std::env::var_os("GODOT")
-        .into_iter()
-        .map(PathBuf::from)
-        .chain(std::env::var_os("PATH").into_iter().flat_map(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("godot"))
-                .collect::<Vec<_>>()
-        }))
-        .chain(std::iter::once(PathBuf::from("/usr/bin/godot")));
-    candidates.find(|path| path.is_file())
+/// A GUI test needs a desktop session. Windows always has one; a Unix session
+/// advertises it through `DISPLAY` or `WAYLAND_DISPLAY`.
+#[allow(dead_code)]
+pub fn display_available(test: &str) -> bool {
+    if cfg!(windows)
+        || std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        return true;
+    }
+    println!("skipping {test}: DISPLAY and WAYLAND_DISPLAY are unset");
+    false
+}
+
+pub fn godot_path() -> Option<PathBuf> {
+    godot_bridge::godot_bin::resolve_godot(None).ok()
+}
+
+/// The resolved Godot binary as a JSON string, escaped so a Windows path with
+/// backslashes survives being embedded in a settings document.
+#[allow(dead_code)]
+pub fn godot_path_json() -> String {
+    serde_json::to_string(&godot_path().unwrap()).unwrap()
 }
 
 pub fn initialize_lsp(client: &mut BridgeClient, project: &Path) -> Value {
@@ -186,7 +213,7 @@ pub fn initialize_dap(client: &mut BridgeClient) -> Value {
 }
 
 fn project_hash(project: &Path) -> String {
-    let path = project.canonicalize().unwrap();
+    let path = canonical(project);
     let path = path.to_string_lossy();
     format!(
         "{}-{}",
@@ -195,10 +222,15 @@ fn project_hash(project: &Path) -> String {
     )
 }
 
+fn state_path(runtime: &Path, project: &Path) -> PathBuf {
+    runtime
+        .join("godot-bridge")
+        .join(format!("{}.json", project_hash(project)))
+}
+
 #[allow(dead_code)]
 pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
-    let hash = project_hash(project);
-    let state = runtime.join("godot-bridge").join(format!("{hash}.json"));
+    let state = state_path(runtime, project);
     let value: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     (state, value)
 }
@@ -206,48 +238,39 @@ pub fn runtime_state(runtime: &Path, project: &Path) -> (PathBuf, Value) {
 #[allow(dead_code)]
 pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path) {
     let (state_path, state) = runtime_state(runtime, project);
-    let godot_pid = state["godot_pid"].as_u64().unwrap();
+    let godot_pid = state["godot_pid"].as_u64().unwrap() as u32;
     client.close_stdin();
     let deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline {
-        if !Path::new(&format!("/proc/{godot_pid}")).exists() {
+        if !process_alive(godot_pid) {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let _ = client.child.wait();
-    assert!(!Path::new(&format!("/proc/{godot_pid}")).exists());
+    assert!(!process_alive(godot_pid));
     assert!(!state_path.exists());
     let hash = project_hash(project);
     assert!(runtime
         .join("godot-bridge")
         .join(format!("{hash}.lock"))
         .exists());
+    #[cfg(unix)]
     assert!(!runtime
         .join("godot-bridge")
         .join(format!("{hash}.sock"))
         .exists());
 }
 
-#[allow(dead_code)]
-pub fn runtime_socket(runtime: &Path, project: &Path) -> PathBuf {
-    let hash = project_hash(project);
-    runtime.join("godot-bridge").join(format!("{hash}.sock"))
-}
-
+/// Ask the owner for its status over its own rendezvous address, a Unix
+/// socket next to the state file or a named pipe derived from its name.
 #[allow(dead_code)]
 pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
-    let mut stream = UnixStream::connect(runtime_socket(runtime, project)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let canonical = project.canonicalize().unwrap();
-    let request = serde_json::json!({"cmd": "status", "project": canonical.to_string_lossy()});
-    stream.write_all(format!("{request}\n").as_bytes()).ok()?;
-    stream.shutdown(Shutdown::Write).ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+    let address = godot_bridge::state::socket_path_for_state(&state_path(runtime, project));
+    let project = canonical(project).to_string_lossy().into_owned();
+    let request = godot_bridge::json!({"cmd": "status", "project": (project)});
+    let response = godot_bridge::state::socket_request(address, &request, SOCKET_TIMEOUT).ok()?;
+    serde_json::from_str(&response.to_string()).ok()
 }
 
 #[allow(dead_code)]
@@ -264,13 +287,94 @@ pub fn wait_for_ready(runtime: &Path, project: &Path) -> Value {
     }
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
-pub fn child_pids(pid: u64) -> Vec<u32> {
+pub fn child_pids(pid: u32) -> Vec<u32> {
     std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .unwrap_or_default()
         .split_whitespace()
         .filter_map(|child| child.parse().ok())
         .collect()
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn kill_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn child_pids(pid: u32) -> Vec<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let Some(snapshot) = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut children = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    while more != 0 {
+        if entry.th32ParentProcessID == pid {
+            children.push(entry.th32ProcessID);
+        }
+        more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+    }
+    children
+}
+
+/// A pid whose process object still exists but has already exited is not
+/// alive, so the exit code decides rather than the mere ability to open it.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn process_alive(pid: u32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::STILL_ACTIVE;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let Some(process) = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+    else {
+        return false;
+    };
+    let mut code = 0u32;
+    let read = unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) };
+    read != 0 && code == STILL_ACTIVE as u32
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn kill_process(pid: u32) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if let Some(process) = owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) }) {
+        unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+    }
+}
+
+#[cfg(windows)]
+fn owned(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return None;
+    }
+    Some(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 #[allow(dead_code)]
@@ -290,13 +394,10 @@ pub fn copy_directory(source: &Path, destination: &Path) {
 
 #[allow(dead_code)]
 pub fn status(runtime: &Path, project: &Path, config: &Path) -> Option<Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_godot-bridge"))
-        .arg("status")
-        .current_dir(project)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_CONFIG_HOME", config)
-        .output()
-        .ok()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_godot-bridge"));
+    command.arg("status").current_dir(project);
+    redirect_directories(&mut command, runtime, config);
+    let output = command.output().ok()?;
     output
         .stdout
         .split(|byte| *byte == b'\n')

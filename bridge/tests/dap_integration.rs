@@ -2,7 +2,6 @@ mod common;
 use common::*;
 use godot_bridge::temp::TempDir;
 use serde_json::json;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +22,7 @@ fn dap_without_owner_returns_initialize_failure() {
         response["message"],
         format!(
             "No Godot language server runs for {}. Open a .gd file of the project in Zed first.",
-            project.canonicalize().unwrap().display()
+            canonical(&project).display()
         )
     );
     assert_eq!(response["request_seq"], 1);
@@ -32,8 +31,7 @@ fn dap_without_owner_returns_initialize_failure() {
 
 #[test]
 fn dap_with_owner_launches_and_terminates_game() {
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        println!("skipping DAP integration test with owner: DISPLAY and WAYLAND_DISPLAY are unset");
+    if !display_available("DAP integration test with owner") {
         return;
     }
     if !godot_available("DAP integration test") {
@@ -46,15 +44,18 @@ fn dap_with_owner_launches_and_terminates_game() {
     assert!(initialize_lsp(&mut owner, &project).get("error").is_none());
     owner.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
     let status = wait_for_ready(runtime.path(), &project);
-    let editor_pid = status["godot_pid"].as_u64().unwrap();
+    let editor_pid = status["godot_pid"].as_u64().unwrap() as u32;
     let existing_children = child_pids(editor_pid);
-    let settings = r#"{"godot_path":"/usr/bin/godot","startup_timeout_s":60}"#;
+    let settings = format!(
+        r#"{{"godot_path":{},"startup_timeout_s":60}}"#,
+        godot_path_json()
+    );
     let mut dap = BridgeClient::start(
         Protocol::Dap,
         &project,
         runtime.path(),
         None,
-        Some(settings),
+        Some(&settings),
     );
     let initialize = initialize_dap(&mut dap);
     assert_eq!(initialize["success"], true, "{initialize}");
@@ -92,7 +93,7 @@ fn dap_with_owner_launches_and_terminates_game() {
     };
     dap.send(json!({"type":"request","seq":4,"command":"terminate"}));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while Path::new(&format!("/proc/{game_pid}")).exists() {
+    while process_alive(game_pid) {
         assert!(Instant::now() < deadline, "game process did not exit");
         thread::sleep(Duration::from_millis(100));
     }

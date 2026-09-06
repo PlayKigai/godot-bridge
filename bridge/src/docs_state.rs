@@ -3,7 +3,6 @@ use crate::root::{canonical_or_normalized, doc_key, normalize_absolute};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -220,6 +219,18 @@ impl DocumentState {
             .unwrap_or_else(|| doc_key(uri))
     }
 
+    /// Godot on Windows percent-encodes the drive colon, so the URI it reports a
+    /// document under is not the one the bridge and Zed agreed on for that file.
+    pub fn client_uri(&self, uri: &str) -> String {
+        if !uri.to_ascii_lowercase().starts_with("file:") {
+            return uri.to_owned();
+        }
+        let key = self.key_for_uri(uri);
+        self.open_docs
+            .get(&key)
+            .map_or_else(|| path_to_uri(&key), |doc| doc.uri.clone())
+    }
+
     pub fn generation_for_uri(&self, uri: &str) -> Option<u64> {
         let key = self.key_for_uri(uri);
         self.open_docs.get(&key).map(|doc| doc.generation)
@@ -333,11 +344,7 @@ pub fn scan_project_stream(
 }
 
 pub fn read_document(path: &Path) -> Option<String> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+    let file = match crate::sys::open_nofollow_read(path) {
         Ok(file) => file,
         Err(error) => {
             crate::warn!(
@@ -473,5 +480,31 @@ mod tests {
             .bridge_open_key(PathBuf::from("/project/overflow.gd"), String::new())
             .is_none());
         assert_eq!(state.open_docs.len(), MAX_OPEN_DOCS);
+    }
+
+    #[test]
+    fn a_respelled_uri_names_the_document_the_client_knows() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("other.gd");
+        fs::write(&path, "extends Node\n").unwrap();
+        let mut state = DocumentState::new();
+        let action = state
+            .bridge_open_path(&path, "extends Node\n".to_owned())
+            .unwrap();
+        let DocumentAction::Open { uri, .. } = action else {
+            panic!("expected an open");
+        };
+
+        let respelled = uri.replace("/other.gd", "/%6Fther.gd");
+        assert_ne!(respelled, uri);
+        assert_eq!(state.client_uri(&respelled), uri);
+        #[cfg(windows)]
+        {
+            let prefix = "file:///";
+            let encoded = format!("{prefix}{}", uri[prefix.len()..].replacen(':', "%3A", 1));
+            assert_ne!(encoded, uri);
+            assert_eq!(state.client_uri(&encoded), uri);
+        }
+        assert_eq!(state.client_uri("untitled:1"), "untitled:1");
     }
 }

@@ -1,33 +1,27 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::state::{pid_alive_with_ticks, process_start_ticks};
+use crate::sys::{self, OpenMode};
+
+pub use crate::sys::port_listener_belongs_to_process;
 
 const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 const TAIL_LIMIT: usize = 20;
-const GROUP_WAIT: Duration = Duration::from_secs(5);
 
 fn open_log(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    sys::open_private(path, OpenMode::Append)
 }
 
 pub struct GodotChild {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: u32,
     pub start_ticks: u64,
     pub child: Child,
     pub tail: Arc<Mutex<VecDeque<String>>>,
@@ -77,48 +71,27 @@ pub fn pick_free_port(range: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
     Err(last_error.expect("port range has at least one port"))
 }
 
-pub fn port_listener_belongs_to_process(pid: u32, port: u16) -> io::Result<bool> {
-    let mut inodes = HashSet::new();
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let contents = std::fs::read_to_string(path)?;
-        for line in contents.lines().skip(1) {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() <= 9 || fields[3] != "0A" {
-                continue;
-            }
-            let Some((_, port_hex)) = fields[1].split_once(':') else {
-                continue;
-            };
-            if u16::from_str_radix(port_hex, 16).ok() == Some(port) {
-                if let Ok(inode) = fields[9].parse::<u64>() {
-                    inodes.insert(inode);
-                }
-            }
-        }
+fn editor_command(
+    bin: &Path,
+    extra_args: &[String],
+    project: &Path,
+    lsp_port: u16,
+    dap_port: u16,
+    headless: bool,
+) -> Command {
+    let mut command = Command::new(bin);
+    command.args(extra_args).arg("--editor");
+    if headless {
+        command.arg("--headless");
     }
-    if inodes.is_empty() {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
-        let entry = entry?;
-        let target = match std::fs::read_link(entry.path()) {
-            Ok(target) => target,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(inode) = target
-            .to_str()
-            .and_then(|target| target.strip_prefix("socket:["))
-            .and_then(|target| target.strip_suffix(']'))
-            .and_then(|inode| inode.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        if inodes.contains(&inode) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    command
+        .arg("--path")
+        .arg(project)
+        .arg("--lsp-port")
+        .arg(lsp_port.to_string())
+        .arg("--dap-port")
+        .arg(dap_port.to_string());
+    command
 }
 
 pub fn spawn_godot(
@@ -129,47 +102,15 @@ pub fn spawn_godot(
     dap_port: u16,
     log_path: impl AsRef<Path>,
 ) -> io::Result<GodotChild> {
-    let parent_pid = std::process::id();
-    let project = project.as_ref();
-    let mut command = Command::new(bin.as_ref());
-    command
-        .args(extra_args)
-        .arg("--editor")
-        .arg("--headless")
-        .arg("--path")
-        .arg(project)
-        .arg("--lsp-port")
-        .arg(lsp_port.to_string())
-        .arg("--dap-port")
-        .arg(dap_port.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                libc::_exit(127);
-            }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                libc::_exit(127);
-            }
-            if libc::getppid() as u32 != parent_pid {
-                libc::_exit(127);
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    let start_ticks = match process_start_ticks(pid) {
-        Ok(ticks) => ticks,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(spawn_failure(&mut child, error));
-        }
-    };
+    let mut command = editor_command(
+        bin.as_ref(),
+        extra_args,
+        project.as_ref(),
+        lsp_port,
+        dap_port,
+        true,
+    );
+    let (mut child, pgid, start_ticks) = sys::spawn_headless_process(&mut command)?;
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LIMIT)));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -181,8 +122,8 @@ pub fn spawn_godot(
     );
 
     Ok(GodotChild {
-        pid,
-        pgid: pid as i32,
+        pid: child.id(),
+        pgid,
         start_ticks,
         child,
         tail,
@@ -197,43 +138,18 @@ pub fn spawn_gui(
     lsp_port: u16,
     dap_port: u16,
     log_path: impl AsRef<Path>,
-) -> io::Result<(u32, i32, u64)> {
+) -> io::Result<(u32, u32, u64)> {
     let output = open_log(log_path.as_ref())?;
-    let error_output = output.try_clone()?;
-    let project = project.as_ref();
-    let mut command = Command::new(bin.as_ref());
-    command
-        .args(extra_args)
-        .arg("--editor")
-        .arg("--path")
-        .arg(project)
-        .arg("--lsp-port")
-        .arg(lsp_port.to_string())
-        .arg("--dap-port")
-        .arg(dap_port.to_string())
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(error_output));
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                libc::_exit(127);
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    let start_ticks = match process_start_ticks(pid) {
-        Ok(ticks) => ticks,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(spawn_failure(&mut child, error));
-        }
-    };
-    Ok((pid, pid as i32, start_ticks))
+    let mut command = editor_command(
+        bin.as_ref(),
+        extra_args,
+        project.as_ref(),
+        lsp_port,
+        dap_port,
+        false,
+    );
+    let (child, pgid, start_ticks) = sys::spawn_gui_process(&mut command, output)?;
+    Ok((child.id(), pgid, start_ticks))
 }
 
 pub enum Readiness {
@@ -276,118 +192,14 @@ pub fn wait_for_port(
 }
 
 pub fn kill_group(mut child: GodotChild) -> io::Result<()> {
-    validate_ids(child.pid, child.pgid)?;
-    if !signal_group(child.pid, child.pgid, child.start_ticks, libc::SIGTERM)? {
-        let _ = child.child.wait();
-        child.wait_output();
-        return Ok(());
-    }
-    let deadline = Instant::now() + GROUP_WAIT;
-    while !leader_exited_unreaped(child.pid)? {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        thread::sleep(remaining.min(Duration::from_millis(50)));
-    }
-    // The unreaped leader pins the pgid, so -pgid cannot name a foreign group here.
-    if unsafe { libc::kill(-child.pgid, libc::SIGKILL) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
-    }
+    let result = sys::kill_group(&mut child.child, child.pid, child.pgid, child.start_ticks);
     let _ = child.child.wait();
     child.wait_output();
-    Ok(())
+    result
 }
 
-fn leader_exited_unreaped(pid: u32) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if rc == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { info.si_pid() } != 0)
-}
-
-pub fn kill_recorded(pid: u32, pgid: i32, ticks: u64) -> io::Result<()> {
-    validate_ids(pid, pgid)?;
-    if !pid_alive_with_ticks(pid, ticks) {
-        return Ok(());
-    }
-
-    if !signal_group(pid, pgid, ticks, libc::SIGTERM)? {
-        return Ok(());
-    }
-    if wait_for_process_to_disappear(pid, ticks, GROUP_WAIT) {
-        return Ok(());
-    }
-
-    if !signal_group(pid, pgid, ticks, libc::SIGKILL)? {
-        return Ok(());
-    }
-    if !wait_for_process_to_disappear(pid, ticks, GROUP_WAIT) {
-        crate::warn!("process {pid} did not exit after SIGKILL");
-    }
-    Ok(())
-}
-
-fn validate_ids(pid: u32, pgid: i32) -> io::Result<()> {
-    if pid <= 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "process id must be greater than 1",
-        ));
-    }
-    if pgid <= 1 || pgid != pid as i32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "process group id must be greater than 1 and match the leader",
-        ));
-    }
-    Ok(())
-}
-
-fn spawn_failure(child: &mut Child, error: io::Error) -> io::Error {
-    let _ = child.kill();
-    let _ = child.wait();
-    error
-}
-
-fn signal_group(pid: u32, pgid: i32, ticks: u64, signal: libc::c_int) -> io::Result<bool> {
-    if !pid_alive_with_ticks(pid, ticks) {
-        return Ok(false);
-    }
-    if unsafe { libc::kill(-pgid, signal) } == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(true)
-    } else {
-        Err(error)
-    }
-}
-
-fn wait_for_process_to_disappear(pid: u32, ticks: u64, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !pid_alive_with_ticks(pid, ticks) {
-            return true;
-        }
-        let remaining = match deadline.checked_duration_since(Instant::now()) {
-            Some(remaining) => remaining,
-            None => return false,
-        };
-        thread::sleep(remaining.min(Duration::from_millis(50)));
-    }
+pub fn kill_recorded(pid: u32, pgid: u32, ticks: u64) -> io::Result<()> {
+    sys::kill_recorded(pid, pgid, ticks)
 }
 
 fn spawn_output_task(
@@ -553,8 +365,8 @@ impl LogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
+    #[cfg(unix)]
     use crate::temp::TempDir;
 
     #[test]
@@ -568,6 +380,7 @@ mod tests {
         panic!("picked port should be bindable");
     }
 
+    #[cfg(unix)]
     #[test]
     fn listener_owner_matches_process() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -575,6 +388,7 @@ mod tests {
         assert!(port_listener_belongs_to_process(std::process::id(), port).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn readiness_reports_child_exit() {
         let directory = TempDir::new().expect("temporary directory");
@@ -598,6 +412,7 @@ mod tests {
         assert!(matches!(readiness, Readiness::ChildExited(_)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn group_kill_terminates_grandchild() {
         assert_group_kill_reaches_grandchild(
@@ -606,6 +421,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn group_kill_reaches_grandchild_after_leader_exits() {
         assert_group_kill_reaches_grandchild(
@@ -614,6 +430,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn assert_group_kill_reaches_grandchild(script: &str, port: u16) {
         let directory = TempDir::new().expect("temporary directory");
         let args = vec!["-c".to_owned(), script.to_owned()];

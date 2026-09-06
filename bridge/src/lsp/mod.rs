@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
 use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::mpsc::{self, Receiver};
@@ -523,7 +522,7 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
             state.status = Status::Starting;
             state.mode = Mode::Gui;
             state.godot_pid = Some(pid);
-            state.godot_pgid = Some(pgid as u32);
+            state.godot_pgid = Some(pgid);
             state.godot_start_ticks = Some(ticks);
             state.lsp_port = Some(old_lsp_port);
             state.dap_port = Some(old_dap_port);
@@ -1186,15 +1185,30 @@ fn forward_server_message<W: Write>(
             return Ok(());
         }
         if method == "textDocument/publishDiagnostics" && message.get("id").is_none() {
-            let uri = message
+            let incoming = message
                 .get("params")
                 .and_then(|params| params.get("uri"))
                 .and_then(Value::as_str);
-            if uri.is_some_and(|uri| proxy.bulk_batch_uris.remove(uri))
+            let uri = incoming.map(|uri| proxy.documents.client_uri(uri));
+            let renamed = uri.as_deref() != incoming;
+            if uri
+                .as_ref()
+                .is_some_and(|uri| proxy.bulk_batch_uris.remove(uri))
                 && proxy.bulk_batch_uris.is_empty()
             {
                 proxy.bulk_deadline = None;
                 pump_bulk_documents(proxy, writer)?;
+            }
+            if renamed {
+                let mut message = message;
+                if let (Some(uri), Some(params)) = (
+                    uri,
+                    message.get_mut("params").and_then(Value::as_object_mut),
+                ) {
+                    params.insert("uri".to_owned(), Value::String(uri));
+                }
+                send_client(output, &message)?;
+                return Ok(());
             }
         }
         if message.get("id").is_none() {
@@ -1733,7 +1747,7 @@ fn send_client<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
 }
 
 fn client_writer() -> ClientWriter {
-    unsafe { BufWriter::new(StdoutFile(ManuallyDrop::new(std::fs::File::from_raw_fd(1)))) }
+    BufWriter::new(StdoutFile(crate::sys::stdout_file()))
 }
 
 fn send_client_body<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
@@ -1790,10 +1804,8 @@ fn check_workspace(message: &Value, project: &Path, port: Option<u16>) -> Result
         .and_then(|params| params.get("path").or_else(|| params.get("workspace")))
         .and_then(Value::as_str);
     let Some(path) = path else { return Ok(()) };
-    let actual = PathBuf::from(path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(path));
-    if actual != project {
+    let actual = crate::root::canonicalize(Path::new(path)).unwrap_or_else(|_| PathBuf::from(path));
+    if !crate::root::paths_equal(&actual, project) {
         let port = port.map_or_else(|| "unknown".to_owned(), |port| port.to_string());
         crate::bail!(
             "Editor on {port} serves {}, expected {}",
@@ -1935,6 +1947,31 @@ mod tests {
     #[test]
     fn startup_deadline_zero_is_unbounded() {
         assert!(startup_deadline(0).is_none());
+    }
+
+    /// Godot announces the workspace it opened with forward slashes and in
+    /// whatever case the project directory was given, and `canonicalize`
+    /// answers with a verbatim path on Windows; all three still name the
+    /// project the bridge asked for.
+    #[test]
+    fn workspace_of_the_editor_matches_the_project() {
+        let directory = crate::temp::TempDir::new().unwrap();
+        let project = crate::root::canonicalize(directory.path()).unwrap();
+        let announced = project.to_string_lossy().replace('\\', "/");
+        let message = crate::json!({"method":"gdscript_client/changeWorkspace","params":{"path":(announced)}});
+        check_workspace(&message, &project, Some(6005)).unwrap();
+
+        let other = crate::temp::TempDir::new().unwrap();
+        let other = crate::root::canonicalize(other.path()).unwrap();
+        let message = crate::json!({
+            "method": "gdscript_client/changeWorkspace",
+            "params": {"path": (other.to_string_lossy().into_owned())}
+        });
+        let error = check_workspace(&message, &project, Some(6005)).unwrap_err();
+        assert!(
+            error.to_string().contains("Editor on 6005 serves"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -820,23 +820,34 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    const URIS: [(&str, &str); 2] = [
+        ("file:///tmp/../tmp/main.gd", "file:///tmp/main.gd"),
+        ("file:///tmp/../tmp/other.gd", "file:///tmp/other.gd"),
+    ];
+    #[cfg(windows)]
+    const URIS: [(&str, &str); 2] = [
+        ("file:///C:/tmp/../tmp/main.gd", "file:///C:/tmp/main.gd"),
+        ("file:///C:/tmp/../tmp/other.gd", "file:///C:/tmp/other.gd"),
+    ];
+
     #[test]
     fn flattens_nested_document_symbols() {
         let result = crate::json!([
             {"name":"Root","kind":5,"range":{"start":{"line":0},"end":{"line":4}},"selectionRange":{"start":{"line":1},"end":{"line":1}},"children":[
                 {"name":"Child","kind":6,"range":{"start":{"line":2},"end":{"line":3}},"selectionRange":{"start":{"line":2},"end":{"line":2}}},
-                {"name":"Other","kind":6,"range":{"start":{"line":3},"end":{"line":4}},"selectionRange":{"start":{"line":3},"end":{"line":3}},"uri":"file:///tmp/../tmp/other.gd","children":[{"name":"Nested","kind":6,"selectionRange":{"start":{"line":4},"end":{"line":4}}}]}
+                {"name":"Other","kind":6,"range":{"start":{"line":3},"end":{"line":4}},"selectionRange":{"start":{"line":3},"end":{"line":3}},"uri":(URIS[1].0),"children":[{"name":"Nested","kind":6,"selectionRange":{"start":{"line":4},"end":{"line":4}}}]}
             ]}
         ]);
         let mut containers = ContainerTable::default();
-        let flattened = flatten(&result, "file:///tmp/../tmp/main.gd", &mut containers);
+        let flattened = flatten(&result, URIS[0].0, &mut containers);
         assert_eq!(flattened.len(), 4);
         assert_eq!(containers.get(flattened[0].1.container), "");
         assert_eq!(containers.get(flattened[1].1.container), "Root");
         assert_eq!(flattened[0].1.range[0], 1);
-        assert_eq!(flattened[0].0, "file:///tmp/main.gd");
-        assert_eq!(flattened[1].0, "file:///tmp/main.gd");
-        assert_eq!(flattened[2].0, "file:///tmp/other.gd");
-        assert_eq!(flattened[3].0, "file:///tmp/other.gd");
+        assert_eq!(flattened[0].0, URIS[0].1);
+        assert_eq!(flattened[1].0, URIS[0].1);
+        assert_eq!(flattened[2].0, URIS[1].1);
+        assert_eq!(flattened[3].0, URIS[1].1);
     }
 }

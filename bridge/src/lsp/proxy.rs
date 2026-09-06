@@ -36,14 +36,20 @@ pub(super) fn run_session(mut session: Session, unmanaged: bool) -> Result<ExitC
         }
     }
     if session.settings.project_diagnostics {
-        session.watch.watcher = Some(
-            crate::watch::watch_project_into(
-                &session.proxy.project,
-                session.settings.diagnose_addons,
-                session.proxy.internal_sender.clone(),
-            )
-            .context("cannot watch project")?,
-        );
+        // A watch the platform cannot provide costs live project-wide
+        // diagnostics, not the session: the initial scan and open documents
+        // still work.
+        match crate::watch::watch_project_into(
+            &session.proxy.project,
+            session.settings.diagnose_addons,
+            session.proxy.internal_sender.clone(),
+        ) {
+            Ok(watcher) => session.watch.watcher = Some(watcher),
+            Err(error) => crate::warn!(
+                "cannot watch project {}: {error}; project diagnostics will not follow edits made outside the editor",
+                session.proxy.project.display()
+            ),
+        }
     }
     let gui_interval = Duration::from_millis(200);
     let mut gui_deadline = Instant::now() + gui_interval;

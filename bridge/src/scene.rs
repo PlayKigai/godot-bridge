@@ -1,6 +1,5 @@
 use std::fmt;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::root::normalize_absolute;
@@ -68,11 +67,7 @@ pub fn resolve_scene(project: &Path, file: &Path) -> Result<String, SceneError> 
 }
 
 fn read_scene(path: &Path) -> Option<String> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+    let file = match crate::sys::open_nofollow_read(path) {
         Ok(file) => file,
         Err(error) => {
             crate::warn!("cannot read scene {}: {error}", path.display());

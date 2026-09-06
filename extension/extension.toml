@@ -23,3 +23,5 @@ languages = ["GDScript"]
 
 [debug_adapters.godot]
 schema_path = "debug_adapter_schemas/godot.json"
+
+[debug_locators.godot]

@@ -10,6 +10,7 @@ const ROOT_MESSAGE: &str =
 #[derive(Debug)]
 pub enum RootError {
     CannotDetermineRoot,
+    UncPath(PathBuf),
     ProjectDirInvalid(PathBuf),
     NoProject(PathBuf),
     SeveralProjects {
@@ -28,6 +29,11 @@ impl fmt::Display for RootError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CannotDetermineRoot => f.write_str(ROOT_MESSAGE),
+            Self::UncPath(path) => write!(
+                f,
+                "network path {} is not supported; use a local drive",
+                path.display()
+            ),
             Self::ProjectDirInvalid(path) => {
                 write!(f, "project_dir {} has no project.godot", path.display())
             }
@@ -55,6 +61,58 @@ impl fmt::Display for RootError {
 
 impl std::error::Error for RootError {}
 
+/// Resolve a path against the file system, then remove the `\?\` prefix
+/// `canonicalize` adds on Windows so hashes, display and URIs all agree, and
+/// refuse a network path the rest of the bridge cannot address.
+pub fn canonicalize(path: &Path) -> Result<PathBuf, RootError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| RootError::CannotDetermineRoot)?;
+    strip_verbatim(canonical)
+}
+
+/// Remove the `\?\` prefix from a canonicalized Windows path, and refuse a
+/// UNC path. A no-op on Unix.
+#[cfg(unix)]
+pub fn strip_verbatim(path: PathBuf) -> Result<PathBuf, RootError> {
+    Ok(path)
+}
+
+#[cfg(windows)]
+pub fn strip_verbatim(path: PathBuf) -> Result<PathBuf, RootError> {
+    use std::path::Prefix;
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Ok(path);
+    };
+    let letter = match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => letter,
+        Prefix::Disk(_) => return Ok(path),
+        _ => return Err(RootError::UncPath(path)),
+    };
+    let mut stripped = PathBuf::from(format!("{}:\\", char::from(letter.to_ascii_uppercase())));
+    for component in components {
+        if component != Component::RootDir {
+            stripped.push(component.as_os_str());
+        }
+    }
+    Ok(stripped)
+}
+
+/// Compare two paths the way the platform's file system does: byte for byte on
+/// Unix, ignoring ASCII case on Windows.
+#[cfg(unix)]
+pub fn paths_equal(left: &Path, right: &Path) -> bool {
+    left.as_os_str() == right.as_os_str()
+}
+
+#[cfg(windows)]
+pub fn paths_equal(left: &Path, right: &Path) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
 pub fn worktree_root_from_initialize(params: &Value) -> Result<PathBuf, RootError> {
     if let Some(workspaces) = params.get("workspaceFolders") {
         let Some(workspaces) = workspaces.as_array() else {
@@ -66,9 +124,7 @@ pub fn worktree_root_from_initialize(params: &Value) -> Result<PathBuf, RootErro
                 .or_else(|| workspace.get("uri").and_then(Value::as_str));
             if let Some(uri) = uri {
                 if let Ok(path) = uri_to_path(uri) {
-                    return path
-                        .canonicalize()
-                        .map_err(|_| RootError::CannotDetermineRoot);
+                    return canonicalize(&path);
                 }
             }
         }
@@ -76,23 +132,17 @@ pub fn worktree_root_from_initialize(params: &Value) -> Result<PathBuf, RootErro
     }
 
     if let Some(root_uri) = params.get("rootUri").and_then(Value::as_str) {
-        return uri_to_path(root_uri).and_then(|path| {
-            path.canonicalize()
-                .map_err(|_| RootError::CannotDetermineRoot)
-        });
+        return uri_to_path(root_uri).and_then(|path| canonicalize(&path));
     }
     if let Some(root_path) = params.get("rootPath").and_then(Value::as_str) {
-        return Path::new(root_path)
-            .canonicalize()
-            .map_err(|_| RootError::CannotDetermineRoot);
+        return canonicalize(Path::new(root_path));
     }
     cwd_root()
 }
 
 pub fn cwd_root() -> Result<PathBuf, RootError> {
-    std::env::current_dir()
-        .and_then(|path| path.canonicalize())
-        .map_err(|_| RootError::CannotDetermineRoot)
+    let cwd = std::env::current_dir().map_err(|_| RootError::CannotDetermineRoot)?;
+    canonicalize(&cwd)
 }
 
 pub fn find_project_dir(
@@ -100,9 +150,7 @@ pub fn find_project_dir(
     file: Option<&Path>,
     configured: Option<&Path>,
 ) -> Result<PathBuf, RootError> {
-    let root = root
-        .canonicalize()
-        .map_err(|_| RootError::CannotDetermineRoot)?;
+    let root = canonicalize(root)?;
 
     if let Some(file) = file {
         let file = normalize_absolute(file);
@@ -212,8 +260,7 @@ fn has_project_file(path: &Path) -> bool {
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf, RootError> {
-    path.canonicalize()
-        .map_err(|_| RootError::CannotDetermineRoot)
+    canonicalize(path)
 }
 
 fn should_skip(path: &Path) -> bool {
@@ -245,8 +292,7 @@ pub fn normalize_absolute(path: &Path) -> PathBuf {
 }
 
 pub fn canonical_or_normalized(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| normalize_absolute(path))
+    canonicalize(path).unwrap_or_else(|_| normalize_absolute(path))
 }
 
 #[cfg(test)]
@@ -256,20 +302,86 @@ mod tests {
     #[test]
     fn resolves_fixture_projects() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures");
-        let root = root.canonicalize().unwrap();
+        let root = canonicalize(&root).unwrap();
         assert!(find_project_dir(&root.join("nested"), None, None)
             .unwrap()
-            .ends_with("nested/repo/game"));
+            .ends_with(Path::new("nested").join("repo").join("game")));
         assert!(find_project_dir(&root.join("minimal-project"), None, None)
             .unwrap()
             .ends_with("minimal-project"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn paths_compare_byte_for_byte() {
+        assert!(paths_equal(Path::new("/project"), Path::new("/project")));
+        assert!(!paths_equal(Path::new("/Project"), Path::new("/project")));
+        assert!(!paths_equal(Path::new("/project/"), Path::new("/project")));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn encodes_and_decodes_spaces() {
         let path = PathBuf::from("/tmp/a space/project.godot");
         let uri = canonical_path_to_uri(&path);
         assert!(uri.contains("a%20space"));
         assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encodes_and_decodes_spaces() {
+        let path = PathBuf::from(r"C:\tmp\a space\project.godot");
+        let uri = canonical_path_to_uri(&path);
+        assert!(uri.starts_with("file:///C:/"), "{uri}");
+        assert!(uri.contains("a%20space"), "{uri}");
+        assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_is_stripped_and_unc_is_refused() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\Users\me\proj")).unwrap(),
+            PathBuf::from(r"C:\Users\me\proj")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\c:\")).unwrap(),
+            PathBuf::from(r"C:\")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"C:\Users\me")).unwrap(),
+            PathBuf::from(r"C:\Users\me")
+        );
+        assert!(matches!(
+            strip_verbatim(PathBuf::from(r"\\server\share\proj")),
+            Err(RootError::UncPath(_))
+        ));
+        assert!(matches!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\server\share")),
+            Err(RootError::UncPath(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_returns_a_drive_letter_path() {
+        let root = canonicalize(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let text = root.to_string_lossy().into_owned();
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert!(text.as_bytes()[1] == b':', "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_compare_without_regard_to_case() {
+        assert!(paths_equal(
+            Path::new(r"C:\Users\Me\Proj"),
+            Path::new(r"c:\users\me\proj")
+        ));
+        assert!(!paths_equal(
+            Path::new(r"C:\Users\Me\Proj"),
+            Path::new(r"C:\Users\Me\Other")
+        ));
     }
 }
