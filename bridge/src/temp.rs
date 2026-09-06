@@ -15,7 +15,10 @@ impl TempDir {
             let count = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!("godot-bridge-{}-{count}", std::process::id()));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    let path = crate::root::canonicalize(&path).unwrap_or(path);
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
