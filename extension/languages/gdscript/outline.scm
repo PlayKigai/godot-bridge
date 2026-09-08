@@ -14,6 +14,19 @@
   "signal" @context
   name: (name) @name) @item
 
+(const_statement
+  "const" @context
+  name: (name) @name) @item
+
+(enum_definition
+  "enum" @context
+  name: (name) @name) @item
+
+(enum_definition
+  body: (enumerator_list
+    (enumerator
+      left: (identifier) @name) @item))
+
 (variable_statement
   "var" @context
   name: (name) @name) @item
