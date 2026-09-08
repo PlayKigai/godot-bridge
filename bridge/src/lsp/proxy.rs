@@ -178,6 +178,10 @@ fn handle_event(
             }
         }
         ProxyEvent::Godot(event) => {
+            let event = match event {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => Ok(None),
+                event => event,
+            };
             let result = session.godot.feed(event);
             if let Some(code) = guard(session, unmanaged, result)? {
                 return Ok(Some(code));
