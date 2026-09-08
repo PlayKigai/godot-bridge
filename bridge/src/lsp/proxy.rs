@@ -392,6 +392,24 @@ where
     proxy.next_id += 1;
     if let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) {
         params.remove("initializationOptions");
+        // Godot compares these against its opened project and degrades on a
+        // mismatch, so point them at the resolved project, not the worktree.
+        let uri = crate::root::canonical_path_to_uri(project);
+        params.insert("rootUri".into(), crate::json!(uri.clone()));
+        params.insert(
+            "rootPath".into(),
+            crate::json!(project.to_string_lossy().into_owned()),
+        );
+        if params.contains_key("workspaceFolders") {
+            let name = project
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            params.insert(
+                "workspaceFolders".into(),
+                crate::json!([{"uri": uri, "name": name}]),
+            );
+        }
     }
     initialize["id"] = crate::json!(bridge_id);
     send_godot(&mut editor.connection.writer, &initialize, true)?;
