@@ -171,8 +171,8 @@ mod unix_tests {
     const CAPTURED: [(&str, &str); 10] = [
         ("/", "file:///"),
         (
-            "/home/user/projects/zed-godot",
-            "file:///home/user/projects/zed-godot",
+            "/home/user/projects/godot-bridge",
+            "file:///home/user/projects/godot-bridge",
         ),
         (
             "/home/user/my project/main.gd",
