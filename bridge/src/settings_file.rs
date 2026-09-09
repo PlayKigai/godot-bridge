@@ -145,24 +145,52 @@ pub fn parse_settings(value: &Value) -> Result<Settings, String> {
         return Ok(Settings::default());
     }
     let Some(object) = value.as_object() else {
-        return Err("initializationOptions must be an object".to_string());
+        return Err("settings must be an object".to_string());
     };
     for key in object.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            crate::warn!("ignoring unknown key {key} in lsp.godot.settings");
+            crate::warn!("ignoring unknown setting {key}");
         }
     }
-    let settings = Settings::from_object(object)
-        .map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
-    validate_settings(&settings).map_err(|error| format!("invalid lsp.godot.settings: {error}"))?;
+    let settings =
+        Settings::from_object(object).map_err(|error| format!("invalid settings: {error}"))?;
+    validate_settings(&settings).map_err(|error| format!("invalid settings: {error}"))?;
     Ok(settings)
 }
 
-pub fn load_zed_settings(worktree: &Path) -> Result<Settings, String> {
-    load_zed_settings_with(worktree, user_settings_path().as_deref())
+const ENV_SETTINGS: &str = "GODOT_BRIDGE_SETTINGS";
+
+/// Already merged by the client, so every key is kept.
+fn env_settings() -> Result<Option<Settings>, String> {
+    match std::env::var(ENV_SETTINGS) {
+        Ok(contents) if contents.is_empty() => Ok(None),
+        Ok(contents) if contents.len() <= SETTINGS_FILE_CAP as usize => {
+            let value = crate::json::from_str(&contents)
+                .map_err(|error| format!("invalid {ENV_SETTINGS}: {error}"))?;
+            parse_settings(&value).map(Some)
+        }
+        Ok(_) => Err(format!("{ENV_SETTINGS} exceeds 1 MiB")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("cannot read {ENV_SETTINGS}: {error}")),
+    }
 }
 
-fn load_zed_settings_with(worktree: &Path, user_path: Option<&Path>) -> Result<Settings, String> {
+fn load_with(fallback: impl FnOnce() -> Result<Settings, String>) -> Result<Settings, String> {
+    match env_settings()? {
+        Some(settings) => Ok(settings),
+        None => fallback(),
+    }
+}
+
+pub fn load_cli(worktree: &Path) -> Result<Settings, String> {
+    load_with(|| load_file_settings(worktree, user_settings_path().as_deref()))
+}
+
+pub fn load_lsp(options: &Value, worktree: &Path) -> Result<Settings, String> {
+    load_with(|| merge_lsp_options(options, worktree))
+}
+
+fn load_file_settings(worktree: &Path, user_path: Option<&Path>) -> Result<Settings, String> {
     let project_path = worktree.join(".zed").join("settings.json");
 
     let project_section = read_settings_section(&project_path)?;
@@ -179,7 +207,7 @@ fn load_zed_settings_with(worktree: &Path, user_path: Option<&Path>) -> Result<S
     parse_settings(&Value::Object(merged))
 }
 
-pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings, String> {
+fn merge_lsp_options(value: &Value, worktree: &Path) -> Result<Settings, String> {
     let empty = Map::new();
     let object = match value.as_object() {
         Some(object) => object,
@@ -202,17 +230,17 @@ pub fn parse_trusted_settings(value: &Value, worktree: &Path) -> Result<Settings
     parse_settings(&Value::Object(merged))
 }
 
-fn remove_untrusted_project_keys(path: &Path, section: &mut Map) {
+fn warn_untrusted_project_keys(path: &Path, section: &Map) {
     for key in PROJECT_UNTRUSTED_KEYS {
-        if section.remove(key).is_some() {
+        if section.contains_key(key) {
             crate::warn!("ignoring project setting {key} in {}", path.display());
         }
     }
 }
 
-fn warn_untrusted_project_keys(path: &Path, section: &Map) {
+fn remove_untrusted_project_keys(path: &Path, section: &mut Map) {
     for key in PROJECT_UNTRUSTED_KEYS {
-        if section.contains_key(key) {
+        if section.remove(key).is_some() {
             crate::warn!("ignoring project setting {key} in {}", path.display());
         }
     }
@@ -369,7 +397,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("main.gd");
         fs::write(&file, "").unwrap();
-        assert!(load_zed_settings_with(&file, None).is_ok());
+        assert!(load_file_settings(&file, None).is_ok());
     }
 
     #[test]
@@ -401,7 +429,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_settings(&value).unwrap_err(),
-                "initializationOptions must be an object"
+                "settings must be an object"
             );
         }
     }
@@ -449,7 +477,7 @@ mod tests {
                 }
             }"#,
         );
-        let settings = load_zed_settings_with(
+        let settings = load_file_settings(
             worktree.path(),
             Some(&user_settings_path_in(config_dir.path())),
         )
@@ -472,7 +500,7 @@ mod tests {
             worktree.path(),
             r#"{"lsp":{"godot":{"settings":{"godot_path":"/bin/true","godot_path":"/bin/sh"}}}}"#,
         );
-        let settings = load_zed_settings_with(
+        let settings = load_file_settings(
             worktree.path(),
             Some(&user_settings_path_in(config_dir.path())),
         )
@@ -498,7 +526,7 @@ mod tests {
                 },
             }"#,
         );
-        let settings = load_zed_settings_with(
+        let settings = load_file_settings(
             worktree.path(),
             Some(&user_settings_path_in(config_dir.path())),
         )
@@ -515,7 +543,7 @@ mod tests {
             worktree.path(),
             r#"{"lsp": {"godot": {"settings": {"dap_port": "bad"}}}}"#,
         );
-        let error = load_zed_settings_with(
+        let error = load_file_settings(
             worktree.path(),
             Some(&user_settings_path_in(config_dir.path())),
         )

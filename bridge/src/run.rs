@@ -41,7 +41,7 @@ fn resolve_project(
     file: &Path,
 ) -> crate::error::Result<(std::path::PathBuf, settings_file::Settings)> {
     let worktree = root::cwd_root()?;
-    let settings = settings_file::load_zed_settings(&worktree)?;
+    let settings = settings_file::load_cli(&worktree)?;
     let project = root::find_project_dir(
         &worktree,
         Some(file),

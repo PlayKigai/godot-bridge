@@ -19,6 +19,10 @@ fn main() -> ExitCode {
             print!("{}", cli::HELP);
             return ExitCode::SUCCESS;
         }
+        Ok(Invocation::Version) => {
+            println!("godot-bridge {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Ok(Invocation::Command(command)) => command,
         Err(message) => {
             eprintln!("godot-bridge: {message}\n\n{}", cli::HELP);

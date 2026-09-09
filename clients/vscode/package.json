@@ -1,0 +1,223 @@
+{
+  "name": "godot-bridge",
+  "displayName": "Godot Bridge",
+  "description": "GDScript in VS Code, backed by the Godot editor's own language server and debugger.",
+  "version": "1.0.0",
+  "publisher": "playkigai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PlayKigai/godot-bridge"
+  },
+  "engines": {
+    "vscode": "^1.134.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "package": "npx --yes @vscode/vsce@3.9.2 package",
+    "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.134.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "gdscript",
+        "aliases": ["GDScript", "gdscript"],
+        "extensions": [".gd"],
+        "configuration": "./language-configuration/gdscript-language-configuration.json"
+      },
+      {
+        "id": "gdshader",
+        "aliases": ["GDShader", "gdshader"],
+        "extensions": [".gdshader", ".gdshaderinc"],
+        "configuration": "./language-configuration/gdshader-language-configuration.json"
+      },
+      {
+        "id": "godot-resource",
+        "aliases": ["Godot Resource", "godot-resource"],
+        "extensions": [".tscn", ".tres", ".godot", ".gdextension", ".import"],
+        "configuration": "./language-configuration/godot-resource-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gdscript",
+        "scopeName": "source.gdscript",
+        "path": "./syntaxes/gdscript.tmGrammar.json"
+      },
+      {
+        "language": "gdshader",
+        "scopeName": "source.gdshader",
+        "path": "./syntaxes/gdshader.tmGrammar.json"
+      },
+      {
+        "language": "godot-resource",
+        "scopeName": "source.godot-resource",
+        "path": "./syntaxes/godot-resource.tmGrammar.json"
+      }
+    ],
+    "configuration": {
+      "title": "Godot",
+      "properties": {
+        "godot.bridgePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Path to the godot-bridge binary (absolute, ~/ or relative to your home directory) or a name found on PATH. Empty means godot-bridge on PATH."
+        },
+        "godot.godotPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Godot 4 binary, absolute path. Empty means godot on PATH."
+        },
+        "godot.projectDir": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Directory containing project.godot, relative to the workspace root. Empty means auto-detect."
+        },
+        "godot.lspPort": {
+          "type": ["integer", "null"],
+          "default": null,
+          "scope": "resource",
+          "description": "Attach to a Godot editor you started yourself instead of spawning one."
+        },
+        "godot.dapPort": {
+          "type": "integer",
+          "default": 6006,
+          "scope": "resource",
+          "description": "Debug port of the editor named by lspPort. Ignored otherwise."
+        },
+        "godot.projectDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Diagnostics for all scripts, not only open ones."
+        },
+        "godot.diagnoseAddons": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Include addons/ in project diagnostics."
+        },
+        "godot.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "scope": "machine",
+          "description": "Extra Godot flags."
+        },
+        "godot.startupTimeoutS": {
+          "type": "integer",
+          "default": 600,
+          "scope": "resource",
+          "description": "How long to wait for Godot, in seconds."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[gdscript]": {
+        "editor.insertSpaces": false
+      }
+    },
+    "debuggers": [
+      {
+        "type": "godot",
+        "label": "Godot",
+        "languages": ["gdscript"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["request"],
+            "properties": {
+              "request": {
+                "type": "string",
+                "enum": ["launch"],
+                "default": "launch"
+              },
+              "scene": {
+                "type": "string",
+                "default": "main",
+                "description": "\"main\" runs the project, \"current\" runs the scene of the active file. A res:// path or .tscn path also works."
+              }
+            }
+          },
+          "attach": {
+            "required": ["request"],
+            "properties": {
+              "request": {
+                "type": "string",
+                "enum": ["attach"],
+                "default": "attach"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "godot",
+            "request": "launch",
+            "name": "Godot: run project",
+            "scene": "main"
+          },
+          {
+            "type": "godot",
+            "request": "launch",
+            "name": "Godot: run current scene",
+            "scene": "current"
+          },
+          {
+            "type": "godot",
+            "request": "attach",
+            "name": "Godot: attach"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "godot.runProject",
+        "title": "Run Project",
+        "category": "Godot"
+      },
+      {
+        "command": "godot.runCurrentScene",
+        "title": "Run Current Scene",
+        "category": "Godot"
+      },
+      {
+        "command": "godot.openEditor",
+        "title": "Open Editor",
+        "category": "Godot"
+      },
+      {
+        "command": "godot.openDocs",
+        "title": "Docs for Symbol",
+        "category": "Godot"
+      },
+      {
+        "command": "godot.showStatus",
+        "title": "Bridge Status",
+        "category": "Godot"
+      },
+      {
+        "command": "godot.restartLanguageServer",
+        "title": "Restart Language Server",
+        "category": "Godot"
+      }
+    ]
+  }
+}

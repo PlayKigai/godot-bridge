@@ -1,4 +1,4 @@
-//! `file:` URI encoding and decoding, in the dialect Zed and Godot exchange.
+//! `file:` URI encoding and decoding, in the dialect editors and Godot exchange.
 //!
 //! Unix paths are arbitrary bytes, so the Unix implementation never goes
 //! through `str`. Windows paths are UTF-16 that the bridge handles as UTF-8,
@@ -39,7 +39,7 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 /// Encode an absolute Windows path. A drive letter becomes `/C:` after the
-/// authority, which is the form Godot emits and Zed accepts.
+/// authority, which is the form Godot emits and editors accept.
 #[cfg(windows)]
 pub fn path_to_uri(path: &Path) -> String {
     use std::path::Prefix;
@@ -223,7 +223,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn accepts_the_forms_zed_and_godot_send() {
+    fn accepts_the_forms_clients_and_godot_send() {
         assert_eq!(
             uri_to_path("FILE:///tmp/a.gd"),
             Some(PathBuf::from("/tmp/a.gd"))
@@ -313,7 +313,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn accepts_the_forms_zed_and_godot_send() {
+    fn accepts_the_forms_clients_and_godot_send() {
         let expected = Some(PathBuf::from(r"C:\Users\me\proj\main.gd"));
         assert_eq!(uri_to_path("file:///C:/Users/me/proj/main.gd"), expected);
         assert_eq!(uri_to_path("file:///c:/Users/me/proj/main.gd"), expected);

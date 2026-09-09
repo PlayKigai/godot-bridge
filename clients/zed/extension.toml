@@ -1,10 +1,10 @@
 id = "godot"
 name = "Godot"
-version = "0.1.0"
+version = "1.0.0"
 schema_version = 1
 authors = ["Godot Zed contributors"]
 description = "Godot language support for Zed."
-repository = "https://github.com/PlayKigai/zed-godot"
+repository = "https://github.com/PlayKigai/godot-bridge"
 
 [grammars.gdscript]
 repository = "https://github.com/PrestonKnopp/tree-sitter-gdscript"

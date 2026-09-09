@@ -1,16 +1,23 @@
 pub const HELP: &str = "\
-godot-bridge: GDScript language server and debug adapter bridge for Zed
+godot-bridge: GDScript language server and debug adapter bridge for editors
 
 Usage: godot-bridge <command> [options] [-- ignored args]
 
 Commands:
-  lsp                                 proxy Zed's language server over stdio
-  dap [--file <path>]                 proxy one Zed debug session over stdio
+  lsp                                 language server over stdio
+  dap [--file <path>]                 one debug session over stdio
   project-dir --file <path>           print the resolved Godot project directory
   run --file <path> [--scene current] run the project, or the file's scene
   open-editor --file <path>           hand the project to the Godot GUI editor
   status                              print the state of every running bridge
   doc <symbol>                        open the Godot documentation for a symbol
+
+Options:
+  -h, --help                          print this help
+  -V, --version                       print the bridge version
+
+Settings come from GODOT_BRIDGE_SETTINGS (a JSON object) when set, else from
+the Zed settings files (other editors always set it).
 ";
 
 pub enum Command {
@@ -25,6 +32,7 @@ pub enum Command {
 
 pub enum Invocation {
     Help,
+    Version,
     Command(Command),
 }
 
@@ -42,6 +50,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     };
     if subcommand == "-h" || subcommand == "--help" || subcommand == "help" {
         return Ok(Invocation::Help);
+    }
+    if subcommand == "-V" || subcommand == "--version" {
+        return Ok(Invocation::Version);
     }
     let allowed: &[&str] = match subcommand.as_str() {
         "dap" | "project-dir" | "open-editor" => &["--file"],
@@ -118,7 +129,7 @@ mod tests {
     fn command(arguments: &[&str]) -> Command {
         match parse(arguments.iter().map(|argument| (*argument).to_owned())) {
             Ok(Invocation::Command(command)) => command,
-            Ok(Invocation::Help) => panic!("expected a command, got help"),
+            Ok(Invocation::Help | Invocation::Version) => panic!("expected a command"),
             Err(message) => panic!("expected a command, got {message}"),
         }
     }
@@ -183,6 +194,15 @@ mod tests {
             panic!("expected doc");
         };
         assert_eq!(symbol, "Node.ready");
+    }
+
+    #[test]
+    fn version_is_requested_by_flag() {
+        assert!(matches!(
+            parse(["--version".to_owned()]),
+            Ok(Invocation::Version)
+        ));
+        assert!(matches!(parse(["-V".to_owned()]), Ok(Invocation::Version)));
     }
 
     #[test]

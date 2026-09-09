@@ -1,9 +1,12 @@
 [package]
 name = "godot-bridge"
+description = "GDScript language server and debug adapter bridge to the Godot editor, for Zed, VS Code and Neovim"
 version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
 edition.workspace = true
+keywords = ["godot", "gdscript", "lsp", "dap"]
+categories = ["development-tools"]
 
 [[bin]]
 name = "godot-bridge"

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{kill_recorded, pick_free_port, port_listener_belongs_to_process, spawn_gui};
 use crate::root::{cwd_root, find_project_dir};
-use crate::settings_file::{load_zed_settings, Settings};
+use crate::settings_file::{self, Settings};
 use crate::state::{
     detached_gui_state, gui_process_alive, matches_project, read_state, socket_request, try_lock,
     write_state, Mode, ProjectFiles, State, Status,
@@ -25,7 +25,7 @@ enum PortReadiness {
 
 pub fn run(file: &Path) -> Result<ExitCode> {
     let root = cwd_root()?;
-    let settings = load_zed_settings(&root)?;
+    let settings = settings_file::load_cli(&root)?;
     let project = find_project_dir(
         &root,
         Some(file),

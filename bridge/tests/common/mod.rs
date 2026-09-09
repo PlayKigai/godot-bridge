@@ -61,6 +61,7 @@ impl BridgeClient {
             .arg(command)
             .current_dir(project)
             .env("GODOT_BRIDGE_LOG", "debug")
+            .env_remove("GODOT_BRIDGE_SETTINGS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -395,7 +396,10 @@ pub fn copy_directory(source: &Path, destination: &Path) {
 #[allow(dead_code)]
 pub fn status(runtime: &Path, project: &Path, config: &Path) -> Option<Value> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_godot-bridge"));
-    command.arg("status").current_dir(project);
+    command
+        .arg("status")
+        .current_dir(project)
+        .env_remove("GODOT_BRIDGE_SETTINGS");
     redirect_directories(&mut command, runtime, config);
     let output = command.output().ok()?;
     output

@@ -25,7 +25,7 @@ use crate::process::{
     spawn_gui, wait_for_port, GodotChild, Readiness,
 };
 use crate::root::{find_project_dir, worktree_root_from_initialize};
-use crate::settings_file::{parse_trusted_settings, Settings};
+use crate::settings_file::{self, Settings};
 use crate::state::{
     clear_owner_identity, gui_process_alive, handoff_decision, matches_project, read_state,
     remove_if_stale, serve_socket, set_owner_identity, start_ticks, try_lock, write_state,
@@ -77,7 +77,7 @@ impl Write for StdoutFile {
 }
 
 struct PendingRequest {
-    zed_id: Value,
+    client_id: Value,
     internal: bool,
     symbol: Option<(String, u64, i64)>,
 }
@@ -139,7 +139,7 @@ struct ProxyState {
     stale_server_ids: RequestKeys,
     next_id: i64,
     initialized_forwarded: bool,
-    zed_initialized: bool,
+    client_initialized: bool,
     initialize: Value,
     project: PathBuf,
     recovery_times: VecDeque<Instant>,
@@ -178,7 +178,7 @@ impl ProxyState {
             stale_server_ids: RequestKeys::default(),
             next_id: 1,
             initialized_forwarded: false,
-            zed_initialized: false,
+            client_initialized: false,
             initialize,
             project,
             recovery_times: VecDeque::new(),
@@ -544,14 +544,14 @@ fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
                             )?;
                         }
                         if session.client.eof && session.client.frames.is_empty() {
-                            crate::bail!("Zed closed during GUI handoff");
+                            crate::bail!("client closed during GUI handoff");
                         }
                     }
                     Ok(ProxyEvent::Godot(_)) => {}
                     Ok(event) => session.deferred.push_back(event)?,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        crate::bail!("Zed closed during GUI handoff")
+                        crate::bail!("client closed during GUI handoff")
                     }
                 }
                 Ok(())
@@ -651,7 +651,7 @@ pub fn run() -> Result<ExitCode> {
         }
     };
     let options = params.get("initializationOptions").unwrap_or(&Value::Null);
-    let settings = match parse_trusted_settings(options, &root) {
+    let settings = match settings_file::load_lsp(options, &root) {
         Ok(settings) => settings,
         Err(error) => {
             send_error(&mut output, &initialize_id, -32602, "InvalidParams")?;
@@ -738,7 +738,7 @@ pub fn run() -> Result<ExitCode> {
                 &initialize_id,
                 -32002,
                 &format!(
-                    "Another Zed window already serves {}. Godot serves one client at a time.",
+                    "Another editor window already serves {}. Godot serves one client at a time.",
                     project.display()
                 ),
             )?;
@@ -1020,7 +1020,7 @@ fn forward_client_message(
         }
         if method == "initialized" {
             send_godot(&mut editor.connection.writer, &message, false)?;
-            proxy.zed_initialized = true;
+            proxy.client_initialized = true;
             start_project_diagnostics(proxy, settings);
             return Ok(());
         }
@@ -1046,7 +1046,7 @@ fn forward_client_message(
     if message.get("id").is_some() && method.is_none() {
         let body = crate::json::to_vec(&message);
         if body.len() > GODOT_WRITE_CAP {
-            crate::bail!("Zed response is too large for Godot");
+            crate::bail!("client response is too large for Godot");
         }
         let Some(id) = message.get("id").and_then(crate::json::value_request_key) else {
             return Ok(());
@@ -1067,30 +1067,30 @@ fn forward_client_request<W: Write>(
     proxy: &mut ProxyState,
     mut message: Value,
 ) -> Result<Option<i64>> {
-    let zed_id = message.get("id").cloned().unwrap_or(Value::Null);
+    let client_id = message.get("id").cloned().unwrap_or(Value::Null);
     let is_shutdown = message.get("method").and_then(Value::as_str) == Some("shutdown");
     let bridge_id = proxy.next_id;
     proxy.next_id += 1;
     message["id"] = crate::json!(bridge_id);
     let body = crate::json::to_vec(&message);
     if body.len() > GODOT_WRITE_CAP {
-        send_error(output, &zed_id, -32803, "message too large for Godot")?;
+        send_error(output, &client_id, -32803, "message too large for Godot")?;
         return Ok(None);
     }
     if proxy.pending.len() >= IN_FLIGHT_CAP && !is_shutdown {
         let queued_size = body.len();
         if proxy.queued_bytes.saturating_add(queued_size) > QUEUE_BYTES_CAP {
-            send_error(output, &zed_id, -32803, "RequestFailed")?;
+            send_error(output, &client_id, -32803, "RequestFailed")?;
             return Ok(None);
         }
         proxy.queued_bytes += queued_size;
-        proxy.queued.push_back((message, zed_id, queued_size));
+        proxy.queued.push_back((message, client_id, queued_size));
         return Ok(None);
     }
     proxy.pending.insert(
         bridge_id,
         PendingRequest {
-            zed_id,
+            client_id,
             internal: false,
             symbol: None,
         },
@@ -1130,7 +1130,7 @@ fn cancel_request<W: Write>(
     if let Some(index) = proxy
         .queued
         .iter()
-        .position(|(_, zed_id, _)| zed_id == &target)
+        .position(|(_, client_id, _)| client_id == &target)
     {
         if let Some((_, _, queued_size)) = proxy.queued.remove(index) {
             proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
@@ -1141,7 +1141,7 @@ fn cancel_request<W: Write>(
     if let Some((&bridge_id, _)) = proxy
         .pending
         .iter()
-        .find(|(_, pending)| pending.zed_id == target)
+        .find(|(_, pending)| pending.client_id == target)
     {
         let translated =
             crate::json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":bridge_id}});
@@ -1275,7 +1275,7 @@ fn forward_server_message<W: Write>(
             return Ok(());
         }
         let mut response = message;
-        response["id"] = pending.zed_id;
+        response["id"] = pending.client_id;
         send_client(output, &response)?;
         flush_queued(output, writer, proxy)?;
     } else if !request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id))
@@ -1292,7 +1292,7 @@ fn flush_queued<W: Write>(
     proxy: &mut ProxyState,
 ) -> Result<()> {
     while proxy.pending.len() < IN_FLIGHT_CAP {
-        let Some((mut message, zed_id, queued_size)) = proxy.queued.pop_front() else {
+        let Some((mut message, client_id, queued_size)) = proxy.queued.pop_front() else {
             break;
         };
         proxy.queued_bytes = proxy.queued_bytes.saturating_sub(queued_size);
@@ -1301,13 +1301,13 @@ fn flush_queued<W: Write>(
         message["id"] = crate::json!(bridge_id);
         let body = crate::json::to_vec(&message);
         if body.len() > GODOT_WRITE_CAP {
-            send_error(output, &zed_id, -32803, "message too large for Godot")?;
+            send_error(output, &client_id, -32803, "message too large for Godot")?;
             continue;
         }
         proxy.pending.insert(
             bridge_id,
             PendingRequest {
-                zed_id,
+                client_id,
                 internal: false,
                 symbol: None,
             },
@@ -1350,11 +1350,12 @@ fn rewrite_document_messages(
                 return Ok(Vec::new());
             }
             let key = proxy.documents.key_for_uri(&uri);
-            let planned = proxy.documents.plan_zed_open_key(&key, text);
+            let planned = proxy.documents.plan_client_open_key(&key, text);
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let Some((action_uri, version)) = proxy.documents.zed_open(&uri, &key, planned) else {
+            let Some((action_uri, version)) = proxy.documents.client_open(&uri, &key, planned)
+            else {
                 return Ok(Vec::new());
             };
             schedule_document(proxy, &action_uri, version);
@@ -1376,7 +1377,7 @@ fn rewrite_document_messages(
                 return Ok(Vec::new());
             }
             let key = proxy.documents.key_for_uri(&uri);
-            let Some(planned) = proxy.documents.plan_zed_change_key(&key, text) else {
+            let Some(planned) = proxy.documents.plan_client_change_key(&key, text) else {
                 let body = crate::json::to_vec(&message);
                 if !check_document_size(&uri, "didChange", body.len()) {
                     return Ok(Vec::new());
@@ -1386,14 +1387,14 @@ fn rewrite_document_messages(
             let Some(body) = encode_document_action(&planned, &uri) else {
                 return Ok(Vec::new());
             };
-            let Some((action_uri, version)) = proxy.documents.zed_change(&key, planned) else {
+            let Some((action_uri, version)) = proxy.documents.client_change(&key, planned) else {
                 return Ok(Vec::new());
             };
             schedule_document(proxy, &action_uri, version);
             return Ok(vec![body]);
         }
         "textDocument/didClose" => {
-            let Some((key, close_uri)) = proxy.documents.zed_close(&uri) else {
+            let Some((key, close_uri)) = proxy.documents.client_close(&uri) else {
                 return Ok(vec![crate::json::to_vec(&message)]);
             };
             forget_symbols(proxy, &close_uri);
@@ -1468,7 +1469,7 @@ fn close_message(uri: &str) -> Value {
 fn start_project_diagnostics(proxy: &mut ProxyState, settings: &Settings) {
     if !settings.project_diagnostics
         || !proxy.initialized_forwarded
-        || !proxy.zed_initialized
+        || !proxy.client_initialized
         || proxy.project_diagnostics_started
         || proxy.bulk_replay
     {
@@ -1557,7 +1558,7 @@ fn process_bulk_document(
             return Ok(None);
         };
         let text = match open.owner {
-            DocumentOwner::Zed => open.text.clone(),
+            DocumentOwner::Editor => open.text.clone(),
             DocumentOwner::Bridge => docs_state::read_document(&document.key),
         };
         let Some(text) = text else {
@@ -1632,7 +1633,7 @@ fn process_watcher_changes(
     mut changes: Vec<WatcherChange>,
     recovering: bool,
 ) -> Result<()> {
-    if !settings.project_diagnostics || !proxy.zed_initialized {
+    if !settings.project_diagnostics || !proxy.client_initialized {
         return Ok(());
     }
     if changes
@@ -1655,7 +1656,7 @@ fn process_watcher_changes(
                 }
                 let key = crate::root::canonical_or_normalized(&path);
                 let owner = proxy.documents.owner(&key);
-                if owner == Some(DocumentOwner::Zed) {
+                if owner == Some(DocumentOwner::Editor) {
                     continue;
                 }
                 let Some(text) = docs_state::read_document(&path) else {
@@ -1687,7 +1688,7 @@ fn process_watcher_changes(
                 let Some(key) = proxy.documents.watcher_key(&path) else {
                     continue;
                 };
-                if proxy.documents.owner(&key) == Some(DocumentOwner::Zed) {
+                if proxy.documents.owner(&key) == Some(DocumentOwner::Editor) {
                     continue;
                 }
                 let Some(uri) = proxy.documents.bridge_remove_key(&key) else {
@@ -1885,7 +1886,7 @@ fn send_due_symbol_requests(
     editor: &mut Editor,
     proxy: &mut ProxyState,
 ) -> Result<Option<Instant>> {
-    if !proxy.zed_initialized {
+    if !proxy.client_initialized {
         return Ok(None);
     }
     if proxy.pending.len() >= IN_FLIGHT_CAP {
@@ -1912,7 +1913,7 @@ fn send_due_symbol_requests(
         proxy.pending.insert(
             id,
             PendingRequest {
-                zed_id: Value::Null,
+                client_id: Value::Null,
                 internal: true,
                 symbol: Some((uri.clone(), generation, version)),
             },
@@ -2011,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_request_response_keeps_zed_id() {
+    fn queued_request_response_keeps_client_id() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let writer = TcpStream::connect(address).unwrap();
@@ -2040,7 +2041,7 @@ mod tests {
                 (
                     id,
                     PendingRequest {
-                        zed_id: crate::json!(id),
+                        client_id: crate::json!(id),
                         internal: false,
                         symbol: None,
                     },

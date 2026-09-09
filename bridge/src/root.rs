@@ -39,7 +39,7 @@ impl fmt::Display for RootError {
             }
             Self::NoProject(root) => write!(
                 f,
-                "No project.godot found under {}. Set lsp.godot.settings.project_dir.",
+                "No project.godot found under {}. Set the project_dir setting.",
                 root.display()
             ),
             Self::SeveralProjects { root, projects } => {
@@ -50,7 +50,7 @@ impl fmt::Display for RootError {
                     .join(", ");
                 write!(
                     f,
-                    "Several Godot projects under {}: {}. Set lsp.godot.settings.project_dir.",
+                    "Several Godot projects under {}: {}. Set the project_dir setting.",
                     root.display(),
                     paths
                 )

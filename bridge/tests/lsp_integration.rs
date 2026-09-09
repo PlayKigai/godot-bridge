@@ -72,7 +72,7 @@ fn second_owner_is_rejected() {
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("Another Zed window"));
+        .contains("Another editor window"));
     close_and_wait(&mut first, runtime.path(), &project);
 }
 

@@ -24,14 +24,14 @@ pub(super) fn fail_in_flight(session: &mut Session) -> Result<()> {
         if !pending.internal {
             send_error(
                 &mut session.output,
-                &pending.zed_id,
+                &pending.client_id,
                 -32803,
                 "RequestFailed",
             )?;
         }
     }
-    for (_, zed_id, _) in session.proxy.queued.drain(..) {
-        send_error(&mut session.output, &zed_id, -32803, "RequestFailed")?;
+    for (_, client_id, _) in session.proxy.queued.drain(..) {
+        send_error(&mut session.output, &client_id, -32803, "RequestFailed")?;
     }
     session.proxy.queued_bytes = 0;
     let served = session.proxy.server_requests.drain();
@@ -327,7 +327,7 @@ pub(super) fn replay_initialize(
     proxy.pending.insert(
         id,
         PendingRequest {
-            zed_id: Value::Null,
+            client_id: Value::Null,
             internal: true,
             symbol: None,
         },
@@ -348,7 +348,7 @@ pub(super) fn replay_initialize(
         &mut context,
         move |editor, proxy, _, _, _| {
             proxy.pending.remove(&id);
-            if proxy.zed_initialized {
+            if proxy.client_initialized {
                 send_godot(
                     &mut editor.connection.writer,
                     &crate::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),

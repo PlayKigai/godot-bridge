@@ -1,17 +1,17 @@
-# zed-godot: spec
+# godot-bridge: spec
 
 One native binary, `godot-bridge`, owns a headless Godot editor per project.
-Zed spawns it as the LSP (`godot-bridge lsp`) and once per debug session as
-the DAP (`godot-bridge dap`). Both proxy stdio to the editor's TCP ports.
+The editor client spawns it as the LSP (`godot-bridge lsp`) and once per
+debug session as the DAP (`godot-bridge dap`). Both proxy stdio to the editor's TCP ports.
 
 ```
-Zed ──stdio──► godot-bridge lsp ──tcp──► Godot editor (headless)
-Zed ──stdio──► godot-bridge dap ──tcp──►   --lsp-port, --dap-port
+Editor ──stdio──► godot-bridge lsp ──tcp──► Godot editor (headless)
+Editor ──stdio──► godot-bridge dap ──tcp──►   --lsp-port, --dap-port
                       └── owns, kills, respawns ──┘
 ```
 
-Godot facts the design rests on: Zed extensions cannot spawn processes.
-Godot LSP serves one client, uses full text sync, accepts one
+The Zed extension (wasm) cannot spawn processes, so the bridge owns Godot.
+Godot facts the design rests on: Godot LSP serves one client, uses full text sync, accepts one
 `Content-Length` header and frames up to 4 MiB, has no `workspace/*`
 methods, publishes diagnostics only for opened documents, and can crash
 under load. `bridge/` depends on `libc` at runtime; `serde_json` is a
@@ -21,7 +21,7 @@ dev-dependency only.
 
 | command | purpose |
 |---|---|
-| `lsp` | Zed's LSP entry. Owns the editor. |
+| `lsp` | The editor's LSP entry. Owns the Godot editor. |
 | `dap [--file <path>]` | DAP proxy. Needs a running `lsp` owner. |
 | `project-dir --file <path>` | Prints the canonical project dir. |
 | `run --file <path> [--scene <value>]` | Runs `<godot> [extra_args] --path <project> [scene]`. `--scene current` runs a `.tscn` directly or resolves the scene of a script. |
@@ -34,16 +34,16 @@ exit 1. Errors print a message and exit 1.
 
 ## Settings
 
-`lsp.godot.settings` in user settings or `.zed/settings.json`. `godot_path`,
+For Zed, `lsp.godot.settings` in user settings or `.zed/settings.json`. `godot_path`,
 `project_dir` and `extra_args` are ignored in project settings with a
-warning. Other project keys override user keys. The extension passes the
+warning. Other project keys override user keys. The Zed extension passes the
 merged object as `initializationOptions`; the bridge strips it before
 forwarding `initialize` to Godot. A non-object gets `-32602`, exit 1.
 
 | key | default | meaning |
 |---|---|---|
 | `godot_path` | unset | Absolute, executable. |
-| `project_dir` | unset | Dir with `project.godot`, relative to the worktree root. |
+| `project_dir` | unset | Dir with `project.godot`, relative to the workspace root. |
 | `lsp_port` | unset | Attach to a running editor, mode `unmanaged`. No lock, socket, state or spawn. |
 | `dap_port` | 6006 | With `lsp_port` only. |
 | `startup_timeout_s` | 600 | Deadline for ports and the `initialize` response. 0 disables. |
@@ -51,8 +51,12 @@ forwarding `initialize` to Godot. A non-object gets `-32602`, exit 1.
 | `diagnose_addons` | false | Include `addons/`. |
 | `extra_args` | [] | Before the bridge's flags. Rejected: `--path`, `--editor`, `-e`, `--headless`, `--lsp-port`, `--dap-port`, `--display-driver`, `--audio-driver`, `--quit`, `--quit-after`, `--script`, `-s`, `--main-pack`, `--export-release`, `--export-debug`, `--export-pack`. |
 
-`dap` gets the merged object in `GODOT_BRIDGE_SETTINGS`. The other commands
-read `$XDG_CONFIG_HOME/zed/settings.json`, else `~/.config/zed` and on
+Other editor clients set `GODOT_BRIDGE_SETTINGS` to one JSON object with the
+same keys, already merged and trusted by the client. When it is set no
+settings file is read, `initializationOptions` is ignored, and untrusted
+keys are not stripped. Without it, `lsp` merges `initializationOptions`
+over the user file and the other commands read
+`$XDG_CONFIG_HOME/zed/settings.json`, else `~/.config/zed` and on
 Windows `%APPDATA%\Zed` (neither set: skipped), and
 `<worktree>/.zed/settings.json` as JSON with comments, each at most 1 MiB, a
 regular file, opened without following symlinks. Missing files contribute
@@ -73,7 +77,7 @@ is an error: `--file` walk-up, `project_dir` (invalid errors at once), the
 root, then a breadth-first scan to depth 3 skipping `.git`, `.godot`,
 `addons`, `node_modules`, `target`, hidden dirs and symlinks. Zero hits:
 `-32002` "No project.godot found under <root>. Set
-lsp.godot.settings.project_dir."
+the project_dir setting."
 
 Godot binary: `godot_path`, `GODOT` (absolute, executable), then `godot4`,
 `godot` on PATH. Must answer `--version` within 5 s with `4.`. On Windows the
@@ -121,7 +125,7 @@ state file whose owner is dead is removed.
 ## `lsp` startup
 
 1. Read `initialize`, validate settings, resolve roots. Error: respond, exit 1.
-2. Take the lock. Held: `-32002` "Another Zed window already serves
+2. Take the lock. Held: `-32002` "Another editor window already serves
    <project>. Godot serves one client at a time."
 3. Stale cleanup: a live headless orphan (pid and ticks match) is killed by
    group. `mode: gui` with a live pid: wait for its ports under the deadline,
@@ -152,15 +156,15 @@ there is none. Games the editor launches die with the group.
 ## LSP proxy
 
 Frames: one `Content-Length` header. 8 MiB per frame each way, 4 MiB written
-to Godot. Zed request over 4 MiB: `-32803`. Notification over 4 MiB:
-dropped. Response over 4 MiB or malformed Zed frame: exit 1. Oversized or
+to Godot. Client request over 4 MiB: `-32803`. Notification over 4 MiB:
+dropped. Response over 4 MiB or malformed client frame: exit 1. Oversized or
 malformed Godot frame, or TCP EOF: treated as a crash.
 
 State: stripped `initialize` and Godot's response; `open_docs` keyed by
-canonical path, at most 20 000, `{uri, version, text, owner: Zed|Bridge}`,
-with one path-to-URI function for every Zed URI and watcher path and a
+canonical path, at most 20 000, `{uri, version, text, owner: Editor|Bridge}`,
+with one path-to-URI function for every editor URI and watcher path and a
 recorded `incoming uri -> key` so deleted files still resolve; request ids
-mapped `bridge_id -> (zed_id, method, internal)`; 32 requests in flight
+mapped `bridge_id -> (client_id, method, internal)`; 32 requests in flight
 toward Godot, the rest queued in order. Forwarded `didOpen`/`didChange`
 versions are rewritten from a per-URI counter. `$/cancelRequest` for a queued
 request drops it with `-32800`.
@@ -171,11 +175,11 @@ release the lock, exit 0.
 
 ## Crash recovery
 
-Before the first `initialize` response reached Zed, a crash consumes one
+Before the first `initialize` response reached the editor, a crash consumes one
 spawn attempt and re-forwards `initialize`. After:
 
 1. `recovering`. `window/showMessage` Error "Godot exited (code N), restarting.".
-2. Fail pending requests with `-32803`. Queue Zed traffic in one FIFO,
+2. Fail pending requests with `-32803`. Queue editor traffic in one FIFO,
    requests and notifications capped at 1000 each; overflow answers `-32803`
    or drops the oldest notification. Responses to the dead connection's
    requests are dropped.
@@ -198,7 +202,7 @@ Godot-to-client requests keep a `seq` map so `request_seq` maps back.
    for <project> is already running".
 3. `lsp_port` set: connect to `dap_port`. Else find the owner via the socket
    ("No Godot language server runs for <project>. Open a .gd file of the
-   project in Zed first."), poll every 500 ms until `ready` under the
+   project in your editor first."), poll every 500 ms until `ready` under the
    deadline, connect.
 4. Forward `initialize`, flush the buffer.
 5. `launch`/`attach`: drop `adapter`, `request`, `file`, `project`; set
@@ -222,11 +226,11 @@ hidden, symlinks) not already open gets `didOpen` from disk as `Bridge`, 100
 per batch, next batch when their diagnostics arrive or after 1 s. Over 2 MiB
 or invalid UTF-8: skipped.
 
-Zed `didOpen` on a Bridge doc becomes `didChange`, owner `Zed`. Zed
+Editor `didOpen` on a Bridge doc becomes `didChange`, owner `Editor`. Editor
 `didClose` forwards, then reopens from disk as `Bridge` if the file exists.
 Watcher (inotify, on Windows `ReadDirectoryChangesW` over the project subtree,
 300 ms debounce): create opens, modify of a Bridge doc
-changes, remove of a Bridge doc closes and clears Zed's diagnostics, Zed
+changes, remove of a Bridge doc closes and clears the editor's diagnostics, editor
 docs are ignored, moved directories rescan. While `recovering` the watcher
 only updates text; recovery replays it. If the watch cannot be created the
 session continues without it and logs a warning.
@@ -263,18 +267,21 @@ The owner never kills a GUI child. At shutdown in `gui` mode the state stays
 with null owner fields for the next `lsp` to adopt. GUI exit triggers one
 recovery to headless that does not count toward the 3-in-60 s limit.
 
-## Extension
+## Clients
 
-`extension.toml`: three pinned grammars, one language server, one debug
-adapter. `language_server_command`: `lsp.godot.binary.path`, else
-`which("godot-bridge")`, else "Install godot-bridge: cargo install --path
-bridge". Args `["lsp"]` plus `--` and `binary.arguments`. Env from the shell.
-`initialization_options` is `LspSettings::for_worktree("godot").settings`.
+Each editor ships a thin client that spawns the bridge. The Zed extension
+(wasm; `extension.toml` pins three grammars, one language server, one debug
+adapter) runs an absolute `lsp.godot.binary.path`, else `godot-bridge` from
+PATH, with args `["lsp"]` and the shell env minus `GODOT_BRIDGE_SETTINGS`.
+Relative paths are ignored; Zed applies project settings only for trusted
+worktrees.
+`LspSettings::for_worktree("godot").settings` becomes
+`initializationOptions`. VS Code and Neovim pass their merged settings in
+`GODOT_BRIDGE_SETTINGS` and take the bridge path from user settings only.
 
-Debug adapter: `get_dap_binary` runs the bridge with `["dap", "--file",
-file]` when present, cwd the worktree, `GODOT_BRIDGE_SETTINGS` set.
-`dap_config_to_scenario`: `Launch` uses `program` as `scene` when it ends in
-`.tscn`, else `main`; `Attach` ignores `process_id`. Zed substitutes
+Debug adapter: the bridge runs as `["dap", "--file", file]` when a file is
+known, cwd the project. Zed maps a `Launch` `program` ending in `.tscn` to
+`scene`, else `main`; `Attach` ignores `process_id`. Zed substitutes
 `$ZED_FILE` in `debug.json`. The `godot` debug locator accepts a
 `godot-bridge run` task and returns a launch scenario with its `--scene` and
 `--file` values, so the shipped `godot: run` tasks debug without a
@@ -283,5 +290,5 @@ file]` when present, cwd the worktree, `GODOT_BRIDGE_SETTINGS` set.
 GDScript indent: increase after `:`, `@indent` on bodies, `@start.<kw>`
 captures so `else`/`elif` dedent to `if`, `elif`, `for`, `while`.
 
-Out of scope: macOS, VS Code (see the port docs), Godot 3.x, two
-windows or two debug sessions on one project, auto-download.
+Out of scope: macOS, Godot 3.x, two windows or two debug sessions on one
+project, auto-download.

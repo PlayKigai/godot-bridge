@@ -11,7 +11,7 @@ pub const BULK_DOCUMENTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentOwner {
-    Zed,
+    Editor,
     Bridge,
 }
 
@@ -57,7 +57,7 @@ impl DocumentState {
         }
     }
 
-    pub fn zed_open(
+    pub fn client_open(
         &mut self,
         incoming_uri: &str,
         key: &Path,
@@ -71,7 +71,7 @@ impl DocumentState {
                 };
                 doc.text = Some(text);
                 doc.version = version;
-                doc.owner = DocumentOwner::Zed;
+                doc.owner = DocumentOwner::Editor;
                 self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
                 self.register_watcher_path(&key, key.clone());
                 Some((uri, version))
@@ -92,7 +92,7 @@ impl DocumentState {
                         text: Some(text),
                         text_hash: 0,
                         text_len: 0,
-                        owner: DocumentOwner::Zed,
+                        owner: DocumentOwner::Editor,
                     },
                 );
                 self.uri_keys.insert(incoming_uri.to_owned(), key.clone());
@@ -102,7 +102,7 @@ impl DocumentState {
         }
     }
 
-    pub fn zed_change(&mut self, key: &Path, action: DocumentAction) -> Option<(String, i64)> {
+    pub fn client_change(&mut self, key: &Path, action: DocumentAction) -> Option<(String, i64)> {
         let key = key.to_path_buf();
         let DocumentAction::Change { uri, version, text } = action else {
             return None;
@@ -110,11 +110,11 @@ impl DocumentState {
         let doc = self.open_docs.get_mut(&key)?;
         doc.text = Some(text);
         doc.version = version;
-        doc.owner = DocumentOwner::Zed;
+        doc.owner = DocumentOwner::Editor;
         Some((uri, version))
     }
 
-    pub fn zed_close(&mut self, incoming_uri: &str) -> Option<(PathBuf, String)> {
+    pub fn client_close(&mut self, incoming_uri: &str) -> Option<(PathBuf, String)> {
         let key = self.key_for_uri(incoming_uri);
         let doc = self.open_docs.remove(&key)?;
         self.remove_mappings(&key);
@@ -220,7 +220,7 @@ impl DocumentState {
     }
 
     /// Godot on Windows percent-encodes the drive colon, so the URI it reports a
-    /// document under is not the one the bridge and Zed agreed on for that file.
+    /// document under is not the one the bridge and the editor agreed on for that file.
     pub fn client_uri(&self, uri: &str) -> String {
         if !uri.to_ascii_lowercase().starts_with("file:") {
             return uri.to_owned();
@@ -246,7 +246,7 @@ impl DocumentState {
         self.generation
     }
 
-    pub(crate) fn plan_zed_open_key(&self, key: &Path, text: &str) -> DocumentAction {
+    pub(crate) fn plan_client_open_key(&self, key: &Path, text: &str) -> DocumentAction {
         if let Some(doc) = self.open_docs.get(key) {
             DocumentAction::Change {
                 uri: doc.uri.clone(),
@@ -262,7 +262,7 @@ impl DocumentState {
         }
     }
 
-    pub(crate) fn plan_zed_change_key(&self, key: &Path, text: &str) -> Option<DocumentAction> {
+    pub(crate) fn plan_client_change_key(&self, key: &Path, text: &str) -> Option<DocumentAction> {
         let doc = self.open_docs.get(key)?;
         Some(DocumentAction::Change {
             uri: doc.uri.clone(),

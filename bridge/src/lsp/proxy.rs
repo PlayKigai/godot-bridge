@@ -613,7 +613,7 @@ pub(super) fn forward_initialize(
             if !project_diagnostics && !proxy.workspace_symbols_notice_sent {
                 send_info_message(
                     output,
-                    "Project diagnostics are disabled; workspace symbols cover only files open in Zed.",
+                    "Project diagnostics are disabled; workspace symbols cover only open files.",
                 )?;
                 proxy.workspace_symbols_notice_sent = true;
             }

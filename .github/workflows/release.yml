@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: godot-bridge-${{ github.ref_name }}-x86_64-linux.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: godot-bridge-${{ github.ref_name }}-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p godot-bridge --target ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: tar -C target/${{ matrix.target }}/release -czf ${{ matrix.archive }} godot-bridge
+      - if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/godot-bridge.exe -DestinationPath ${{ matrix.archive }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

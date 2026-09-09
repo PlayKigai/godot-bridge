@@ -17,7 +17,7 @@ use crate::framing::{
 };
 use crate::root::{cwd_root, find_project_dir};
 use crate::scene::resolve_scene;
-use crate::settings_file::{parse_trusted_settings, Settings};
+use crate::settings_file::{self, Settings};
 use crate::state::{socket_request, try_lock, LockGuard, ProjectFiles};
 
 const FRAME_CAP: usize = 8 * 1024 * 1024;
@@ -351,7 +351,7 @@ fn prepare(
         return Err("DAP startup cancelled".to_owned());
     }
     let root = cwd_root().map_err(|error| error.to_string())?;
-    let settings = read_settings(&root)?;
+    let settings = settings_file::load_cli(&root)?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
     if let Some(file) = file {
@@ -394,17 +394,6 @@ fn prepare(
     })
 }
 
-fn read_settings(worktree: &Path) -> std::result::Result<Settings, String> {
-    let value = match std::env::var("GODOT_BRIDGE_SETTINGS") {
-        Ok(contents) if contents.len() <= 1024 * 1024 => crate::json::from_str(&contents)
-            .map_err(|error| format!("invalid GODOT_BRIDGE_SETTINGS: {error}"))?,
-        Ok(_) => return Err("GODOT_BRIDGE_SETTINGS exceeds 1 MiB".to_owned()),
-        Err(std::env::VarError::NotPresent) => Value::Null,
-        Err(error) => return Err(format!("cannot read GODOT_BRIDGE_SETTINGS: {error}")),
-    };
-    parse_trusted_settings(&value, worktree)
-}
-
 fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     match TcpStream::connect_timeout(&address, SOCKET_REQUEST_TIMEOUT) {
@@ -425,7 +414,7 @@ fn discover_owner(
     cancel: &AtomicBool,
 ) -> std::result::Result<TcpStream, String> {
     let no_owner = format!(
-        "No Godot language server runs for {}. Open a .gd file of the project in Zed first.",
+        "No Godot language server runs for {}. Open a .gd file of the project in your editor first.",
         project.display()
     );
     let deadline = (settings.startup_timeout_s != 0)

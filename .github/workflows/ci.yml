@@ -31,6 +31,24 @@ jobs:
       - run: cargo test --locked --offline
       - run: cargo build --locked --offline --target wasm32-wasip2 -p godot-zed-extension
       - run: python3 scripts/check_build_scripts.py
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua5.4 && luac5.4 -p lua/godot-bridge/init.lua plugin/godot-bridge.lua
+
+  vscode:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci
+      - run: ./node_modules/.bin/tsc --noEmit
+      - run: npm run build
 
   check-windows:
     if: github.event_name != 'schedule'

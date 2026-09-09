@@ -1,6 +1,6 @@
 target/
-extension/*.wasm
-extension/grammars/
+clients/zed/*.wasm
+clients/zed/grammars/
 .env
 .env.*
 .claude/
@@ -10,3 +10,4 @@ extension/grammars/
 AGENTS.md
 CLAUDE.md
 .DS_Store
+*.log

@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const NO_BINARY: &str =
-    "No Godot binary. Set lsp.godot.settings.godot_path, or GODOT, or put godot on PATH.";
+    "No Godot binary. Set the godot_path setting, or GODOT, or put godot on PATH.";
 #[cfg(windows)]
 const NO_BINARY: &str =
-    "No Godot binary. Set lsp.godot.settings.godot_path, or GODOT, or put godot.exe on PATH.";
+    "No Godot binary. Set the godot_path setting, or GODOT, or put godot.exe on PATH.";
 const FORBIDDEN_ARGS: [&str; 16] = [
     "--path",
     "--editor",
@@ -59,6 +59,7 @@ pub fn resolve_godot(configured: Option<&Path>) -> Result<PathBuf, String> {
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -69,7 +70,10 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    for dir in std::env::split_paths(&path)
+        .map(|dir| PathBuf::from(dir.to_string_lossy().trim_matches('"')))
+        .filter(|dir| dir.is_absolute())
+    {
         for extension in path_extensions() {
             let candidate = dir.join(format!("{name}{extension}"));
             if is_executable(&candidate) {

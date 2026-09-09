@@ -1,8 +1,6 @@
 const DOC_BASE: &str = "https://docs.godotengine.org/en/stable/classes/";
 
 pub fn open_doc(symbol: &str) -> crate::error::Result<()> {
-    let root = crate::root::cwd_root()?;
-    crate::settings_file::load_zed_settings(&root)?;
     crate::sys::open_url(&doc_url(symbol)?)?;
     Ok(())
 }

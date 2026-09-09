@@ -21,7 +21,7 @@ fn dap_without_owner_returns_initialize_failure() {
     assert_eq!(
         response["message"],
         format!(
-            "No Godot language server runs for {}. Open a .gd file of the project in Zed first.",
+            "No Godot language server runs for {}. Open a .gd file of the project in your editor first.",
             canonical(&project).display()
         )
     );
