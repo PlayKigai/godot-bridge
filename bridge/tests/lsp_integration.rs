@@ -24,10 +24,6 @@ fn minimal_project_diagnostics_and_cleanup() {
         message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == file_uri(&project.join("other.gd"))
     });
-    assert_eq!(
-        diagnostics["params"]["uri"],
-        file_uri(&project.join("other.gd"))
-    );
     let diagnostic = &diagnostics["params"]["diagnostics"][0];
     assert_eq!(diagnostic["severity"], 1);
     let range = &diagnostic["range"];

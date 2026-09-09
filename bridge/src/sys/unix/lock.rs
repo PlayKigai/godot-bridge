@@ -6,7 +6,6 @@ use std::path::Path;
 
 use crate::sys::{open_private, OpenMode};
 
-/// Holds the lock until it is dropped.
 pub struct LockGuard {
     file: std::fs::File,
 }

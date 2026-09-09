@@ -17,7 +17,6 @@ use crate::sys::{open_private, OpenMode};
 const RANGE_LOW: u32 = u32::MAX;
 const RANGE_HIGH: u32 = u32::MAX;
 
-/// Holds the lock until it is dropped.
 pub struct LockGuard {
     file: std::fs::File,
 }

@@ -490,11 +490,14 @@ fn run_session_inner(
     }
 
     while let Some(body) = buffer.pop() {
-        if let Some(result) =
-            forward_client_body(&body, &mut server_requests, connection, project, file)?
-        {
-            send_request_failure(output, result)?;
-        }
+        forward_client_body(
+            &body,
+            &mut server_requests,
+            connection,
+            project,
+            file,
+            output,
+        )?;
     }
 
     let mut process_seen = false;
@@ -508,11 +511,14 @@ fn run_session_inner(
                 }
             }
             DapFrame::Body(DapSide::Client, body) => {
-                if let Some(failure) =
-                    forward_client_body(&body, &mut server_requests, connection, project, file)?
-                {
-                    send_request_failure(output, failure)?;
-                }
+                forward_client_body(
+                    &body,
+                    &mut server_requests,
+                    connection,
+                    project,
+                    file,
+                    output,
+                )?;
             }
             DapFrame::End(DapSide::Godot) => return godot_died(output),
             DapFrame::End(DapSide::Client) => return Ok(ExitCode::SUCCESS),
@@ -577,7 +583,8 @@ fn forward_client_body(
     connection: &mut Connection,
     project: &Path,
     file: Option<&Path>,
-) -> Result<Option<RequestFailure>> {
+    output: &mut ClientOutput<std::io::Stdout>,
+) -> Result<()> {
     let fields = crate::json::scan_top_level(body)?;
     if fields.type_.is_none_or(|value| !value.is_string()) {
         return Err(crate::error::Error::new(
@@ -590,16 +597,21 @@ fn forward_client_body(
         || fields
             .command
             .is_some_and(|command| command.string_eq("launch") || command.string_eq("attach"));
-    if rewrite {
-        return forward_client(
-            parse_message(body)?,
-            server_requests,
-            connection,
-            project,
-            file,
-        );
+    if !rewrite {
+        write_frame(&mut connection.writer, body, FRAME_CAP)?;
+        return Ok(());
     }
-    send_to_godot_body(&mut connection.writer, body).map(|()| None)
+    let failure = forward_client(
+        parse_message(body)?,
+        server_requests,
+        connection,
+        project,
+        file,
+    )?;
+    if let Some(failure) = failure {
+        output.failure(failure.request_seq, &failure.command, &failure.message)?;
+    }
+    Ok(())
 }
 
 fn forward_client(
@@ -635,13 +647,6 @@ fn forward_client(
     Ok(None)
 }
 
-fn send_request_failure(
-    output: &mut ClientOutput<std::io::Stdout>,
-    failure: RequestFailure,
-) -> Result<()> {
-    output.failure(failure.request_seq, &failure.command, &failure.message)
-}
-
 fn rewrite_launch_or_attach(
     message: &mut Value,
     command: &str,
@@ -652,15 +657,6 @@ fn rewrite_launch_or_attach(
     let Some(object) = message.as_object_mut() else {
         return Err((request_seq, "DAP message must be an object".to_owned()));
     };
-    if command != "launch" {
-        if let Some(arguments) = object.get_mut("arguments").and_then(Value::as_object_mut) {
-            arguments.remove("adapter");
-            arguments.remove("request");
-            arguments.remove("file");
-            arguments.remove("project");
-        }
-        return Ok(());
-    }
     if object.get("arguments").is_none() {
         object.insert("arguments".to_owned(), crate::json!({}));
     }
@@ -671,6 +667,9 @@ fn rewrite_launch_or_attach(
     arguments.remove("request");
     arguments.remove("file");
     arguments.remove("project");
+    if command != "launch" {
+        return Ok(());
+    }
 
     let scene = arguments
         .get("scene")
@@ -695,11 +694,6 @@ fn rewrite_launch_or_attach(
 
 fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
     write_json(writer, message, FRAME_CAP, true)?;
-    Ok(())
-}
-
-fn send_to_godot_body(writer: &mut TcpStream, body: &[u8]) -> Result<()> {
-    write_frame(writer, body, FRAME_CAP)?;
     Ok(())
 }
 

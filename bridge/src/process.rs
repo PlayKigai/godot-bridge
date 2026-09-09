@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn group_kill_reaches_grandchild_after_leader_exits() {
         assert_group_kill_reaches_grandchild(
-            "/bin/sh -c 'trap \"\" TERM; sleep 300' & printf '%s\\n' \"$!\" >&2; trap 'exit 0' TERM; wait",
+            "/bin/sh -c 'trap \"\" TERM; /bin/sleep 300' & printf '%s\\n' \"$!\" >&2; trap 'exit 0' TERM; wait",
             41006,
         );
     }

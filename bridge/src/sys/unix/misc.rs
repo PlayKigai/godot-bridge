@@ -1,5 +1,3 @@
-//! Small platform details that fit nowhere else.
-
 use std::io;
 use std::mem::ManuallyDrop;
 

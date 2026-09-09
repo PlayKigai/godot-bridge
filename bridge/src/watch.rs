@@ -1,6 +1,3 @@
-//! The project tree watch. The platform implementation lives in
-//! [`crate::sys`]; this module is the crate-facing name for it.
-
 pub(crate) use crate::sys::{watch_project_into, ProjectWatcher};
 
 #[cfg(test)]

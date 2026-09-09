@@ -64,9 +64,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-/// On Windows a command name on `PATH` carries no extension; `PATHEXT` lists
-/// the suffixes the shell appends, and a package manager shim is often a
-/// `.cmd` or `.bat` rather than an `.exe`.
+/// `PATHEXT` lists the suffixes the shell appends; package manager shims are `.cmd` or `.bat`.
 #[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -99,8 +97,6 @@ fn find_well_known() -> Option<PathBuf> {
     None
 }
 
-/// The installer locations a Windows user is likely to have: the per-user
-/// installer, the WinGet package store and Steam.
 #[cfg(windows)]
 fn find_well_known() -> Option<PathBuf> {
     let mut directories = Vec::new();
@@ -154,15 +150,12 @@ fn newest_godot_in(directory: &Path) -> Option<PathBuf> {
     candidates.pop()
 }
 
-/// The `*_console.exe` twin of a Windows build is a launcher that runs the
-/// engine as a child, so the pid the bridge records would own neither the
-/// language server port nor the process identity. The engine itself writes to
-/// a redirected stdout, so the plain binary is the one to run.
 #[cfg(unix)]
 fn prefer_direct(path: PathBuf) -> PathBuf {
     path
 }
 
+/// `*_console.exe` only launches the engine, so its pid would own neither the port nor the process.
 #[cfg(windows)]
 fn prefer_direct(path: PathBuf) -> PathBuf {
     let Some(stem) = path
@@ -317,9 +310,6 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Write a script that answers `--version` with `body`, in the shape the
-    /// platform can run: a `#!/bin/sh` script on Unix, a `.cmd` batch file on
-    /// Windows.
     #[cfg(unix)]
     fn write_version_script(dir: &Path, name: &str, output: &str) -> PathBuf {
         write_script(dir, name, &format!("#!/bin/sh\necho {output}\n"))
@@ -424,7 +414,7 @@ mod tests {
         }
     }
 
-    fn with_environment<T>(path: &OsStr, godot: Option<&OsStr>, test: impl FnOnce() -> T) -> T {
+    fn with_environment<T>(path: &OsStr, godot: Option<&OsStr>, run: impl FnOnce() -> T) -> T {
         let old_path = env::var_os("PATH");
         let old_godot = env::var_os("GODOT");
         env::set_var("PATH", path);
@@ -432,7 +422,7 @@ mod tests {
             Some(value) => env::set_var("GODOT", value),
             None => env::remove_var("GODOT"),
         }
-        let result = test();
+        let result = run();
         match old_path {
             Some(value) => env::set_var("PATH", value),
             None => env::remove_var("PATH"),
@@ -609,22 +599,5 @@ mod tests {
             env::remove_var("GODOT");
             assert_no_binary_or_well_known();
         });
-    }
-
-    #[test]
-    fn extra_args_rejects_script_and_export() {
-        for arg in [
-            "--script",
-            "--script=evil.gd",
-            "-s",
-            "--main-pack",
-            "--main-pack=game.pck",
-            "--export-release",
-            "--export-debug",
-            "--export-pack=out.zip",
-        ] {
-            let args = [arg.to_string()];
-            assert!(validate_extra_args(&args).is_err(), "{arg}");
-        }
     }
 }

@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
 
 permissions:
   contents: read
@@ -19,16 +19,20 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: godot-bridge-${{ github.ref_name }}-x86_64-windows.zip
     runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked -p godot-bridge --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p godot-bridge --target "$TARGET"
+        shell: bash
       - if: runner.os == 'Linux'
-        run: tar -C target/${{ matrix.target }}/release -czf ${{ matrix.archive }} godot-bridge
+        run: tar -C "target/$TARGET/release" -czf "$ARCHIVE" godot-bridge
       - if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/godot-bridge.exe -DestinationPath ${{ matrix.archive }}
+        run: Compress-Archive -LiteralPath "target/$env:TARGET/release/godot-bridge.exe" -DestinationPath "$env:ARCHIVE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.archive }}

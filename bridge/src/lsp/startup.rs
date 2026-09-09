@@ -12,12 +12,6 @@ pub(super) fn startup_deadline(seconds: u32) -> Option<Instant> {
     (seconds != 0).then(|| Instant::now() + Duration::from_secs(u64::from(seconds)))
 }
 
-pub(super) fn terminate_editor(mut editor: Editor) {
-    if let Some(child) = editor.child.take() {
-        terminate_editor_child(child);
-    }
-}
-
 pub(super) fn terminate_editor_child(child: GodotChild) {
     if let Err(error) = kill_group(child) {
         crate::warn!("cannot terminate Godot process group: {error}");
@@ -204,18 +198,7 @@ pub(super) fn spawn_one(
             terminate_editor_child(child);
             return Err(StartupError::Io(error.to_string()));
         }
-        let (child, stream) = match await_port(child, lsp_port, deadline, "LSP") {
-            Ok(value) => value,
-            Err(StartupError::PortMismatch) => {
-                port_mismatches += 1;
-                if port_mismatches >= STARTUP_ATTEMPTS {
-                    return Err(StartupError::PortMismatch);
-                }
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let (child, _) = match await_port(child, dap_port, deadline, "DAP") {
+        let (child, stream) = match await_ports(child, lsp_port, dap_port, deadline) {
             Ok(value) => value,
             Err(StartupError::PortMismatch) => {
                 port_mismatches += 1;
@@ -234,6 +217,17 @@ pub(super) fn spawn_one(
             dap_port,
         });
     }
+}
+
+fn await_ports(
+    child: GodotChild,
+    lsp_port: u16,
+    dap_port: u16,
+    deadline: Option<Instant>,
+) -> std::result::Result<(GodotChild, TcpStream), StartupError> {
+    let (child, stream) = await_port(child, lsp_port, deadline, "LSP")?;
+    let (child, _) = await_port(child, dap_port, deadline, "DAP")?;
+    Ok((child, stream))
 }
 
 fn await_port(

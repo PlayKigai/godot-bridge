@@ -24,9 +24,6 @@ pub fn lock_godot() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Point the bridge under test at the temporary runtime and config trees.
-/// Unix reads `XDG_RUNTIME_DIR`, Windows reads `LOCALAPPDATA`, and both look
-/// for Zed's settings under `XDG_CONFIG_HOME`.
 pub(crate) fn redirect_directories(command: &mut Command, runtime: &Path, config: &Path) {
     command
         .env("XDG_RUNTIME_DIR", runtime)
@@ -160,8 +157,7 @@ pub fn godot_available(test: &str) -> bool {
     }
 }
 
-/// A GUI test needs a desktop session. Windows always has one; a Unix session
-/// advertises it through `DISPLAY` or `WAYLAND_DISPLAY`.
+/// A GUI test needs a desktop session.
 #[allow(dead_code)]
 pub fn display_available(test: &str) -> bool {
     if cfg!(windows)
@@ -263,8 +259,6 @@ pub fn close_and_wait(client: &mut BridgeClient, runtime: &Path, project: &Path)
         .exists());
 }
 
-/// Ask the owner for its status over its own rendezvous address, a Unix
-/// socket next to the state file or a named pipe derived from its name.
 #[allow(dead_code)]
 pub fn socket_status(runtime: &Path, project: &Path) -> Option<Value> {
     let address = godot_bridge::state::socket_path_for_state(&state_path(runtime, project));

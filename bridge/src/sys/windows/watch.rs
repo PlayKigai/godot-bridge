@@ -52,7 +52,6 @@ pub(crate) struct ProjectWatcher {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Closes the handle when dropped.
 struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {

@@ -21,7 +21,9 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
     TOKEN_USER,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`, which live in a
 /// `windows-sys` feature this crate does not otherwise need.
@@ -84,7 +86,19 @@ pub(super) fn current_user_descriptor() -> io::Result<SecurityDescriptor> {
 }
 
 pub(super) fn current_user_sid() -> io::Result<String> {
-    let token = current_process_token()?;
+    token_user_sid(&process_token(unsafe { GetCurrentProcess() })?)
+}
+
+pub(super) fn process_user_sid(pid: u32) -> io::Result<String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    token_user_sid(&process_token(process.as_raw_handle())?)
+}
+
+fn token_user_sid(token: &OwnedHandle) -> io::Result<String> {
     let mut needed = 0u32;
     unsafe {
         GetTokenInformation(
@@ -117,9 +131,9 @@ pub(super) fn current_user_sid() -> io::Result<String> {
     sid
 }
 
-fn current_process_token() -> io::Result<OwnedHandle> {
+fn process_token(process: HANDLE) -> io::Result<OwnedHandle> {
     let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(token) })

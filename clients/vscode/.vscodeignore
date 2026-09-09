@@ -9,3 +9,4 @@ package-lock.json
 *.log
 *.vsix
 .npmrc
+.env*

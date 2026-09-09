@@ -323,8 +323,8 @@ pub fn remove_if_stale(state_path: &Path, sock_path: &Path) -> io::Result<bool> 
 }
 
 /// Read one newline-terminated request from a socket, refusing a line that
-/// would grow past [`SOCKET_LINE_CAP`]. `partial` carries the bytes read so
-/// far across a `WouldBlock`.
+/// would grow past [`SOCKET_LINE_CAP`]. `line` carries the bytes read so far
+/// across a `WouldBlock`.
 pub(crate) fn read_line_limited<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,

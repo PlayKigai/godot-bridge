@@ -71,8 +71,6 @@ pub fn canonicalize(path: &Path) -> Result<PathBuf, RootError> {
     strip_verbatim(canonical)
 }
 
-/// Remove the `\?\` prefix from a canonicalized Windows path, and refuse a
-/// UNC path. A no-op on Unix.
 #[cfg(unix)]
 pub fn strip_verbatim(path: PathBuf) -> Result<PathBuf, RootError> {
     Ok(path)
@@ -99,8 +97,6 @@ pub fn strip_verbatim(path: PathBuf) -> Result<PathBuf, RootError> {
     Ok(stripped)
 }
 
-/// Compare two paths the way the platform's file system does: byte for byte on
-/// Unix, ignoring ASCII case on Windows.
 #[cfg(unix)]
 pub fn paths_equal(left: &Path, right: &Path) -> bool {
     left.as_os_str() == right.as_os_str()

@@ -487,8 +487,7 @@ fn gui_process_is_alive(runtime: &Runtime) -> bool {
     gui_process_alive(&state)
 }
 
-fn perform_handoff(session: &mut Session, dap_lock: LockGuard) -> Result<()> {
-    let _dap_lock = dap_lock;
+fn perform_handoff(session: &mut Session, _dap_lock: LockGuard) -> Result<()> {
     reset_for_recovery(session)?;
     fail_in_flight(session)?;
     let mut recovery_queue = RecoveryQueue::default();
@@ -628,7 +627,7 @@ pub fn run() -> Result<ExitCode> {
     let mut client = FrameState::new(CLIENT_FRAME_CAP);
     let mut godot = FrameState::new(GODOT_FRAME_CAP);
     let mut deferred = DeferredQueue::default();
-    let mut output = client_writer();
+    let mut output = BufWriter::new(StdoutFile(crate::sys::stdout_file()));
     let initialize = match receive_client_frame(&event_receiver, &mut client, &mut deferred)? {
         Some(body) => parse_message(&body).map_err(crate::error::Error::new)?,
         None => return Ok(ExitCode::SUCCESS),
@@ -767,21 +766,21 @@ pub fn run() -> Result<ExitCode> {
                             mode: Mode::Gui,
                         };
                         publish(&runtime)?;
+                        let (lsp_port, dap_port) = {
+                            let state = runtime
+                                .state
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (
+                                state.lsp_port.expect("reconnected GUI has an LSP port"),
+                                state.dap_port.expect("reconnected GUI has a DAP port"),
+                            )
+                        };
                         let mut editor = Editor {
                             child: None,
                             connection,
-                            lsp_port: runtime
-                                .state
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .lsp_port
-                                .expect("reconnected GUI has an LSP port"),
-                            dap_port: runtime
-                                .state
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .dap_port
-                                .expect("reconnected GUI has a DAP port"),
+                            lsp_port,
+                            dap_port,
                         };
                         if let Err(message) = forward_initialize(
                             &mut editor,
@@ -895,7 +894,9 @@ pub fn run() -> Result<ExitCode> {
                     }
                     Err(message) => {
                         startup_error = Some(StartupError::Io(message));
-                        terminate_editor(candidate);
+                        if let Some(child) = candidate.child.take() {
+                            terminate_editor_child(child);
+                        }
                     }
                 }
             }
@@ -1156,7 +1157,6 @@ fn forward_server_message<W: Write>(
     output: &mut W,
     proxy: &mut ProxyState,
     body: &[u8],
-    shutdown_response: bool,
 ) -> Result<()> {
     let (fields, intercepted) = crate::json::scan_top_level_until_method(body, |method| {
         method.string_eq("textDocument/publishDiagnostics")
@@ -1231,12 +1231,10 @@ fn forward_server_message<W: Write>(
     } else {
         fields.id.and_then(|id| id.as_i64())
     };
+    let stale = request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id));
     let Some(id_number) = id_number else {
-        if !shutdown_response {
-            let stale = request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id));
-            if !stale {
-                crate::debug!("dropping unknown Godot response id {id}");
-            }
+        if !stale {
+            crate::debug!("dropping unknown Godot response id {id}");
         }
         return Ok(());
     };
@@ -1278,9 +1276,7 @@ fn forward_server_message<W: Write>(
         response["id"] = pending.client_id;
         send_client(output, &response)?;
         flush_queued(output, writer, proxy)?;
-    } else if !request_key.is_some_and(|id| proxy.stale_server_ids.contains(&id))
-        && !shutdown_response
-    {
+    } else if !stale {
         crate::debug!("dropping unknown Godot response id {id}");
     }
     Ok(())
@@ -1747,10 +1743,6 @@ fn send_client<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn client_writer() -> ClientWriter {
-    BufWriter::new(StdoutFile(crate::sys::stdout_file()))
-}
-
 fn send_client_body<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
     write_frame(writer, body, CLIENT_FRAME_CAP)?;
     writer.flush()?;
@@ -1931,12 +1923,12 @@ fn send_due_symbol_requests(
 }
 
 fn patch_initialize_response(response: &mut Value) {
-    if let Some(result) = response
+    if let Some(capabilities) = response
         .get_mut("result")
         .and_then(|result| result.get_mut("capabilities"))
         .and_then(Value::as_object_mut)
     {
-        result.insert("workspaceSymbolProvider".to_owned(), Value::Bool(true));
+        capabilities.insert("workspaceSymbolProvider".to_owned(), Value::Bool(true));
     }
 }
 
@@ -2074,7 +2066,6 @@ mod tests {
             &mut output,
             &mut proxy,
             response.as_bytes(),
-            false,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();

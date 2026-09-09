@@ -193,7 +193,6 @@ fn handle_event(
                     &mut session.output,
                     &mut session.proxy,
                     &body,
-                    false,
                 );
                 let failed = result.is_err();
                 if let Some(code) = guard(session, unmanaged, result)? {
@@ -580,7 +579,6 @@ fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
                     &mut session.output,
                     &mut session.proxy,
                     &body,
-                    false,
                 )?;
                 if is_response {
                     return exit_session(session, 0);

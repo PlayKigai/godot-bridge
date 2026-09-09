@@ -21,19 +21,21 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW, NAMED_PIPE_MODE,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+    WaitNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-use super::security::{current_user_descriptor, wide, SecurityDescriptor};
+use super::security::{
+    current_user_descriptor, current_user_sid, process_user_sid, wide, SecurityDescriptor,
+};
 use crate::json::Value;
 use crate::state::read_line_limited;
 
@@ -266,6 +268,8 @@ fn open_pipe(name: &[u16], deadline: Instant) -> io::Result<OwnedHandle> {
     }
 }
 
+/// Pipe names are global, so a server squatting on the name must neither
+/// impersonate this process nor be trusted with its requests.
 fn open_pipe_once(name: &[u16]) -> io::Result<OwnedHandle> {
     let handle = unsafe {
         CreateFileW(
@@ -274,14 +278,25 @@ fn open_pipe_once(name: &[u16]) -> io::Result<OwnedHandle> {
             0,
             std::ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             std::ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    Ok(OwnedHandle(handle))
+    let pipe = OwnedHandle(handle);
+    let mut server_pid = 0u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if process_user_sid(server_pid)? != current_user_sid()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the named pipe belongs to another user",
+        ));
+    }
+    Ok(pipe)
 }
 
 struct PipeReader {

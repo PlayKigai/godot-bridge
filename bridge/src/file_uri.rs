@@ -107,8 +107,6 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// Strip `file:`, then an authority that must be empty or `localhost`, then a
-/// query or fragment. Returns the percent-encoded path bytes.
 fn strip_scheme_and_authority(uri: &str) -> Option<&[u8]> {
     let (scheme, mut rest) = uri.split_at_checked(5)?;
     if !scheme.eq_ignore_ascii_case("file:") {
