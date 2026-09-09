@@ -8,10 +8,10 @@ case $tag in
 esac
 want=${tag#v}
 echo "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "tag $tag is not strict semver" >&2; exit 1; }
-cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-zed_v=$(sed -n 's/^version = "\(.*\)"/\1/p' clients/zed/extension.toml | head -1)
-lua_v=$(sed -n 's/^local VERSION = "\(.*\)"/\1/p' lua/godot-bridge/init.lua | head -1)
-npm_v=$(sed -n 's/^  "version": "\(.*\)",/\1/p' clients/vscode/package.json | head -1)
+cargo_v=$(awk '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0} s && /^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
+zed_v=$(awk '/^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' clients/zed/extension.toml)
+lua_v=$(sed -n 's/^local VERSION *= *"\([^"]*\)".*/\1/p' lua/godot-bridge/init.lua | head -1)
+npm_v=$(node -p "require('./clients/vscode/package.json').version")
 status=0
 for pair in "Cargo.toml=$cargo_v" "clients/zed/extension.toml=$zed_v" "lua/godot-bridge/init.lua=$lua_v" "clients/vscode/package.json=$npm_v"; do
   file=${pair%%=*}; got=${pair#*=}

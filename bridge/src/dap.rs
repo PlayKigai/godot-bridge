@@ -354,15 +354,6 @@ fn prepare(
     let settings = settings_file::load_cli(&root)?;
     let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
-    if let Some(file) = file {
-        let normalized = crate::root::canonical_or_normalized(file);
-        if !normalized.starts_with(&root) {
-            return Err(format!(
-                "DAP file {} is outside the worktree",
-                file.display()
-            ));
-        }
-    }
     let files = ProjectFiles::new(&project).map_err(|error| error.to_string())?;
     let lock = match try_lock(&files.dap_lock).map_err(|error| error.to_string())? {
         Some(guard) => guard,

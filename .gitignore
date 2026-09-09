@@ -11,16 +11,3 @@ AGENTS.md
 CLAUDE.md
 .DS_Store
 *.log
-
-# zero-byte placeholders created by the Claude Code sandbox in the checkout
-/.bash_profile
-/.bashrc
-/.gitconfig
-/.gitmodules
-/.idea
-/.mcp.json
-/.profile
-/.ripgreprc
-/.vscode
-/.zprofile
-/.zshrc

@@ -542,6 +542,28 @@ mod tests {
     }
 
     #[test]
+    fn project_ports_are_stripped() {
+        let config_dir = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+        write_user_settings(
+            config_dir.path(),
+            r#"{"lsp": {"godot": {"settings": {"dap_port": 7000}}}}"#,
+        );
+        write_project_settings(
+            worktree.path(),
+            r#"{"lsp": {"godot": {"settings": {"lsp_port": 6005, "dap_port": 1, "startup_timeout_s": 5}}}}"#,
+        );
+        let settings = load_file_settings(
+            worktree.path(),
+            Some(&user_settings_path_in(config_dir.path())),
+        )
+        .unwrap();
+        assert_eq!(settings.lsp_port, None);
+        assert_eq!(settings.dap_port, 7000);
+        assert_eq!(settings.startup_timeout_s, 5);
+    }
+
+    #[test]
     fn validation_error_names_the_file() {
         let config_dir = TempDir::new().unwrap();
         let worktree = TempDir::new().unwrap();

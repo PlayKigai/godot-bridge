@@ -12,6 +12,7 @@ pub enum RootError {
     CannotDetermineRoot,
     UncPath(PathBuf),
     ProjectDirInvalid(PathBuf),
+    FileOutsideRoot(PathBuf),
     NoProject(PathBuf),
     SeveralProjects {
         root: PathBuf,
@@ -36,6 +37,9 @@ impl fmt::Display for RootError {
             ),
             Self::ProjectDirInvalid(path) => {
                 write!(f, "project_dir {} has no project.godot", path.display())
+            }
+            Self::FileOutsideRoot(path) => {
+                write!(f, "{} is outside the worktree", path.display())
             }
             Self::NoProject(root) => write!(
                 f,
@@ -149,7 +153,10 @@ pub fn find_project_dir(
     let root = canonicalize(root)?;
 
     if let Some(file) = file {
-        let file = normalize_absolute(file);
+        let file = canonical_or_normalized(file);
+        if !file.starts_with(&root) {
+            return Err(RootError::FileOutsideRoot(file));
+        }
         let mut candidate = if file.is_dir() {
             file
         } else {
@@ -158,11 +165,12 @@ pub fn find_project_dir(
                 .to_path_buf()
         };
         loop {
-            if !candidate.starts_with(&root) {
-                break;
-            }
             if has_project_file(&candidate) {
-                return canonical_dir(&candidate);
+                let dir = canonical_dir(&candidate)?;
+                if dir.starts_with(&root) {
+                    return Ok(dir);
+                }
+                break;
             }
             let Some(parent) = candidate.parent() else {
                 break;
@@ -308,6 +316,43 @@ mod tests {
         assert!(find_project_dir(&root.join("minimal-project"), None, None)
             .unwrap()
             .ends_with("minimal-project"));
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("godot-bridge-root-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_outside_root_is_an_error() {
+        let base = scratch_dir("outside");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("project.godot"), "").unwrap();
+        std::fs::write(other.join("main.gd"), "").unwrap();
+        let error = find_project_dir(&root, Some(&other.join("main.gd")), None).unwrap_err();
+        assert!(matches!(error, RootError::FileOutsideRoot(_)), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_project_outside_root_is_an_error() {
+        let base = scratch_dir("symlink");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("project.godot"), "").unwrap();
+        std::fs::write(other.join("main.gd"), "").unwrap();
+        std::os::unix::fs::symlink(&other, root.join("link")).unwrap();
+        let error =
+            find_project_dir(&root, Some(&root.join("link").join("main.gd")), None).unwrap_err();
+        assert!(matches!(error, RootError::FileOutsideRoot(_)), "{error}");
     }
 
     #[cfg(unix)]

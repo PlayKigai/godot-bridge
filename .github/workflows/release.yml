@@ -8,11 +8,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sh scripts/check_release_version.sh "$GITHUB_REF_NAME"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: cargo-vet@0.10.2
+      - run: cargo vet --locked
+
   build:
+    needs: supply-chain
     strategy:
       matrix:
         include:
@@ -59,6 +76,7 @@ jobs:
           if-no-files-found: error
 
   vsix:
+    needs: supply-chain
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -79,14 +97,15 @@ jobs:
           cache: npm
           cache-dependency-path: clients/vscode/package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npm run package
+      - run: npm audit signatures
+      - run: npm run package -- --out "godot-bridge-$GITHUB_REF_NAME.vsix"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: clients/vscode/godot-bridge-*.vsix
+          subject-path: clients/vscode/godot-bridge-${{ github.ref_name }}.vsix
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: godot-bridge-${{ github.ref_name }}.vsix
-          path: clients/vscode/godot-bridge-*.vsix
+          path: clients/vscode/godot-bridge-${{ github.ref_name }}.vsix
           if-no-files-found: error
 
   release:
@@ -94,12 +113,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
       - run: cd artifacts && sha256sum * > SHA256SUMS
-      - run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/SHA256SUMS
+      - run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ github.token }}

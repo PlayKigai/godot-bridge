@@ -35,8 +35,8 @@ exit 1. Errors print a message and exit 1.
 ## Settings
 
 For Zed, `lsp.godot.settings` in user settings or `.zed/settings.json`. `godot_path`,
-`project_dir` and `extra_args` are ignored in project settings with a
-warning. Other project keys override user keys. The Zed extension passes the
+`project_dir`, `lsp_port`, `dap_port` and `extra_args` are ignored in project
+settings with a warning. Other project keys override user keys. The Zed extension passes the
 merged object as `initializationOptions`; the bridge strips it before
 forwarding `initialize` to Godot. A non-object gets `-32602`, exit 1.
 

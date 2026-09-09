@@ -55,6 +55,7 @@ jobs:
           cache: npm
           cache-dependency-path: clients/vscode/package-lock.json
       - run: npm ci --ignore-scripts
+      - run: npm audit signatures
       - run: ./node_modules/.bin/tsc --noEmit
       - run: npm run build
 
@@ -96,6 +97,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-05
+      - run: cargo fetch --locked
+      - run: python3 scripts/check_build_scripts.py
       - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         with:
           tool: cargo-geiger@0.13.0
