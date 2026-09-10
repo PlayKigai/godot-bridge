@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "godot-bridge"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "godot-zed-extension"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "zed_extension_api",
 ]

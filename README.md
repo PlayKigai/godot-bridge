@@ -32,9 +32,14 @@ Windows. Godot 4 must be installed.
 Needs a Rust toolchain from [rustup](https://rustup.rs).
 
 ```sh
-cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked
+cargo install godot-bridge --locked
 godot-bridge --version
 ```
+
+Prebuilt Linux and Windows binaries are attached to each
+[release](https://github.com/PlayKigai/godot-bridge/releases/latest) with a
+`SHA256SUMS` file and a build provenance attestation; `SECURITY.md` has the
+verification commands.
 
 This puts `godot-bridge` in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on
 Windows). Editors start with your login shell's PATH, not your terminal's,

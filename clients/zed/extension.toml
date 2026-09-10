@@ -1,6 +1,6 @@
 id = "godot"
 name = "Godot"
-version = "1.0.0"
+version = "1.0.1"
 schema_version = 1
 authors = ["Godot Zed contributors"]
 description = "Godot language support for Zed."

@@ -1,6 +1,6 @@
 local M = {}
 
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 local INSTALL_HINT = "install a matching godot-bridge: cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked"
 
 local config = { bridge_path = "godot-bridge", settings = {} }
