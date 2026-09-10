@@ -1,0 +1,68 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v1.0.1
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  marketplace:
+    runs-on: ubuntu-latest
+    environment: release
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "godot-bridge-$TAG.vsix" --dir clients/vscode
+        working-directory: .
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+      - run: sh ../../scripts/publish_retry.sh vsce "godot-bridge-$TAG.vsix"
+        env:
+          TAG: ${{ inputs.tag }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  open-vsx:
+    runs-on: ubuntu-latest
+    environment: release
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "godot-bridge-$TAG.vsix" --dir clients/vscode
+        working-directory: .
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+      - run: sh ../../scripts/publish_retry.sh ovsx "godot-bridge-$TAG.vsix"
+        env:
+          TAG: ${{ inputs.tag }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}

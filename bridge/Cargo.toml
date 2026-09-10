@@ -7,6 +7,7 @@ repository.workspace = true
 edition.workspace = true
 keywords = ["godot", "gdscript", "lsp", "dap"]
 categories = ["development-tools"]
+readme = "../README.md"
 
 [[bin]]
 name = "godot-bridge"
