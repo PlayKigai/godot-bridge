@@ -57,7 +57,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - name: VS Code Marketplace
-        run: ./node_modules/.bin/vsce publish --packagePath "godot-bridge-$TAG.vsix" --skip-duplicate
+        run: |
+          ./node_modules/.bin/vsce verify-pat playkigai
+          ./node_modules/.bin/vsce publish --packagePath "godot-bridge-$TAG.vsix" --skip-duplicate
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
@@ -103,6 +105,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Open VSX
-        run: ./node_modules/.bin/ovsx publish "godot-bridge-$TAG.vsix" --skip-duplicate
+        run: |
+          ./node_modules/.bin/ovsx verify-pat playkigai
+          ./node_modules/.bin/ovsx publish "godot-bridge-$TAG.vsix" --skip-duplicate
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
