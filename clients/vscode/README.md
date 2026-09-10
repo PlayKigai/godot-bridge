@@ -8,12 +8,11 @@ The feature list is in the repository README.
 ## Install
 
 1. Godot 4 on PATH as `godot`, or set `godot.godotPath`.
-2. `cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked`,
-   and make sure `godot-bridge` is on PATH (or set `godot.bridgePath`).
-3. Install this extension (`npm run package`, then install the `.vsix`).
-4. Disable any other GDScript extension. Two language servers on `.gd`
+2. `cargo install godot-bridge --locked`, and make sure `godot-bridge` is on
+   PATH (or set `godot.bridgePath`).
+3. Disable any other GDScript extension. Two language servers on `.gd`
    and two `godot` debug types conflict.
-5. Open a `.gd` file. Godot starts by itself.
+4. Open a `.gd` file. Godot starts by itself.
 
 On macOS the bridge is not supported; the extension shows an error and stays
 idle. One VS Code window per project. Godot serves one client.
