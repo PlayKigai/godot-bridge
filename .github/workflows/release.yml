@@ -149,10 +149,14 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
       - run: |
           ver=${GITHUB_REF_NAME#v}
-          if curl -sfL -o /dev/null "https://crates.io/api/v1/crates/godot-bridge/$ver"; then
+          published() { curl -sfL -A "godot-bridge release workflow" -o /dev/null "https://crates.io/api/v1/crates/godot-bridge/$ver"; }
+          if published; then
             echo "godot-bridge $ver is already on crates.io, nothing to do"
             exit 0
           fi
-          cargo publish -p godot-bridge --locked
+          cargo publish -p godot-bridge --locked || {
+            published && { echo "godot-bridge $ver landed on crates.io anyway"; exit 0; }
+            exit 1
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

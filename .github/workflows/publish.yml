@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  registries:
+  marketplace:
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -27,11 +27,7 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
     steps:
-      - run: |
-          case $TAG in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "tag must look like v1.2.3, got $TAG" >&2; exit 1 ;;
-          esac
+      - run: echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "tag must be vX.Y.Z, got $TAG" >&2; exit 1; }
         working-directory: .
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,17 +46,63 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern "godot-bridge-$TAG.vsix" --pattern SHA256SUMS --dir clients/vscode
           cd clients/vscode
-          gh attestation verify "godot-bridge-$TAG.vsix" --repo "$GITHUB_REPOSITORY"
-          gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
-          grep " godot-bridge-$TAG.vsix\$" SHA256SUMS | sha256sum -c -
+          for f in "godot-bridge-$TAG.vsix" SHA256SUMS; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+          done
+          grep -F " godot-bridge-$TAG.vsix" SHA256SUMS > vsix.sha256
+          test "$(wc -l < vsix.sha256)" -eq 1
+          sha256sum -c vsix.sha256
         env:
           GH_TOKEN: ${{ github.token }}
       - name: VS Code Marketplace
         run: ./node_modules/.bin/vsce publish --packagePath "godot-bridge-$TAG.vsix" --skip-duplicate
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  open-vsx:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      attestations: read
+    defaults:
+      run:
+        working-directory: clients/vscode
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - run: echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "tag must be vX.Y.Z, got $TAG" >&2; exit 1; }
+        working-directory: .
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm audit signatures
+      - name: Download and verify the released vsix
+        working-directory: .
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "godot-bridge-$TAG.vsix" --pattern SHA256SUMS --dir clients/vscode
+          cd clients/vscode
+          for f in "godot-bridge-$TAG.vsix" SHA256SUMS; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+          done
+          grep -F " godot-bridge-$TAG.vsix" SHA256SUMS > vsix.sha256
+          test "$(wc -l < vsix.sha256)" -eq 1
+          sha256sum -c vsix.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Open VSX
-        if: ${{ !cancelled() }}
         run: ./node_modules/.bin/ovsx publish "godot-bridge-$TAG.vsix" --skip-duplicate
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
