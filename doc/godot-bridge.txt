@@ -12,7 +12,7 @@ optional dependency is nvim-dap, required just for |godot-bridge-dap|.
 
 The bridge must be installed and on PATH, or pointed at with `bridge_path`:
 >
-    cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked
+    cargo install godot-bridge --locked
 <
 
 Install with lazy.nvim:

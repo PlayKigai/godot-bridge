@@ -25,9 +25,9 @@ fn bridge_command(worktree: &zed::Worktree) -> zed::Result<String> {
         .binary
         .and_then(|binary| binary.path)
         .filter(|path| is_absolute(path));
-    configured.or_else(|| worktree.which("godot-bridge")).ok_or_else(|| {
-        "Install godot-bridge: cargo install --git https://github.com/PlayKigai/godot-bridge godot-bridge --locked".to_string()
-    })
+    configured
+        .or_else(|| worktree.which("godot-bridge"))
+        .ok_or_else(|| "Install godot-bridge: cargo install godot-bridge --locked".to_string())
 }
 
 impl zed::Extension for GodotExtension {

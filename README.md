@@ -86,9 +86,12 @@ launch main scene, launch current scene, and attach.
    ```sh
    code --install-extension godot-bridge-*.vsix
    ```
-   The extension is not on the Marketplace or Open VSX. To build it
-   yourself: `cd clients/vscode && npm ci && npm run package`.
+   As of v1.0.1 the extension is on neither the Marketplace nor Open VSX,
+   so the release download is the only install path. To build it yourself:
+   `cd clients/vscode && npm ci && npm run package`.
 3. Open a `.gd` file. Godot starts by itself.
+
+macOS is not supported. The extension loads, shows an error and stays idle.
 
 Bridge path if VS Code cannot find it: `godot.bridgePath`. Other settings
 are `godot.godotPath`, `godot.projectDir`, and the Settings table in
@@ -182,4 +185,5 @@ delete `~/.local/share/zed/extensions/index.json`, on Windows
 The bridge and every client share one version number and are released
 together.
 
-Docs: `docs/spec.md` (design and protocol), `docs/mac-port.md`.
+Docs: `docs/spec.md` (design and protocol), `docs/release.md` (cutting a
+release and recovering from a failed one), `docs/mac-port.md`.

@@ -13,13 +13,26 @@ maintainer, with no response time commitment.
 
 Each release publishes a `SHA256SUMS` file next to the binaries and the
 VSIX, and every file carries a GitHub build provenance attestation.
-Download the files you need plus `SHA256SUMS` into one directory, then:
+
+Download the files you want plus `SHA256SUMS` into one directory. Run all
+three steps in this order; the checksum file is only trustworthy once its own
+attestation has been checked. Substitute your version for `v1.0.1`.
+
+    gh attestation verify SHA256SUMS --repo PlayKigai/godot-bridge \
+      --signer-workflow PlayKigai/godot-bridge/.github/workflows/release.yml \
+      --source-ref refs/tags/v1.0.1
 
     sha256sum -c --ignore-missing SHA256SUMS
-    gh attestation verify godot-bridge-vX.Y.Z-x86_64-linux.tar.gz --repo PlayKigai/godot-bridge
-    gh attestation verify godot-bridge-vX.Y.Z-x86_64-windows.zip --repo PlayKigai/godot-bridge
-    gh attestation verify godot-bridge-vX.Y.Z.vsix --repo PlayKigai/godot-bridge
-    gh attestation verify SHA256SUMS --repo PlayKigai/godot-bridge
+
+    gh attestation verify godot-bridge-v1.0.1-x86_64-linux.tar.gz --repo PlayKigai/godot-bridge \
+      --signer-workflow PlayKigai/godot-bridge/.github/workflows/release.yml \
+      --source-ref refs/tags/v1.0.1
+
+Repeat the last command for each file you downloaded, swapping the filename:
+`godot-bridge-v1.0.1-x86_64-windows.zip` or `godot-bridge-v1.0.1.vsix`. The
+two `--signer-*` flags are what tie the file to this repository's release
+workflow at that exact tag; without them any attestation from the repository
+is accepted.
 
 On Windows without `sha256sum`: `Get-FileHash <file> -Algorithm SHA256` and
 compare with the line in `SHA256SUMS`.

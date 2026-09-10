@@ -3,16 +3,26 @@
 GDScript in VS Code, backed by the Godot editor's own language server and
 debugger. Linux and Windows. Godot 4.x.
 
-The feature list is in the repository README.
+The feature list is in the
+[repository README](https://github.com/PlayKigai/godot-bridge#readme).
 
 ## Install
 
 1. Godot 4 on PATH as `godot`, or set `godot.godotPath`.
 2. `cargo install godot-bridge --locked`, and make sure `godot-bridge` is on
-   PATH (or set `godot.bridgePath`).
-3. Disable any other GDScript extension. Two language servers on `.gd`
+   PATH (or set `godot.bridgePath`). This needs a Rust toolchain from
+   [rustup](https://rustup.rs). Prebuilt Linux and Windows binaries are
+   attached to each
+   [release](https://github.com/PlayKigai/godot-bridge/releases/latest).
+3. Install this extension. If you did not get it from a registry, download
+   the `.vsix` from the
+   [latest release](https://github.com/PlayKigai/godot-bridge/releases/latest)
+   and run `code --install-extension godot-bridge-*.vsix`. Verification
+   commands for the download are in
+   [SECURITY.md](https://github.com/PlayKigai/godot-bridge/blob/main/SECURITY.md).
+4. Disable any other GDScript extension. Two language servers on `.gd`
    and two `godot` debug types conflict.
-4. Open a `.gd` file. Godot starts by itself.
+5. Open a `.gd` file. Godot starts by itself.
 
 On macOS the bridge is not supported; the extension shows an error and stays
 idle. One VS Code window per project. Godot serves one client.

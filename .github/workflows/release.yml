@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -111,6 +111,7 @@ jobs:
   release:
     needs: [build, vsix]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       id-token: write
