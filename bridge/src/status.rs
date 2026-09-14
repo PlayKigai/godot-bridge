@@ -1,0 +1,114 @@
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::state::{
+    read_state, remove_if_stale, runtime_dir, socket_path_for_state, socket_request,
+};
+
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn run() -> crate::error::Result<()> {
+    let stdout = io::stdout();
+    run_in(&runtime_dir()?, &mut stdout.lock())
+}
+
+fn run_in(dir: &Path, out: &mut impl Write) -> crate::error::Result<()> {
+    for state_path in list_state_files(dir)? {
+        let sock_path = socket_path_for_state(&state_path);
+        let project = read_state(&state_path)
+            .ok()
+            .flatten()
+            .map(|state| state.project)
+            .unwrap_or_default();
+        match socket_request(
+            &sock_path,
+            &crate::json!({"cmd": "status", "project": (project)}),
+            STATUS_TIMEOUT,
+        ) {
+            Ok(response) => writeln!(out, "{response}")?,
+            Err(_) => {
+                let _ = remove_if_stale(&state_path, &sock_path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn list_state_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "json")
+        {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{write_state, Status};
+    use crate::temp::TempDir;
+
+    #[test]
+    fn detached_gui_state_without_socket_is_kept() {
+        let dir = TempDir::new().unwrap();
+        write_state(
+            &dir.path().join("gui.json"),
+            &crate::state::detached_gui_state(Path::new("/project"), Status::Ready),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        run_in(dir.path(), &mut output).unwrap();
+        assert!(dir.path().join("gui.json").exists());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn stale_state_is_removed_and_live_status_is_printed() {
+        use crate::json::Value;
+        use crate::state::{serve_socket, Mode, State};
+        let dir = TempDir::new().unwrap();
+        let stale = State {
+            version: 1,
+            project: "/stale".to_owned(),
+            status: Status::Ready,
+            mode: Mode::Headless,
+            godot_pid: None,
+            godot_pgid: None,
+            lsp_port: None,
+            dap_port: None,
+            owner_pid: Some(u32::MAX),
+            owner_start_ticks: Some(1),
+            godot_start_ticks: None,
+            started_at: "2026-09-04T00:00:00Z".to_owned(),
+            bridge_version: "0.1.0".to_owned(),
+        };
+        let stale_path = dir.path().join("stale.json");
+        write_state(&stale_path, &stale).unwrap();
+        let live_path = dir.path().join("live.json");
+        std::fs::write(&live_path, b"{}").unwrap();
+        #[cfg(unix)]
+        std::fs::write(socket_path_for_state(&stale_path), b"dead").unwrap();
+        let _handle = serve_socket(
+            socket_path_for_state(&live_path),
+            |_request| crate::json!({"status": "ready", "project": "/live"}),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        run_in(dir.path(), &mut output).unwrap();
+        assert!(!stale_path.exists());
+        #[cfg(unix)]
+        assert!(!socket_path_for_state(&stale_path).exists());
+        assert!(live_path.exists());
+        let lines: Vec<&str> = std::str::from_utf8(&output).unwrap().lines().collect();
+        assert_eq!(lines.len(), 1);
+        let response: Value = crate::json::from_str(lines[0]).unwrap();
+        assert_eq!(response["status"], "ready");
+        assert_eq!(response["project"], "/live");
+    }
+}

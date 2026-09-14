@@ -1,0 +1,65 @@
+{
+  "scopeName": "source.gdshader",
+  "name": "GDShader",
+  "fileTypes": ["gdshader", "gdshaderinc"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#preprocessor" },
+    { "include": "#string" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#constant" },
+    { "include": "#number" },
+    { "include": "#function-call" }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.gdshader",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.gdshader",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "preprocessor": {
+      "name": "keyword.control.directive.gdshader",
+      "match": "^\\s*#[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "string": {
+      "name": "string.quoted.double.gdshader",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gdshader",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "keyword": {
+      "name": "keyword.control.gdshader",
+      "match": "\\b(shader_type|render_mode|group_uniforms|global|instance|uniform|varying|const|struct|if|else|for|while|do|return|break|continue|switch|case|default|discard|in|out|inout|lowp|mediump|highp|flat|smooth|hint_screen_texture|hint_normal_roughness_texture|hint_depth_texture)\\b"
+    },
+    "type": {
+      "name": "storage.type.gdshader",
+      "match": "\\b(void|bool|int|uint|float|vec2|vec3|vec4|ivec2|ivec3|ivec4|uvec2|uvec3|uvec4|mat2|mat3|mat4|sampler2D|isampler2D|usampler2D|sampler2DArray|sampler3D|samplerCube|samplerExternalOES)\\b"
+    },
+    "constant": {
+      "name": "constant.language.gdshader",
+      "match": "\\b(true|false)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.gdshader",
+      "match": "\\b(0x[0-9a-fA-F_]+|\\d[\\d_]*(\\.\\d[\\d_]*)?([eE][+-]?\\d+)?[uUfF]?)\\b"
+    },
+    "function-call": {
+      "name": "entity.name.function.gdshader",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    }
+  }
+}

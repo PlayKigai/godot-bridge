@@ -1,0 +1,77 @@
+{
+  "scopeName": "source.gdscript",
+  "name": "GDScript",
+  "fileTypes": ["gd"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#annotation" },
+    { "include": "#node-path" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#constant" },
+    { "include": "#number" },
+    { "include": "#function-call" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.gdscript",
+      "match": "#.*$"
+    },
+    "string": {
+      "name": "string.quoted.gdscript",
+      "patterns": [
+        {
+          "name": "string.quoted.double.gdscript",
+          "begin": "&?\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.gdscript",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.gdscript",
+          "begin": "&?'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.gdscript",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "annotation": {
+      "name": "storage.modifier.annotation.gdscript",
+      "match": "@[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "node-path": {
+      "name": "string.unquoted.node-path.gdscript",
+      "match": "[$%][A-Za-z_][A-Za-z0-9_/]*"
+    },
+    "keyword": {
+      "name": "keyword.control.gdscript",
+      "match": "\\b(extends|class_name|class|enum|signal|func|const|var|static|if|elif|else|for|while|match|when|return|pass|break|continue|await|and|or|not|in|is|as|self|super|void)\\b"
+    },
+    "type": {
+      "name": "storage.type.gdscript",
+      "match": "\\b(int|float|bool|String|StringName|NodePath|Array|Dictionary|Vector2|Vector2i|Vector3|Vector3i|Vector4|Vector4i|Color|Rect2|Rect2i|Transform2D|Transform3D|Plane|Quaternion|AABB|Basis|RID|Object|Node|Node2D|Node3D|Callable|Signal|Variant|PackedByteArray|PackedInt32Array|PackedInt64Array|PackedFloat32Array|PackedFloat64Array|PackedStringArray|PackedVector2Array|PackedVector3Array|PackedColorArray)\\b"
+    },
+    "constant": {
+      "name": "constant.language.gdscript",
+      "match": "\\b(true|false|null|INF|NAN|PI|TAU|OK|FAILED)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.gdscript",
+      "match": "\\b(0x[0-9a-fA-F_]+|\\d[\\d_]*(\\.\\d[\\d_]*)?([eE][+-]?\\d+)?)\\b"
+    },
+    "function-call": {
+      "name": "entity.name.function.gdscript",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    }
+  }
+}

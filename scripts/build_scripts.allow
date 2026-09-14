@@ -1,0 +1,25 @@
+# crates allowed to run build scripts or proc macros, one per line
+anyhow
+crc32fast
+displaydoc
+futures-macro
+icu_normalizer_data
+icu_properties_data
+libc
+prettyplease
+proc-macro2
+quote
+serde
+serde_core
+serde_derive
+serde_json
+wasm-encoder
+wasmparser
+wit-bindgen-rt
+wit-bindgen-rust
+wit-bindgen-rust-macro
+yoke-derive
+zed_extension_api
+zerofrom-derive
+zerovec-derive
+zmij

@@ -1,0 +1,57 @@
+name: Bug report
+description: Something the bridge or a client does wrong. Feature requests and questions are not tracked here.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One maintainer, best effort, no timelines. Reports missing any field below are closed.
+        Pull requests are not accepted; fork freely.
+  - type: input
+    id: bridge_version
+    attributes:
+      label: Bridge version
+      description: Output of `godot-bridge --version`
+    validations:
+      required: true
+  - type: input
+    id: godot_version
+    attributes:
+      label: Godot version
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options: [Linux, Windows]
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: Editor client
+      options: [Zed, VS Code, Neovim, CLI only]
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal. A tiny project.godot that shows it beats a description.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected versus actual
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `GODOT_BRIDGE_LOG=debug`, then paste the bridge log and the editor's LSP log.
+      render: text
+    validations:
+      required: true
