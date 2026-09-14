@@ -49,17 +49,23 @@ its own client.
 
 ### The bridge
 
-Needs a Rust toolchain from [rustup](https://rustup.rs).
+Each client downloads the matching prebuilt bridge for x86_64/aarch64 Linux
+and Windows on request (Zed: on first use). `cargo install` is the
+alternative, and the only path for other triples:
 
 ```sh
 cargo install godot-bridge --locked
 godot-bridge --version
 ```
 
-Prebuilt Linux and Windows binaries are attached to each
+That needs a Rust toolchain from [rustup](https://rustup.rs).
+
+Prebuilt files are bare binaries attached to each
 [release](https://github.com/PlayKigai/godot-bridge/releases/latest) with a
 `SHA256SUMS` file and a build provenance attestation. `SECURITY.md` has the
-verification commands.
+verification commands. For manual use rename the file to `godot-bridge`
+(`godot-bridge.exe` on Windows) and run `chmod +x` on Linux. Releases before
+1.0.3 have no aarch64 assets.
 
 The binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows).
 Editors start with your login shell's PATH, not your terminal's. If the
@@ -72,14 +78,20 @@ or `godot` on PATH. On Windows the bridge also looks in
 
 ### Zed
 
+The bridge is downloaded automatically on first LSP start.
+
 1. Disable any other GDScript extension. Two language servers on `.gd`
    conflict.
 2. `git clone https://github.com/PlayKigai/godot-bridge`.
 3. In Zed run `zed: install dev extension` and pick the `clients/zed`
    folder of the clone. Zed compiles it and needs `cargo` on its PATH.
+   These steps stay until the extension is on the Zed registry.
 4. Open a `.gd` file and wait for the first diagnostics.
 
-Bridge path: `lsp.godot.binary.path` in user settings, absolute. Other
+Bridge path: `lsp.godot.binary.path` in user settings, absolute. Otherwise
+the downloaded file in the extension work dir is used
+(`~/.local/share/zed/extensions/work/godot` on Linux). To go back to a PATH
+bridge, delete the stored file or set a path. Other
 settings go under `lsp.godot.settings`:
 
 ```json
@@ -105,9 +117,14 @@ launch main scene, launch current scene and attach.
    code --install-extension godot-bridge-*.vsix
    ```
    To build it yourself: `cd clients/vscode && npm ci && npm run package`.
-3. Open a `.gd` file.
+3. Open a `.gd` file; the extension offers to download the bridge. The
+   palette command `Godot: Download bridge` downloads it again.
 
-Bridge path: `godot.bridgePath`. Other settings are `godot.godotPath`,
+Bridge path: `godot.bridgePath`. A downloaded bridge in the extension's
+global storage folder (e.g.
+`~/.config/Code/User/globalStorage/PlayKigai.godot-bridge` on Linux) takes
+precedence over PATH. Delete the stored file or set `godot.bridgePath` to
+go back to a PATH bridge. Other settings are `godot.godotPath`,
 `godot.projectDir` and the rest of the Settings table in camelCase.
 Commands are in the palette under `Godot:`. Press F5 and pick Godot to
 debug; run project, run current scene and attach are offered and VS Code
@@ -123,7 +140,8 @@ Neovim 0.10 or newer. With lazy.nvim:
 { "PlayKigai/godot-bridge", ft = "gdscript", opts = {} }
 ```
 
-Open a `.gd` file. Commands: `:GodotRun`, `:GodotRunScene`,
+Open a `.gd` file. Run `:GodotBridgeInstall` to download the bridge.
+Commands: `:GodotRun`, `:GodotRunScene`,
 `:GodotEditor`, `:GodotDoc`, `:GodotStatus`, `:GodotRestart`.
 
 Bridge path and other settings:
@@ -134,6 +152,10 @@ opts = {
   settings = { project_dir = "game" },
 }
 ```
+
+A path setting wins; otherwise the file installed by `:GodotBridgeInstall`
+under `<stdpath("data")>/godot-bridge` is used. To go back to a PATH bridge,
+delete the stored file or set `bridge_path` to a path.
 
 Debugging needs nvim-dap. After setup call
 `require("godot-bridge").dap()`; `:DapContinue` then offers run project,
@@ -197,7 +219,8 @@ cargo deny check && cargo vet
 ```
 
 The bridge depends on `libc` on Unix and `windows-sys` on Windows, the Zed
-extension on `zed_extension_api` only. `deny.toml`, `supply-chain/` and
+extension on `zed_extension_api` only. SHA-256 verification in the Zed
+extension is hand-rolled in `clients/zed/src/sha256.rs`. `deny.toml`, `supply-chain/` and
 `scripts/build_scripts.allow` gate new dependencies. Platform code lives in
 `bridge/src/sys/`, where `unix/` and `windows/` export the same names; the
 rest is shared. After editing queries or `clients/zed/src/lib.rs`, delete

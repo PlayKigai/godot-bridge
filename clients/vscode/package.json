@@ -268,6 +268,11 @@
         "command": "godot.restartLanguageServer",
         "title": "Restart Language Server",
         "category": "Godot"
+      },
+      {
+        "command": "godot.downloadBridge",
+        "title": "Download bridge",
+        "category": "Godot"
       }
     ]
   }

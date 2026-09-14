@@ -14,7 +14,8 @@ not worth using.
 2. Verify before tagging, because the tag is what costs a version:
    `sh scripts/check_release_version.sh vX.Y.Z`.
 3. Push `main`, then push the tag. `release.yml` runs the supply-chain gate,
-   builds Linux and Windows, packages the VSIX, attests every artifact,
+   builds Linux and Windows for x86_64 and aarch64 as bare binaries,
+   packages the VSIX, attests every artifact,
    writes `SHA256SUMS`, and waits for your approval before creating the
    GitHub release and publishing to crates.io.
 4. Publish the extension separately once the release exists:

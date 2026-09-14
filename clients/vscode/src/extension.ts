@@ -1,12 +1,15 @@
 import * as cp from "child_process";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import * as util from "util";
 import * as vscode from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
 
 const MACHINE_KEYS = ["godotPath", "projectDir", "lspPort", "dapPort", "extraArgs"];
 const WORKSPACE_KEYS = ["projectDiagnostics", "diagnoseAddons", "exclude", "startupTimeoutS"];
+const CARGO_LINE = "Install it: cargo install godot-bridge --locked";
 
 const clients = new Map<string, { client: LanguageClient; folder: vscode.WorkspaceFolder; spawnKey: string }>();
 let queue: Promise<void> = Promise.resolve();
@@ -19,6 +22,9 @@ function serialize(step: () => Promise<unknown>): Promise<void> {
 }
 
 const resolvedBridge = new Map<string, string>();
+let clientVersion: string;
+let storageDir: string;
+let inFlight: Promise<void> | undefined;
 
 // Bare and relative names are resolved here because Windows would search the project cwd first.
 function bridgePath(): string {
@@ -28,12 +34,32 @@ function bridgePath(): string {
   if (cached) {
     return cached;
   }
-  const name = configured.replace(/^~(?=[\\/])/, os.homedir());
-  const found = name === path.basename(name) ? onPath(name) : path.resolve(os.homedir(), name);
-  if (found) {
-    resolvedBridge.set(configured, found);
+  if (configured.startsWith("~") || configured.includes("/") || configured.includes("\\")) {
+    const expanded = configured.replace(/^~(?=[\\/])/, os.homedir());
+    const resolved = path.resolve(os.homedir(), expanded);
+    resolvedBridge.set(configured, resolved);
+    return resolved;
   }
-  return found ?? path.join(os.homedir(), ".cargo", "bin", name);
+  const asset = assetName();
+  if (asset && storageDir) {
+    const stored = path.join(storageDir, asset);
+    if (isFile(stored)) {
+      resolvedBridge.set(configured, stored);
+      return stored;
+    }
+  }
+  const hit = onPath(configured);
+  if (hit) {
+    resolvedBridge.set(configured, hit);
+    return hit;
+  }
+  const cargoBin = process.env.CARGO_HOME
+    ? path.join(process.env.CARGO_HOME, "bin", configured)
+    : path.join(os.homedir(), ".cargo", "bin", configured);
+  if (isFile(cargoBin)) {
+    resolvedBridge.set(configured, cargoBin);
+  }
+  return cargoBin;
 }
 
 function isFile(candidate: string): boolean {
@@ -56,6 +82,28 @@ function onPath(name: string): string | undefined {
     }
   }
   return undefined;
+}
+
+function assetName(): string | undefined {
+  const osName = process.platform === "linux" ? "linux" : process.platform === "win32" ? "windows" : undefined;
+  if (!osName || !clientVersion) {
+    return undefined;
+  }
+  const raw = process.arch.toLowerCase();
+  const arch = raw === "x86_64" || raw === "amd64" || raw === "x64" ? "x86_64" : raw === "aarch64" || raw === "arm64" ? "aarch64" : undefined;
+  if (!arch) {
+    return undefined;
+  }
+  const ext = process.platform === "win32" ? ".exe" : "";
+  return `godot-bridge-v${clientVersion}-${arch}-${osName}${ext}`;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function withCargo(text: string): string {
+  return text.endsWith(CARGO_LINE) ? text : `${text} ${CARGO_LINE}`;
 }
 
 function bridgeSettings(folder?: vscode.Uri): Record<string, unknown> {
@@ -84,20 +132,109 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function checkBridge(clientVersion: string): void {
+function downloadBridge(): Promise<void> {
+  if (inFlight) {
+    return inFlight;
+  }
+  inFlight = downloadNow().finally(() => {
+    inFlight = undefined;
+  });
+  return inFlight;
+}
+
+async function downloadNow(): Promise<void> {
+  const asset = assetName();
+  if (!asset) {
+    if (process.platform === "darwin") {
+      throw new Error("godot-bridge: macOS is not supported. Linux and Windows only.");
+    }
+    throw new Error(`godot-bridge: no prebuilt binary for ${process.platform}/${process.arch}. ${CARGO_LINE}`);
+  }
+  const tag = `v${clientVersion}`;
+  const base = `https://github.com/PlayKigai/godot-bridge/releases/download/${tag}`;
+  const final = path.join(storageDir, asset);
+  const part = `${final}.${process.pid}.part`;
+  const execFile = util.promisify(cp.execFile);
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, cancellable: false, title: `Downloading ${asset}` },
+    async () => {
+      fs.mkdirSync(storageDir, { recursive: true });
+      const sumsResponse = await fetch(`${base}/SHA256SUMS`);
+      if (!sumsResponse.ok) {
+        throw new Error(`godot-bridge: download failed (${sumsResponse.status}). ${CARGO_LINE}`);
+      }
+      const sums = await sumsResponse.text();
+      const digests: string[] = [];
+      for (const raw of sums.split("\n")) {
+        const match = /^([0-9a-fA-F]{64})(?:  | \*)(.+)$/.exec(raw.replace(/\r$/, ""));
+        if (match && match[2] === asset) {
+          digests.push(match[1].toLowerCase());
+        }
+      }
+      if (digests.length === 0) {
+        throw new Error(`godot-bridge: ${asset} absent from this release. ${CARGO_LINE}`);
+      }
+      if (digests.length > 1) {
+        throw new Error(`godot-bridge: corrupt SHA256SUMS. ${CARGO_LINE}`);
+      }
+      const expected = digests[0];
+      const assetResponse = await fetch(`${base}/${asset}`);
+      if (!assetResponse.ok) {
+        throw new Error(`godot-bridge: download failed (${assetResponse.status}). ${CARGO_LINE}`);
+      }
+      const bytes = Buffer.from(await assetResponse.arrayBuffer());
+      const actual = sha256Hex(bytes);
+      if (actual !== expected) {
+        throw new Error(`godot-bridge: checksum mismatch (expected ${expected}, got ${actual}). ${CARGO_LINE}`);
+      }
+      fs.writeFileSync(part, bytes);
+      try {
+        fs.renameSync(part, final);
+      } catch {
+        const existing = isFile(final) ? sha256Hex(fs.readFileSync(final)) : "";
+        fs.rmSync(part, { force: true });
+        if (existing !== expected) {
+          throw new Error(`godot-bridge: cannot replace ${asset}; stop the language server and retry. ${CARGO_LINE}`);
+        }
+      }
+      if (process.platform === "linux") {
+        fs.chmodSync(final, 0o755);
+      }
+      let versionOut = "";
+      try {
+        versionOut = (await execFile(final, ["--version"], { timeout: 5000 })).stdout;
+      } catch (error) {
+        fs.rmSync(final, { force: true });
+        throw new Error(`godot-bridge: cannot run downloaded bridge: ${messageOf(error)}. ${CARGO_LINE}`);
+      }
+      const bridgeMinor = /^godot-bridge (\d+\.\d+)/.exec(versionOut)?.[1];
+      if (bridgeMinor !== clientVersion.replace(/\.\d+$/, "")) {
+        fs.rmSync(final, { force: true });
+        throw new Error(
+          `godot-bridge: extension ${clientVersion}, bridge ${bridgeMinor ?? versionOut.trim().slice(0, 80)}. ${CARGO_LINE}`,
+        );
+      }
+    },
+  );
+}
+
+function offerInstall(message: string): void {
+  const download = `Download bridge v${clientVersion}`;
+  const choices = assetName() ? [download, "Open install instructions"] : ["Open install instructions"];
+  vscode.window.showErrorMessage(withCargo(message), ...choices).then((choice) => {
+    if (choice === download) {
+      vscode.commands.executeCommand("godot.downloadBridge");
+    } else if (choice) {
+      vscode.env.openExternal(vscode.Uri.parse("https://github.com/PlayKigai/godot-bridge#install"));
+    }
+  });
+}
+
+function checkBridge(): void {
   const resolved = bridgePath();
   cp.execFile(resolved, ["--version"], { timeout: 5000 }, (error, stdout) => {
     if (error) {
-      vscode.window
-        .showErrorMessage(
-          `Godot Bridge: cannot run "${resolved} --version". Install the bridge and put it on PATH or set godot.bridgePath.`,
-          "Open install instructions",
-        )
-        .then((choice) => {
-          if (choice) {
-            vscode.env.openExternal(vscode.Uri.parse("https://github.com/PlayKigai/godot-bridge#install"));
-          }
-        });
+      offerInstall(`Godot Bridge: cannot run "${resolved} --version". Install the bridge and put it on PATH or set godot.bridgePath.`);
       return;
     }
     const bridgeVersion = /^godot-bridge (\d+\.\d+)/.exec(stdout)?.[1];
@@ -146,7 +283,7 @@ async function startClient(folder: vscode.WorkspaceFolder, output: vscode.LogOut
     if (clients.get(key)?.client === client) {
       clients.delete(key);
     }
-    vscode.window.showErrorMessage(`Godot Bridge failed to start: ${messageOf(error)}`);
+    offerInstall(`Godot Bridge failed to start: ${messageOf(error)}`);
   }
 }
 
@@ -228,11 +365,13 @@ const FILE_COMMANDS: [string, string, string, string[]][] = [
 
 export function activate(context: vscode.ExtensionContext): void {
   if (process.platform === "darwin") {
-    vscode.window.showErrorMessage("Godot Bridge is not supported on macOS. Linux and Windows only.");
+    vscode.window.showErrorMessage("godot-bridge: macOS is not supported. Linux and Windows only.");
     return;
   }
+  clientVersion = context.extension.packageJSON.version;
+  storageDir = context.globalStorageUri.fsPath;
   const output = vscode.window.createOutputChannel("Godot Bridge", { log: true });
-  checkBridge(context.extension.packageJSON.version);
+  checkBridge();
 
   context.subscriptions.push(
     output,
@@ -292,6 +431,20 @@ export function activate(context: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("godot.restartLanguageServer", () => restartClients(runningFolders, output)),
+    vscode.commands.registerCommand("godot.downloadBridge", () =>
+      serialize(async () => {
+        await stopClients(runningFolders());
+        try {
+          await downloadBridge();
+        } catch (error) {
+          vscode.window.showErrorMessage(withCargo(messageOf(error)));
+          return;
+        }
+        resolvedBridge.clear();
+        await Promise.all(foldersWithGdscript().map((folder) => startClient(folder, output)));
+        vscode.window.showInformationMessage(`Godot Bridge: downloaded ${assetName()}.`);
+      }),
+    ),
   );
   void serialize(() => Promise.all(foldersWithGdscript().map((folder) => startClient(folder, output))));
 }

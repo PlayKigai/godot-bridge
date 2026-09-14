@@ -10,10 +10,12 @@ https://github.com/PlayKigai/godot-bridge. It provides an LSP client for GDScrip
 commands, and optional nvim-dap debugging. Neovim 0.10 or later. The only
 optional dependency is nvim-dap, required just for |godot-bridge-dap|.
 
-The bridge must be installed and on PATH, or pointed at with `bridge_path`:
+The bridge can be downloaded with `:GodotBridgeInstall`, or installed
+by hand (needed on other platforms):
 >
     cargo install godot-bridge --locked
 <
+See |godot-bridge-install|.
 
 Install with lazy.nvim:
 >
@@ -33,7 +35,9 @@ the commands work with defaults without it.
 
 >
     require("godot-bridge").setup({
-      bridge_path = "godot-bridge",      -- name on PATH, or a path (~/ and home-relative allowed)
+      bridge_path = "godot-bridge",      -- name on PATH, or a path (~/ and home-relative allowed).
+                                         -- A path setting wins; otherwise the file from
+                                         -- |godot-bridge-install| wins over PATH.
       settings = {                       -- sent verbatim as JSON, see below
         project_diagnostics = false,
       },
@@ -41,8 +45,10 @@ the commands work with defaults without it.
 <
 
 On setup the plugin runs `godot-bridge --version` asynchronously and
-warns if it fails or the major.minor differs from the plugin's version. On
-macOS the bridge is unsupported; an error is shown and nothing else happens.
+warns if it fails or the major.minor differs from the plugin's version. Run
+`:GodotBridgeInstall` or `cargo install godot-bridge --locked` to fix that.
+On macOS the bridge is unsupported (`macOS is not supported. Linux and
+Windows only.`); an error is shown and nothing else happens.
 
 Settings (all optional; only keys you set are sent):
 >
@@ -76,8 +82,24 @@ COMMANDS                                                  *godot-bridge-commands
 :GodotStatus                 Print bridge status.
 :GodotRestart                Stop the client for the current root and start
                              it again.
+:GodotBridgeInstall          Download and install the bridge, see
+                             |godot-bridge-install|.
 
 Commands run in the project root and report output on exit.
+
+==============================================================================
+INSTALL                                               *godot-bridge-install*
+
+:GodotBridgeInstall downloads the prebuilt bridge for this plugin's
+version (x86_64/aarch64 Linux and Windows) from the release tagged with
+the plugin version, verifies its SHA-256 against that release's
+SHA256SUMS, and stores it under Neovim's data directory: >
+    <stdpath("data")>/godot-bridge/godot-bridge-vX.Y.Z-<arch>-<os>
+<Use `:echo stdpath("data")` to see the directory. Requires `curl`, plus
+`sha256sum` on Linux or `certutil` on Windows. `setup()` never downloads;
+run this command explicitly. A second call while one runs is rejected.
+To go back to a PATH bridge, delete the stored file or set `bridge_path`
+to a path.
 
 ==============================================================================
 DAP                                                   *godot-bridge-dap*

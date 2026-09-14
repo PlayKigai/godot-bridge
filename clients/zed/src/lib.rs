@@ -1,4 +1,11 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use zed_extension_api as zed;
+
+const CARGO_LINE: &str = "Install it: cargo install godot-bridge --locked";
+
+mod sha256;
 
 struct GodotExtension;
 
@@ -20,14 +27,190 @@ fn is_absolute(path: &str) -> bool {
 }
 
 /// Zed applies project settings only for trusted worktrees; relative paths would resolve against the project.
-fn bridge_command(worktree: &zed::Worktree) -> zed::Result<String> {
+fn bridge_command(
+    worktree: &zed::Worktree,
+    id: Option<&zed::LanguageServerId>,
+) -> zed::Result<String> {
+    let (asset, linux) = platform_asset()?;
     let configured = zed::settings::LspSettings::for_worktree("godot", worktree)?
         .binary
-        .and_then(|binary| binary.path)
-        .filter(|path| is_absolute(path));
-    configured
-        .or_else(|| worktree.which("godot-bridge"))
-        .ok_or_else(|| "Install godot-bridge: cargo install godot-bridge --locked".to_string())
+        .and_then(|binary| binary.path);
+    let binary_name = match configured {
+        Some(path) if is_absolute(&path) => return Ok(path),
+        Some(path) if path.contains('/') || path.contains('\\') || path.starts_with('~') => {
+            "godot-bridge".to_string()
+        }
+        Some(path) => path,
+        None => "godot-bridge".to_string(),
+    };
+    if std::fs::metadata(&asset).is_ok_and(|metadata| metadata.is_file()) {
+        return absolute(&asset);
+    }
+    if let Some(path) = worktree.which(&binary_name) {
+        return Ok(path);
+    }
+    download(&asset, linux, id)
+}
+
+fn platform_asset() -> zed::Result<(String, bool)> {
+    let (os, arch) = zed::current_platform();
+    let linux = match os {
+        zed::Os::Linux => true,
+        zed::Os::Windows => false,
+        zed::Os::Mac => {
+            return Err(
+                "godot-bridge: macOS is not supported. Linux and Windows only.".to_string(),
+            );
+        }
+    };
+    let os_name = if linux { "linux" } else { "windows" };
+    let triple = match arch {
+        zed::Architecture::X8664 => "x86_64",
+        zed::Architecture::Aarch64 => "aarch64",
+        zed::Architecture::X86 => {
+            return Err(format!(
+                "godot-bridge: no prebuilt binary for {os_name}/x86. {CARGO_LINE}"
+            ));
+        }
+    };
+    let ext = if linux { "" } else { ".exe" };
+    let version = env!("CARGO_PKG_VERSION");
+    Ok((
+        format!("godot-bridge-v{version}-{triple}-{os_name}{ext}"),
+        linux,
+    ))
+}
+
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn temp_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{count}")
+}
+
+fn absolute(asset: &str) -> zed::Result<String> {
+    std::env::current_dir()
+        .map(|dir| dir.join(asset).to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+}
+
+fn expected_hash(sums: &str, asset: &str) -> zed::Result<String> {
+    let mut matches = 0;
+    let mut digest = String::new();
+    for line in sums.lines() {
+        let line = line.trim_end();
+        let Some((candidate, rest)) = line.split_at_checked(64) else {
+            continue;
+        };
+        if !candidate.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Some(name) = rest.strip_prefix("  ").or_else(|| rest.strip_prefix(" *")) else {
+            continue;
+        };
+        if name == asset {
+            matches += 1;
+            digest = candidate.to_string();
+        }
+    }
+    match matches {
+        1 => Ok(digest),
+        0 => Err(format!(
+            "godot-bridge: {asset} is absent from this release's SHA256SUMS"
+        )),
+        _ => Err(format!(
+            "godot-bridge: SHA256SUMS lists {asset} more than once"
+        )),
+    }
+}
+
+fn failed(id: Option<&zed::LanguageServerId>, message: String) -> String {
+    if let Some(id) = id {
+        zed::set_language_server_installation_status(
+            id,
+            &zed::LanguageServerInstallationStatus::Failed(message.clone()),
+        );
+    }
+    format!("{message}. {CARGO_LINE}")
+}
+
+fn install(asset: &str, linux: bool, tag: &str, expected: &str, base: &str) -> zed::Result<String> {
+    let part = format!("{asset}.{}.part", temp_suffix());
+    let url = format!("{base}/{tag}/{asset}");
+    zed::download_file(&url, &part, zed::DownloadedFileType::Uncompressed).inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })?;
+    let bytes = std::fs::read(&part).map_err(|error| {
+        let _ = std::fs::remove_file(&part);
+        error.to_string()
+    })?;
+    let actual = sha256::sha256_hex(&bytes);
+    if !actual.eq_ignore_ascii_case(expected) {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!(
+            "godot-bridge: SHA-256 mismatch for {asset}: expected {expected}, got {actual}"
+        ));
+    }
+    if std::fs::rename(&part, asset).is_err() {
+        let matched = std::fs::read(asset)
+            .map(|current| sha256::sha256_hex(&current).eq_ignore_ascii_case(expected))
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&part);
+        if !matched {
+            return Err(format!(
+                "godot-bridge: could not replace {asset}: stop the language server and retry"
+            ));
+        }
+    }
+    if linux {
+        zed::make_file_executable(asset)?;
+    }
+    absolute(asset)
+}
+
+fn download(asset: &str, linux: bool, id: Option<&zed::LanguageServerId>) -> zed::Result<String> {
+    const BASE: &str = "https://github.com/PlayKigai/godot-bridge/releases/download";
+    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(id) = id {
+        zed::set_language_server_installation_status(
+            id,
+            &zed::LanguageServerInstallationStatus::CheckingForUpdate,
+        );
+    }
+    let sums_name = format!("SHA256SUMS.{}", temp_suffix());
+    let sums_url = format!("{BASE}/{tag}/SHA256SUMS");
+    let parsed = (|| -> zed::Result<String> {
+        zed::download_file(&sums_url, &sums_name, zed::DownloadedFileType::Uncompressed)?;
+        let text = std::fs::read_to_string(&sums_name).map_err(|error| error.to_string())?;
+        expected_hash(&text, asset)
+    })();
+    let _ = std::fs::remove_file(&sums_name);
+    let expected = match parsed {
+        Ok(expected) => expected,
+        Err(message) => return Err(failed(id, message)),
+    };
+    if let Some(id) = id {
+        zed::set_language_server_installation_status(
+            id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
+    }
+    match install(asset, linux, &tag, &expected, BASE) {
+        Ok(path) => {
+            if let Some(id) = id {
+                zed::set_language_server_installation_status(
+                    id,
+                    &zed::LanguageServerInstallationStatus::None,
+                );
+            }
+            Ok(path)
+        }
+        Err(message) => Err(failed(id, message)),
+    }
 }
 
 impl zed::Extension for GodotExtension {
@@ -37,11 +220,11 @@ impl zed::Extension for GodotExtension {
 
     fn language_server_command(
         &mut self,
-        _language_server_id: &zed::LanguageServerId,
+        language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> zed::Result<zed::Command> {
         Ok(zed::Command {
-            command: bridge_command(worktree)?,
+            command: bridge_command(worktree, Some(language_server_id))?,
             args: vec!["lsp".to_string()],
             env: shell_env(worktree),
         })
@@ -89,7 +272,7 @@ impl zed::Extension for GodotExtension {
         }
 
         Ok(zed::DebugAdapterBinary {
-            command: Some(bridge_command(worktree)?),
+            command: Some(bridge_command(worktree, None)?),
             arguments,
             envs: shell_env(worktree),
             cwd: Some(worktree.root_path()),

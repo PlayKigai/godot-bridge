@@ -9,11 +9,8 @@ The feature list is in the
 ## Install
 
 1. Godot 4 on PATH as `godot4` or `godot`, in `$GODOT`, or set `godot.godotPath`.
-2. `cargo install godot-bridge --locked`, and make sure `godot-bridge` is on
-   PATH (or set `godot.bridgePath`). This needs a Rust toolchain from
-   [rustup](https://rustup.rs). Prebuilt Linux and Windows binaries are
-   attached to each
-   [release](https://github.com/PlayKigai/godot-bridge/releases/latest).
+2. Open a `.gd` file; the extension offers to download the bridge. Or
+   `cargo install godot-bridge --locked`.
 3. Install this extension. If you did not get it from a registry, download
    the `.vsix` from the
    [latest release](https://github.com/PlayKigai/godot-bridge/releases/latest)
@@ -35,7 +32,7 @@ bridge. Only folders whose effective settings changed restart.
 
 | key | default | meaning |
 |---|---|---|
-| `godot.bridgePath` | `godot-bridge` on PATH | Bridge binary. User settings only. |
+| `godot.bridgePath` | `godot-bridge` on PATH | Bridge binary. User settings only. A downloaded bridge in storage takes precedence over PATH. |
 | `godot.godotPath` | `$GODOT`, else `godot4` or `godot` on PATH | Godot binary. User settings only. |
 | `godot.projectDir` | auto | Directory with `project.godot`, relative to the workspace root. User settings only. |
 | `godot.lspPort` | unset | Attach to an editor you started yourself instead of spawning one. User settings only. |
@@ -58,6 +55,7 @@ All in the Command Palette under "Godot":
 | Docs for Symbol | open the class reference for the symbol under the cursor |
 | Bridge Status | show running bridges in the Godot Bridge output channel |
 | Restart Language Server | restart the bridge language client |
+| Download bridge | download the matching prebuilt bridge (`Godot: Download bridge`) |
 
 Run, editor and docs output show in a terminal. Debugging uses the `godot`
 debug type: press F5 and pick Godot for run project, run current scene, and
@@ -70,6 +68,13 @@ attach; VS Code writes the `launch.json` for you.
 - The Godot Bridge output channel shows the language server log.
 - Godot's output: `$XDG_RUNTIME_DIR/godot-bridge/*.godot.log`, on Windows
   `%LOCALAPPDATA%\godot-bridge\*.godot.log`.
+- The download fetches from `github.com` (redirects to
+  `objects.githubusercontent.com`); allow both hosts. Node `fetch` ignores
+  `http.proxy`, so behind a corporate proxy the download can fail: use
+  `cargo install godot-bridge --locked` or a manual download instead.
+- The bridge lands in the extension's global storage as
+  `godot-bridge-vX.Y.Z-<arch>-<os>`. Delete the stored file or set
+  `godot.bridgePath` to go back to a PATH bridge.
 
 ## Development
 

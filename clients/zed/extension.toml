@@ -3,7 +3,7 @@ name = "Godot"
 version = "1.0.2"
 schema_version = 1
 authors = ["PlayKigai"]
-description = "Godot language support for Zed."
+description = "Godot language support for Zed. Downloads the matching prebuilt bridge on first use."
 repository = "https://github.com/PlayKigai/godot-bridge"
 
 [grammars.gdscript]
