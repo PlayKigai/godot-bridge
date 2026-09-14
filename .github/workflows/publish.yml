@@ -59,7 +59,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: VS Code Marketplace
         run: |
-          ./node_modules/.bin/vsce verify-pat
           ./node_modules/.bin/vsce publish --packagePath "godot-bridge-$TAG.vsix" --skip-duplicate
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
