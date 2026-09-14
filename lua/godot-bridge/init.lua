@@ -1,6 +1,6 @@
 local M = {}
 
-local VERSION = "1.0.2"
+local VERSION = "1.0.3"
 local CARGO_LINE = "cargo install godot-bridge --locked"
 local INSTALL_HINT = "run :GodotBridgeInstall or " .. CARGO_LINE
 local MACOS_MSG = "godot-bridge: macOS is not supported. Linux and Windows only."
