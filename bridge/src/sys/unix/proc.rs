@@ -25,6 +25,24 @@ pub fn process_start_ticks(pid: u32) -> io::Result<u64> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
 }
 
+/// Pid and name of the parent of `pid`; for a bridge owner that is the editor.
+pub fn parent_process(pid: u32) -> Option<(u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ppid = parse_parent_pid(&stat)?;
+    let name = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| (ppid, name.to_owned()))
+}
+
+fn parse_parent_pid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Whether the process recorded as `pid` with `ticks` is still that same
 /// process, so a reused pid is never mistaken for the original.
 pub fn pid_alive_with_ticks(pid: u32, ticks: u64) -> bool {
@@ -240,5 +258,17 @@ fn wait_for_process_to_disappear(pid: u32, ticks: u64, timeout: Duration) -> boo
             None => return false,
         };
         thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_pid_survives_spaces_and_parentheses_in_comm() {
+        assert_eq!(parse_parent_pid("1234 (my (odd) name) S 1 2 3 4"), Some(1));
+        assert_eq!(parse_parent_pid("1234 (x) R 5678"), Some(5678));
+        assert_eq!(parse_parent_pid("garbage without paren"), None);
     }
 }

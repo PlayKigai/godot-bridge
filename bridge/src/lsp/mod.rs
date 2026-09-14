@@ -618,6 +618,25 @@ fn fail_recovery_queue(output: &mut ClientWriter, queue: &mut RecoveryQueue) -> 
     Ok(())
 }
 
+fn lock_refusal_message(project: &Path, state_path: &Path) -> String {
+    let holder = holding_editor(state_path)
+        .map(|(pid, name)| format!(" ({name}, pid {pid})"))
+        .unwrap_or_default();
+    format!(
+        "Another editor window{holder} already serves {}. Godot serves one client at a time.",
+        project.display()
+    )
+}
+
+fn holding_editor(state_path: &Path) -> Option<(u32, String)> {
+    let state = read_state(state_path).ok()??;
+    let owner = state.owner_pid?;
+    if !crate::sys::pid_alive_with_ticks(owner, state.owner_start_ticks?) {
+        return None;
+    }
+    crate::sys::parent_process(owner)
+}
+
 pub fn run() -> Result<ExitCode> {
     let (event_sender, event_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
     let (bulk_sender, bulk_receiver) = mpsc::sync_channel(MERGED_EVENT_CAP);
@@ -737,15 +756,8 @@ pub fn run() -> Result<ExitCode> {
     let lock = match try_lock(&files.lock)? {
         Some(lock) => lock,
         None => {
-            send_error(
-                &mut output,
-                &initialize_id,
-                -32002,
-                &format!(
-                    "Another editor window already serves {}. Godot serves one client at a time.",
-                    project.display()
-                ),
-            )?;
+            let message = lock_refusal_message(&project, &files.state);
+            send_error(&mut output, &initialize_id, -32002, &message)?;
             return Ok(ExitCode::from(1));
         }
     };
@@ -1068,26 +1080,25 @@ fn forward_client_request<W: Write>(
     output: &mut W,
     proxy: &mut ProxyState,
     mut message: Value,
-) -> Result<Option<i64>> {
+) -> Result<()> {
     let client_id = message.get("id").cloned().unwrap_or(Value::Null);
-    let is_shutdown = message.get("method").and_then(Value::as_str) == Some("shutdown");
     let bridge_id = proxy.next_id;
     proxy.next_id += 1;
     message["id"] = crate::json!(bridge_id);
     let body = crate::json::to_vec(&message);
     if body.len() > GODOT_WRITE_CAP {
         send_error(output, &client_id, -32803, "message too large for Godot")?;
-        return Ok(None);
+        return Ok(());
     }
-    if proxy.pending.len() >= IN_FLIGHT_CAP && !is_shutdown {
+    if proxy.pending.len() >= IN_FLIGHT_CAP {
         let queued_size = body.len();
         if proxy.queued_bytes.saturating_add(queued_size) > QUEUE_BYTES_CAP {
             send_error(output, &client_id, -32803, "RequestFailed")?;
-            return Ok(None);
+            return Ok(());
         }
         proxy.queued_bytes += queued_size;
         proxy.queued.push_back((message, client_id, queued_size));
-        return Ok(None);
+        return Ok(());
     }
     proxy.pending.insert(
         bridge_id,
@@ -1101,7 +1112,7 @@ fn forward_client_request<W: Write>(
         proxy.pending.remove(&bridge_id);
         return Err(error);
     }
-    Ok(is_shutdown.then_some(bridge_id))
+    Ok(())
 }
 
 fn route_client_response(

@@ -170,7 +170,7 @@ toward Godot, the rest queued in order. Forwarded `didOpen`/`didChange`
 versions are rewritten from a per-URI counter. `$/cancelRequest` for a queued
 request drops it with `-32800`.
 
-Shutdown: forward `shutdown`, wait at most 5 s. On `exit` or stdin EOF:
+Shutdown: answer `shutdown` locally with `result: null`, never forward it to Godot, then tear down as below. On `shutdown`, `exit` or stdin EOF:
 close TCP, kill the editor unless `unmanaged`, remove socket and state,
 release the lock, exit 0.
 

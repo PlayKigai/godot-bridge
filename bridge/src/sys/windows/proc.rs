@@ -86,6 +86,43 @@ pub fn pid_alive_with_ticks(pid: u32, ticks: u64) -> bool {
     process_start_ticks(pid).ok() == Some(ticks)
 }
 
+pub fn parent_process(pid: u32) -> Option<(u32, String)> {
+    let snapshot = take_snapshot(TH32CS_SNAPPROCESS).ok()?;
+    let ppid = find_process_entry(&snapshot, pid)?.th32ParentProcessID;
+    if ppid == 0 {
+        return None;
+    }
+    let parent = find_process_entry(&snapshot, ppid)?;
+    let end = parent
+        .szExeFile
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(parent.szExeFile.len());
+    let mut name = String::from_utf16_lossy(&parent.szExeFile[..end]);
+    if name.len() > 4
+        && name.is_char_boundary(name.len() - 4)
+        && name[name.len() - 4..].eq_ignore_ascii_case(".exe")
+    {
+        name.truncate(name.len() - 4);
+    }
+    (!name.is_empty()).then_some((ppid, name))
+}
+
+fn find_process_entry(snapshot: &OwnedHandle, pid: u32) -> Option<PROCESSENTRY32W> {
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    while more != 0 {
+        if entry.th32ProcessID == pid {
+            return Some(entry);
+        }
+        more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+    }
+    None
+}
+
 /// Whether `pid` owns the listening socket on `port`, so the bridge never
 /// talks to a stranger that grabbed the port first.
 pub fn port_listener_belongs_to_process(pid: u32, port: u16) -> io::Result<bool> {

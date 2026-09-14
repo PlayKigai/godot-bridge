@@ -547,46 +547,13 @@ fn exit_session(session: &mut Session, code: u8) -> Result<ExitCode> {
 }
 
 fn shutdown_session(session: &mut Session, message: Value) -> Result<ExitCode> {
-    let bridge_id = match forward_client_request(
-        &mut session.editor,
-        &mut session.output,
-        &mut session.proxy,
-        message,
-    ) {
-        Ok(Some(bridge_id)) => bridge_id,
-        Ok(None) => return exit_session(session, 0),
-        Err(error) => {
-            crate::error!("cannot forward shutdown: {error}");
-            return exit_session(session, 1);
-        }
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match receive_godot_frame(
-            &session.events,
-            &mut session.godot,
-            &mut session.deferred,
-            Some(deadline),
-        )? {
-            Received::Frame(body) => {
-                let is_response = parse_message(&body)
-                    .ok()
-                    .and_then(|message| message.get("id").and_then(Value::as_i64))
-                    == Some(bridge_id);
-                forward_server_message(
-                    &mut session.editor.connection.writer,
-                    session.editor.lsp_port,
-                    &mut session.output,
-                    &mut session.proxy,
-                    &body,
-                )?;
-                if is_response {
-                    return exit_session(session, 0);
-                }
-            }
-            Received::Closed | Received::TimedOut => return exit_session(session, 1),
-        }
+    if let Some(id) = message.get("id") {
+        send_client(
+            &mut session.output,
+            &crate::json!({"jsonrpc":"2.0","id":id,"result":null}),
+        )?;
     }
+    exit_session(session, 0)
 }
 
 pub(super) fn forward_initialize(
