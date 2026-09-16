@@ -13,6 +13,10 @@ pub enum RootError {
     UncPath(PathBuf),
     ProjectDirInvalid(PathBuf),
     FileOutsideRoot(PathBuf),
+    FileOutsideProjectDir {
+        file: PathBuf,
+        dir: PathBuf,
+    },
     NoProject(PathBuf),
     SeveralProjects {
         root: PathBuf,
@@ -40,6 +44,14 @@ impl fmt::Display for RootError {
             }
             Self::FileOutsideRoot(path) => {
                 write!(f, "{} is outside the worktree", path.display())
+            }
+            Self::FileOutsideProjectDir { file, dir } => {
+                write!(
+                    f,
+                    "{} is outside project_dir {}",
+                    file.display(),
+                    dir.display()
+                )
             }
             Self::NoProject(root) => write!(
                 f,
@@ -243,6 +255,34 @@ pub fn find_project_dir(
     }
 }
 
+/// Resolve the project that serves `file` together with the canonical file.
+/// A configured `project_dir` wins over the file's own project and a relative
+/// file is joined to it, exactly as the owner resolves the project.
+pub fn resolve_project_and_file(
+    root: &Path,
+    file: Option<&Path>,
+    configured: Option<&Path>,
+) -> Result<(PathBuf, Option<PathBuf>), RootError> {
+    let root = canonicalize(root)?;
+    if let Some(configured) = configured {
+        let project = find_project_dir(&root, None, Some(configured))?;
+        let Some(file) = file else {
+            return Ok((project, None));
+        };
+        let file = if file.is_absolute() {
+            canonical_or_normalized(file)
+        } else {
+            canonical_or_normalized(&project.join(file))
+        };
+        if !file.starts_with(&project) {
+            return Err(RootError::FileOutsideProjectDir { file, dir: project });
+        }
+        return Ok((project, Some(file)));
+    }
+    let project = find_project_dir(&root, file, None)?;
+    Ok((project, file.map(canonical_or_normalized)))
+}
+
 pub fn canonical_path_to_uri(path: &Path) -> String {
     crate::file_uri::path_to_uri(&canonical_or_normalized(path))
 }
@@ -337,6 +377,87 @@ mod tests {
         std::fs::write(other.join("main.gd"), "").unwrap();
         let error = find_project_dir(&root, Some(&other.join("main.gd")), None).unwrap_err();
         assert!(matches!(error, RootError::FileOutsideRoot(_)), "{error}");
+    }
+
+    #[test]
+    fn configured_project_dir_wins_over_a_nested_file() {
+        let base = scratch_dir("configured");
+        let root = base.join("root");
+        let nested = root.join("nested");
+        let game = root.join("game");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(nested.join("project.godot"), "").unwrap();
+        std::fs::write(game.join("project.godot"), "").unwrap();
+        std::fs::write(nested.join("main.gd"), "").unwrap();
+        let error = resolve_project_and_file(
+            &root,
+            Some(&nested.join("main.gd")),
+            Some(Path::new("game")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} is outside project_dir {}",
+                canonicalize(&nested.join("main.gd")).unwrap().display(),
+                canonicalize(&game).unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn absolute_file_inside_the_configured_project_resolves() {
+        let base = scratch_dir("inside-configured");
+        let root = base.join("root");
+        let game = root.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("project.godot"), "").unwrap();
+        std::fs::write(game.join("main.gd"), "").unwrap();
+        let (project, file) =
+            resolve_project_and_file(&root, Some(&game.join("main.gd")), Some(Path::new("game")))
+                .unwrap();
+        assert_eq!(project, canonicalize(&game).unwrap());
+        assert_eq!(file.unwrap(), canonicalize(&game.join("main.gd")).unwrap());
+    }
+
+    #[test]
+    fn relative_file_is_joined_to_the_configured_project() {
+        let base = scratch_dir("joined");
+        let root = base.join("root");
+        let game = root.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("project.godot"), "").unwrap();
+        std::fs::write(game.join("main.gd"), "").unwrap();
+        let (project, file) =
+            resolve_project_and_file(&root, Some(Path::new("main.gd")), Some(Path::new("game")))
+                .unwrap();
+        assert_eq!(project, canonicalize(&game).unwrap());
+        assert_eq!(file.unwrap(), canonicalize(&game.join("main.gd")).unwrap());
+    }
+
+    #[test]
+    fn file_outside_the_configured_project_is_refused() {
+        let base = scratch_dir("outside-project");
+        let root = base.join("root");
+        let game = root.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("project.godot"), "").unwrap();
+        std::fs::write(root.join("outside.gd"), "").unwrap();
+        let error = resolve_project_and_file(
+            &root,
+            Some(Path::new("../outside.gd")),
+            Some(Path::new("game")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} is outside project_dir {}",
+                canonicalize(&root.join("outside.gd")).unwrap().display(),
+                canonicalize(&game).unwrap().display()
+            )
+        );
     }
 
     #[cfg(unix)]

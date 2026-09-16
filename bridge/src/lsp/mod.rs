@@ -853,21 +853,6 @@ pub fn run() -> Result<ExitCode> {
         }
     }
     stale_cleanup(&files, &project);
-    let binary = match resolve_godot(settings.godot_path.as_deref().map(Path::new)) {
-        Ok(binary) => binary,
-        Err(error) => {
-            cleanup_files(&files);
-            drop(lock);
-            send_error(&mut output, &initialize_id, -32002, &error)?;
-            return Ok(ExitCode::from(1));
-        }
-    };
-    if let Err(error) = check_version(&binary) {
-        cleanup_files(&files);
-        drop(lock);
-        send_error(&mut output, &initialize_id, -32002, &error)?;
-        return Ok(ExitCode::from(1));
-    }
     let state = Arc::new(RwLock::new(new_state(&project, Mode::Headless)));
     let socket = serve_owner_socket(&files, Arc::clone(&state), event_sender.clone())?;
     let mut runtime = Runtime {
@@ -878,6 +863,19 @@ pub fn run() -> Result<ExitCode> {
         mode: Mode::Headless,
     };
     publish(&runtime)?;
+    let binary = match resolve_godot(settings.godot_path.as_deref().map(Path::new)) {
+        Ok(binary) => binary,
+        Err(error) => {
+            cleanup_runtime(&mut runtime, None);
+            send_error(&mut output, &initialize_id, -32002, &error)?;
+            return Ok(ExitCode::from(1));
+        }
+    };
+    if let Err(error) = check_version(&binary) {
+        cleanup_runtime(&mut runtime, None);
+        send_error(&mut output, &initialize_id, -32002, &error)?;
+        return Ok(ExitCode::from(1));
+    }
     let deadline = startup_deadline(settings.startup_timeout_s);
     let mut editor = None;
     let mut startup_error: Option<StartupError> = None;

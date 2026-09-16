@@ -289,14 +289,16 @@ impl zed::Extension for GodotExtension {
         config: zed::DebugConfig,
     ) -> zed::Result<zed::DebugScenario, String> {
         let adapter_config = match config.request {
-            zed::DebugRequest::Launch(launch) => zed::serde_json::json!({
-                "request": "launch",
-                "scene": if launch.program.ends_with(".tscn") {
-                    launch.program
-                } else {
-                    "main".to_string()
-                },
-            }),
+            zed::DebugRequest::Launch(launch) => {
+                if !launch.program.ends_with(".gd") && !launch.program.ends_with(".tscn") {
+                    return Err("unsupported program: expected a .gd or .tscn".to_string());
+                }
+                zed::serde_json::json!({
+                    "request": "launch",
+                    "scene": "current",
+                    "file": launch.program,
+                })
+            }
             zed::DebugRequest::Attach(_) => zed::serde_json::json!({
                 "request": "attach",
             }),
@@ -319,8 +321,11 @@ impl zed::Extension for GodotExtension {
         resolved_label: String,
         debug_adapter_name: String,
     ) -> Option<zed::DebugScenario> {
+        let command = build_task.command.as_str();
+        let bridge_command =
+            command.ends_with("godot-bridge") || command.ends_with("godot-bridge.exe");
         if debug_adapter_name != "godot"
-            || build_task.command != "godot-bridge"
+            || !bridge_command
             || build_task.args.first().map(String::as_str) != Some("run")
         {
             return None;

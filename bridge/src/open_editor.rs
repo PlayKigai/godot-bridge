@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::godot_bin::{check_version, resolve_godot};
 use crate::process::{kill_recorded, pick_free_port, port_listener_belongs_to_process, spawn_gui};
-use crate::root::{cwd_root, find_project_dir};
+use crate::root::{cwd_root, resolve_project_and_file};
 use crate::settings_file::{self, Settings};
 use crate::state::{
     detached_gui_state, gui_process_alive, matches_project, read_state, socket_request, try_lock,
@@ -26,7 +26,7 @@ enum PortReadiness {
 pub fn run(file: &Path) -> Result<ExitCode> {
     let root = cwd_root()?;
     let settings = settings_file::load_cli(&root)?;
-    let project = find_project_dir(
+    let (project, _) = resolve_project_and_file(
         &root,
         Some(file),
         settings.project_dir.as_deref().map(Path::new),
@@ -34,7 +34,9 @@ pub fn run(file: &Path) -> Result<ExitCode> {
     let files = ProjectFiles::new(&project)?;
 
     if let Some(response) = try_handoff_with_timeout(&files, &project, SOCKET_TIMEOUT) {
-        return print_response(response);
+        if handoff_settled(&response) {
+            return print_response(response);
+        }
     }
 
     let lock = match try_lock(&files.lock)? {
@@ -48,16 +50,35 @@ pub fn run(file: &Path) -> Result<ExitCode> {
 
 fn retry_handoff(files: &ProjectFiles, project: &Path) -> Result<ExitCode> {
     let deadline = Instant::now() + SOCKET_TIMEOUT;
+    let mut last_reject = None;
     loop {
         if let Some(response) = try_handoff_with_timeout(files, project, Duration::from_millis(250))
         {
-            return print_response(response);
+            if handoff_settled(&response) {
+                return print_response(response);
+            }
+            last_reject = Some(response);
         }
         if Instant::now() >= deadline {
-            crate::bail!("An owner exists but does not answer");
+            return match last_reject {
+                Some(response) => print_response(response),
+                None => Err(crate::error::Error::new(
+                    "An owner exists but does not answer",
+                )),
+            };
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn handoff_settled(response: &Value) -> bool {
+    if response.get("accepted").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    matches!(
+        response.get("reason").and_then(Value::as_str),
+        Some("project mismatch") | Some("editor is unmanaged")
+    )
 }
 
 fn try_handoff_with_timeout(

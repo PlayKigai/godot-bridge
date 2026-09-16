@@ -339,7 +339,19 @@ function activeSceneOrScript(): string | undefined {
 }
 
 function folderOf(file: string | undefined): vscode.WorkspaceFolder | undefined {
-  return file ? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file)) : vscode.workspace.workspaceFolders?.[0];
+  return file ? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file)) : undefined;
+}
+
+function activeGodotFileIn(folder: vscode.WorkspaceFolder | undefined): string | undefined {
+  const file = activeSceneOrScript();
+  if (!file) {
+    return undefined;
+  }
+  const owner = folderOf(file);
+  if (folder && owner?.uri.toString() !== folder.uri.toString()) {
+    return undefined;
+  }
+  return file;
 }
 
 function runBridgeTask(name: string, args: string[], file: string | undefined): void {
@@ -393,12 +405,32 @@ export function activate(context: vscode.ExtensionContext): void {
         void restartClients(foldersWithChangedSettings, output);
       }
     }),
+    vscode.debug.registerDebugConfigurationProvider("godot", {
+      async resolveDebugConfiguration(folder, config) {
+        const target = folder ?? folderOf(activeSceneOrScript());
+        if (target) {
+          await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: "Godot: starting…" },
+            () => serialize(() => startClient(target, output)),
+          );
+          if (!clients.has(target.uri.toString())) {
+            return undefined;
+          }
+        }
+        const file = activeGodotFileIn(target);
+        if (config.scene === "current" && !file) {
+          vscode.window.showErrorMessage("Godot: open a .gd or .tscn file first.");
+          return undefined;
+        }
+        return { ...config, file };
+      },
+    }),
     vscode.debug.registerDebugAdapterDescriptorFactory("godot", {
       createDebugAdapterDescriptor(session) {
-        const file = activeSceneOrScript();
+        const file = typeof session.configuration.file === "string" ? session.configuration.file : undefined;
         const folder = session.workspaceFolder ?? folderOf(file);
         return new vscode.DebugAdapterExecutable(bridgePath(), file ? ["dap", "--file", file] : ["dap"], {
-          cwd: folder?.uri.fsPath,
+          cwd: folder?.uri.fsPath ?? (file ? path.dirname(file) : undefined),
           env: bridgeEnv(folder?.uri),
         });
       },

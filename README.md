@@ -104,7 +104,8 @@ worktree.
 Tasks appear in the task picker when a GDScript file is active:
 `godot: run project`, `godot: run current scene`, `godot: open editor`,
 `godot: docs for symbol`, `godot: bridge status`. The debug picker offers
-launch main scene, launch current scene and attach.
+launch main scene and launch current scene; `docs/sample/.zed/debug.json`
+shows attach.
 
 ### VS Code
 
@@ -128,7 +129,8 @@ go back to a PATH bridge. Other settings are `godot.godotPath`,
 `godot.projectDir` and the rest of the Settings table in camelCase.
 Commands are in the palette under `Godot:`. Press F5 and pick Godot to
 debug; run project, run current scene and attach are offered and VS Code
-writes the `launch.json`.
+writes the `launch.json`. Starting a debug session also starts the language
+server when it is not running yet.
 
 macOS is not supported. The extension loads, shows an error and stays idle.
 
@@ -141,8 +143,8 @@ Neovim 0.10 or newer. With lazy.nvim:
 ```
 
 Open a `.gd` file. Run `:GodotBridgeInstall` to download the bridge.
-Commands: `:GodotRun`, `:GodotRunScene`,
-`:GodotEditor`, `:GodotDoc`, `:GodotStatus`, `:GodotRestart`.
+Commands: `:GodotRun`, `:GodotRunScene`, `:GodotEditor`, `:GodotDebug`,
+`:GodotDoc`, `:GodotStatus`, `:GodotRestart`.
 
 Bridge path and other settings:
 
@@ -157,10 +159,18 @@ A path setting wins; otherwise the file installed by `:GodotBridgeInstall`
 under `<stdpath("data")>/godot-bridge` is used. To go back to a PATH bridge,
 delete the stored file or set `bridge_path` to a path.
 
-Debugging needs nvim-dap. After setup call
-`require("godot-bridge").dap()`; `:DapContinue` then offers run project,
-run current scene and attach. Highlighting comes from nvim-treesitter's
+Debugging needs nvim-dap; `setup()` registers the adapter when it is
+installed. `:DapContinue` or `:GodotDebug` offers run project, run current
+scene and attach. Run current scene uses the current buffer, else the last
+`.gd`/`.tscn` buffer seen. Highlighting comes from nvim-treesitter's
 `gdscript` parser. `:help godot-bridge` has the rest.
+
+## Debugging
+
+Launch starts the game and debugs it. Attach connects to a game started
+from the Godot editor window: run open editor, press Play there. With
+`lsp_port` set, attach uses your own editor instead. Games started by the
+run commands are not attachable.
 
 ## Settings
 

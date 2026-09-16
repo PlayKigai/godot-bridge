@@ -77,6 +77,7 @@ COMMANDS                                                  *godot-bridge-commands
 :GodotRun                    Run the project.
 :GodotRunScene               Run the scene of the current file.
 :GodotEditor                 Swap headless Godot for the GUI editor.
+:GodotDebug                  Start a debug session, see |godot-bridge-dap|.
 :GodotDoc [symbol]           Open class reference. Defaults to the word under
                              the cursor (dots included).
 :GodotStatus                 Print bridge status.
@@ -104,18 +105,25 @@ to a path.
 ==============================================================================
 DAP                                                   *godot-bridge-dap*
 
-Requires nvim-dap. Call after `require("godot-bridge").setup(...)`:
->
-    require("godot-bridge").dap()
-<
+Requires nvim-dap. `setup()` registers the adapter when nvim-dap is
+installed; `require("godot-bridge").dap()` does the same by hand. Both are
+idempotent and merge with configurations you defined yourself by name.
+`:GodotDebug` starts the picker.
+
 Registers the `godot` adapter and the `gdscript` configurations:
 >
     Godot: run project        launch, scene "main"
     Godot: run current scene  launch, scene "current"
     Godot: attach             attach
 <
-The adapter passes the current buffer path as `--file`, needed for
-`scene: "current"`. The `lsp` for the same project must already be running.
+The adapter passes `--file` from the configuration's `file`, else the
+current `.gd`/`.tscn` buffer, else the last such buffer seen. `scene:
+"current"` needs one. Open a `.gd` of the project so its language server is
+running first; the debug session waits for that owner, it does not start one.
+nvim-dap's `initialize` timeout is sized from `startup_timeout_s`. One Godot session at a time; a second start is refused.
+Attach only works against a game started from the Godot editor window
+(`:GodotEditor`, then Play, or your own editor via `lsp_port`). Games started
+by `:GodotRun` are not attachable; use launch to debug them.
 
 ==============================================================================
 vim:tw=78:ts=8:noet:ft=help:norl:

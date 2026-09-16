@@ -16,15 +16,19 @@ use crate::framing::{
     connect_with_reader, parse_json_object, spawn_frame_reader, write_frame, write_json,
     Connection, FrameDecoder, FrameError, ReadEvent,
 };
-use crate::root::{cwd_root, find_project_dir};
+use crate::root::cwd_root;
 use crate::scene::resolve_scene;
 use crate::settings_file::{self, Settings};
-use crate::state::{socket_request, try_lock, LockGuard, ProjectFiles};
+use crate::state::{socket_request, try_lock, LockGuard, Mode, ProjectFiles};
 
 const FRAME_CAP: usize = 8 * 1024 * 1024;
 const BUFFER_CAP: usize = 8 * 1024 * 1024;
+const GODOT_WRITE_CAP: usize = 4 * 1024 * 1024;
 const SOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PHASE_ONE_GRACE: Duration = Duration::from_secs(10);
+const CONSECUTIVE_ERROR_GRACE: Duration = Duration::from_secs(10);
+const ATTACH_PRECONDITION: &str = "attach needs a game started from the Godot editor window: run open-editor, then press Play there. Set lsp_port to use your own editor. Games started by run are not attachable; use launch to debug them.";
 
 struct Prepared {
     connection: Connection,
@@ -35,6 +39,7 @@ struct Prepared {
 struct DapContext {
     project: PathBuf,
     file: Option<PathBuf>,
+    mode: Mode,
     exclude: Exclude,
 }
 
@@ -248,17 +253,28 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
         DapReadEvent::Client,
     )?;
     let mut input = DapInput::new(receiver);
+    let mut output = ClientOutput::new(std::io::stdout());
     let initialize = loop {
         match input.recv_frame()? {
             DapFrame::Body(DapSide::Client, body) => {
-                let message = match parse_message(&body) {
-                    Ok(message) => message,
-                    Err(_) => return Ok(ExitCode::from(1)),
+                let Ok(message) = parse_message(&body) else {
+                    return Ok(ExitCode::from(1));
                 };
-                if message.get("type").and_then(Value::as_str) == Some("request")
+                let is_request = message.get("type").and_then(Value::as_str) == Some("request");
+                if is_request
                     && message.get("command").and_then(Value::as_str) == Some("initialize")
                 {
                     break message;
+                }
+                if is_request {
+                    output.failure(
+                        message.get("seq").cloned().unwrap_or(Value::Null),
+                        message
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        "first request must be initialize",
+                    )?;
                 }
                 return Ok(ExitCode::from(1));
             }
@@ -269,7 +285,6 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
         }
     };
 
-    let mut output = ClientOutput::new(std::io::stdout());
     let mut buffer = ClientBuffer::new();
     let mut early_frames = VecDeque::new();
     let mut early_bytes = 0;
@@ -285,16 +300,29 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
             let _ = prepared_sender.send(DapReadEvent::Prepared(result));
         })?;
     let prepared = loop {
-        match input.recv_frame()? {
+        let frame = match input.recv_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                cancel.store(true, Ordering::Release);
+                drop(input);
+                let _ = worker.join();
+                return Err(error.into());
+            }
+        };
+        match frame {
             DapFrame::Body(DapSide::Client, body) => {
                 if buffer.push(&body).is_err() {
                     cancel.store(true, Ordering::Release);
+                    drop(input);
+                    let _ = worker.join();
                     return Ok(ExitCode::from(1));
                 }
             }
             DapFrame::Body(side, body) => {
                 if body.len() > BUFFER_CAP {
                     cancel.store(true, Ordering::Release);
+                    drop(input);
+                    let _ = worker.join();
                     return Ok(ExitCode::from(1));
                 }
                 early_bytes += body.len();
@@ -312,6 +340,8 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
                 early_frames.push_back(DapFrame::End(side));
                 if matches!(side, DapSide::Client) {
                     cancel.store(true, Ordering::Release);
+                    drop(input);
+                    let _ = worker.join();
                     return Ok(ExitCode::from(1));
                 }
             }
@@ -321,11 +351,14 @@ pub fn run(file: Option<PathBuf>) -> crate::error::Result<ExitCode> {
     let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(message) => {
+            cancel.store(true, Ordering::Release);
             output.failure(
                 initialize.get("seq").cloned().unwrap_or(Value::Null),
                 "initialize",
                 &message,
             )?;
+            drop(input);
+            let _ = worker.join();
             return Ok(ExitCode::from(1));
         }
     };
@@ -355,24 +388,39 @@ fn prepare(
     }
     let root = cwd_root().map_err(|error| error.to_string())?;
     let settings = settings_file::load_cli(&root)?;
-    let project = find_project_dir(&root, file, settings.project_dir.as_deref().map(Path::new))
-        .map_err(|error| error.to_string())?;
+    let (project, file) = crate::root::resolve_project_and_file(
+        &root,
+        file,
+        settings.project_dir.as_deref().map(Path::new),
+    )
+    .map_err(|error| error.to_string())?;
     let files = ProjectFiles::new(&project).map_err(|error| error.to_string())?;
+
+    let (dap_port, mode) = if settings.lsp_port.is_some() {
+        (settings.dap_port, Mode::Unmanaged)
+    } else {
+        discover_owner(&files, &project, &settings, cancel)?
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Err("DAP startup cancelled".to_owned());
+    }
     let lock = match try_lock(&files.dap_lock).map_err(|error| error.to_string())? {
         Some(guard) => guard,
         None => {
             return Err(format!(
-                "A debug session for {} is already running",
+                "A debug session for {} is already running (or an editor hand-off is in progress)",
                 project.display()
             ));
         }
     };
-
-    let stream = if settings.lsp_port.is_some() {
-        connect_dap(settings.dap_port)?
-    } else {
-        discover_owner(&files, &project, &settings, cancel)?
+    let (dap_port, mode) = match settings.lsp_port {
+        Some(_) => (dap_port, mode),
+        None => refresh_owner_status(&files, &project)?,
     };
+    if cancel.load(Ordering::Acquire) {
+        return Err("DAP startup cancelled".to_owned());
+    }
+    let stream = connect_dap(dap_port)?;
     let connection = connect_with_reader(
         stream,
         "godot-bridge-dap-reader",
@@ -385,7 +433,8 @@ fn prepare(
         lock,
         context: DapContext {
             project,
-            file: file.map(crate::root::canonical_or_normalized),
+            file,
+            mode,
             exclude: Exclude::new(&settings.exclude),
         },
     })
@@ -404,21 +453,145 @@ fn connect_dap(port: u16) -> std::result::Result<TcpStream, String> {
     }
 }
 
+fn status_request(project: &Path) -> Value {
+    crate::json!({"cmd": "status", "project": (project.to_string_lossy().into_owned())})
+}
+
+fn no_owner_message(project: &Path) -> String {
+    format!(
+        "No Godot language server runs for {}. Open a .gd file of the project in your editor first.",
+        project.display()
+    )
+}
+
+fn stale_owner_message(project: &Path) -> String {
+    format!(
+        "A previous language server for {} did not exit cleanly; restart it (:GodotRestart / Godot: Restart Language Server)",
+        project.display()
+    )
+}
+
+fn owner_exited_message(project: &Path) -> String {
+    format!(
+        "Godot language server for {} exited while starting; check :GodotLog / the Output panel",
+        project.display()
+    )
+}
+
+fn mismatch_message(project: &Path) -> String {
+    format!(
+        "Godot language server for {} answered \"project mismatch\"; restart it (:GodotRestart / Godot: Restart Language Server)",
+        project.display()
+    )
+}
+
+fn unexpected_reply_message(project: &Path) -> String {
+    format!(
+        "unexpected owner reply for {}; restart it (:GodotRestart / Godot: Restart Language Server)",
+        project.display()
+    )
+}
+
+fn owner_error_message(error: &io::Error, project: &Path) -> Option<String> {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => Some(format!(
+            "cannot talk to the Godot language server for {}: {error}",
+            project.display()
+        )),
+        io::ErrorKind::Other => Some(unexpected_reply_message(project)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OwnerStatus {
+    Ready { port: u16, mode: Mode },
+    Busy,
+    Mismatch,
+    Unexpected,
+}
+
+fn owner_status(reply: &Value) -> OwnerStatus {
+    if reply.get("error").and_then(Value::as_str) == Some("project mismatch") {
+        return OwnerStatus::Mismatch;
+    }
+    match reply.get("status").and_then(Value::as_str) {
+        Some("ready") => {
+            let Some(port) = reply
+                .get("dap_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+            else {
+                return OwnerStatus::Unexpected;
+            };
+            OwnerStatus::Ready {
+                port,
+                mode: match reply.get("mode").and_then(Value::as_str) {
+                    Some("headless") => Mode::Headless,
+                    Some("gui") => Mode::Gui,
+                    _ => Mode::Unmanaged,
+                },
+            }
+        }
+        Some("starting") | Some("recovering") => OwnerStatus::Busy,
+        _ => OwnerStatus::Unexpected,
+    }
+}
+
 fn discover_owner(
     files: &ProjectFiles,
     project: &Path,
     settings: &Settings,
     cancel: &AtomicBool,
-) -> std::result::Result<TcpStream, String> {
-    let no_owner = format!(
-        "No Godot language server runs for {}. Open a .gd file of the project in your editor first.",
-        project.display()
-    );
-    let deadline = (settings.startup_timeout_s != 0)
-        .then(|| Instant::now() + Duration::from_secs(u64::from(settings.startup_timeout_s)));
+) -> std::result::Result<(u16, Mode), String> {
+    let request = status_request(project);
+    let phase_one_deadline = Instant::now() + PHASE_ONE_GRACE;
+    let mut saw_connection_refused = false;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err("DAP startup cancelled".to_owned());
+        }
+        let remaining = phase_one_deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return Err(if saw_connection_refused {
+                stale_owner_message(project)
+            } else {
+                no_owner_message(project)
+            });
+        }
+        match socket_request(&files.sock, &request, remaining.min(SOCKET_REQUEST_TIMEOUT)) {
+            Ok(reply) => match owner_status(&reply) {
+                OwnerStatus::Ready { port, mode } => return Ok((port, mode)),
+                OwnerStatus::Busy => break,
+                OwnerStatus::Mismatch => return Err(mismatch_message(project)),
+                OwnerStatus::Unexpected => return Err(unexpected_reply_message(project)),
+            },
+            Err(error) => {
+                if let Some(message) = owner_error_message(&error, project) {
+                    return Err(message);
+                }
+                if error.kind() == io::ErrorKind::ConnectionRefused {
+                    saw_connection_refused = true;
+                }
+                thread::sleep(remaining.min(POLL_INTERVAL));
+            }
+        }
+    }
+
+    let deadline = (settings.startup_timeout_s != 0)
+        .then(|| Instant::now() + Duration::from_secs(u64::from(settings.startup_timeout_s)));
+    let mut consecutive_errors: Option<Instant> = None;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("DAP startup cancelled".to_owned());
+        }
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(format!(
+                "Godot did not become ready within {}s",
+                settings.startup_timeout_s
+            ));
         }
         let timeout = deadline.map_or(SOCKET_REQUEST_TIMEOUT, |limit| {
             limit
@@ -426,44 +599,56 @@ fn discover_owner(
                 .unwrap_or(Duration::ZERO)
                 .min(SOCKET_REQUEST_TIMEOUT)
         });
-        if timeout.is_zero() {
-            return Err(format!(
-                "Godot did not become ready within {}s",
-                settings.startup_timeout_s
-            ));
-        }
-        let status = socket_request(
-            &files.sock,
-            &crate::json!({"cmd": "status", "project": (project.to_string_lossy().into_owned())}),
-            timeout,
-        )
-        .map_err(|_| no_owner.clone())?;
-        match status.get("status").and_then(Value::as_str) {
-            Some("ready") => {
-                let port = status
-                    .get("dap_port")
-                    .and_then(Value::as_u64)
-                    .and_then(|port| u16::try_from(port).ok())
-                    .ok_or_else(|| "Godot owner has no DAP port".to_owned())?;
-                return connect_dap(port);
-            }
-            Some("starting") | Some("recovering") => {
-                if deadline.is_some_and(|limit| Instant::now() >= limit) {
-                    return Err(format!(
-                        "Godot did not become ready within {}s",
-                        settings.startup_timeout_s
-                    ));
+        let sleep_for = deadline.map_or(POLL_INTERVAL, |limit| {
+            limit
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+                .min(POLL_INTERVAL)
+        });
+        match socket_request(&files.sock, &request, timeout) {
+            Ok(reply) => match owner_status(&reply) {
+                OwnerStatus::Ready { port, mode } => return Ok((port, mode)),
+                OwnerStatus::Busy => {
+                    consecutive_errors = None;
+                    thread::sleep(sleep_for);
                 }
-                let sleep_for = deadline.map_or(POLL_INTERVAL, |limit| {
-                    limit
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or(Duration::ZERO)
-                        .min(POLL_INTERVAL)
-                });
+                OwnerStatus::Mismatch => return Err(mismatch_message(project)),
+                OwnerStatus::Unexpected => return Err(unexpected_reply_message(project)),
+            },
+            Err(error) => {
+                if let Some(message) = owner_error_message(&error, project) {
+                    return Err(message);
+                }
+                let since = *consecutive_errors.get_or_insert_with(Instant::now);
+                if since.elapsed() >= CONSECUTIVE_ERROR_GRACE {
+                    return Err(owner_exited_message(project));
+                }
                 thread::sleep(sleep_for);
             }
-            _ => return Err(no_owner),
         }
+    }
+}
+
+fn refresh_owner_status(
+    files: &ProjectFiles,
+    project: &Path,
+) -> std::result::Result<(u16, Mode), String> {
+    let reply = socket_request(
+        &files.sock,
+        &status_request(project),
+        SOCKET_REQUEST_TIMEOUT,
+    )
+    .map_err(|error| {
+        owner_error_message(&error, project).unwrap_or_else(|| owner_exited_message(project))
+    })?;
+    match owner_status(&reply) {
+        OwnerStatus::Ready { port, mode } => Ok((port, mode)),
+        OwnerStatus::Busy => Err(format!(
+            "Godot language server for {} is restarting; retry in a moment",
+            project.display()
+        )),
+        OwnerStatus::Mismatch => Err(mismatch_message(project)),
+        OwnerStatus::Unexpected => Err(unexpected_reply_message(project)),
     }
 }
 
@@ -476,6 +661,14 @@ fn run_session_inner(
     context: &DapContext,
 ) -> Result<ExitCode> {
     let mut server_requests = ServerRequests::new();
+    if crate::json::to_vec(initialize).len() > GODOT_WRITE_CAP {
+        output.failure(
+            initialize.get("seq").cloned().unwrap_or(Value::Null),
+            "initialize",
+            "message too large for Godot",
+        )?;
+        return Ok(ExitCode::from(1));
+    }
     send_to_godot(&mut connection.writer, initialize)?;
     match wait_for_initialize(initialize, output, input, buffer, &mut server_requests)? {
         InitializeWait::Ready => {}
@@ -572,6 +765,20 @@ fn forward_client_body(
             "DAP message type must be a string",
         ));
     }
+    if let Some(oversized) = oversized_client_write(body, &fields) {
+        match oversized {
+            OversizedWrite::Failure(failure) => {
+                output.failure(failure.request_seq, &failure.command, &failure.message)?;
+            }
+            OversizedWrite::Drop => {
+                crate::warn!(
+                    "dropping oversized DAP message to Godot, {} bytes",
+                    body.len()
+                );
+            }
+        }
+        return Ok(());
+    }
     let rewrite = fields
         .type_
         .is_some_and(|value| value.string_eq("response"))
@@ -579,7 +786,7 @@ fn forward_client_body(
             .command
             .is_some_and(|command| command.string_eq("launch") || command.string_eq("attach"));
     if !rewrite {
-        write_frame(&mut connection.writer, body, FRAME_CAP)?;
+        write_frame(&mut connection.writer, body, GODOT_WRITE_CAP)?;
         return Ok(());
     }
     let failure = forward_client(parse_message(body)?, server_requests, connection, context)?;
@@ -587,6 +794,35 @@ fn forward_client_body(
         output.failure(failure.request_seq, &failure.command, &failure.message)?;
     }
     Ok(())
+}
+
+enum OversizedWrite {
+    Failure(RequestFailure),
+    Drop,
+}
+
+fn oversized_client_write(
+    body: &[u8],
+    fields: &crate::json::TopLevel<'_>,
+) -> Option<OversizedWrite> {
+    if body.len() <= GODOT_WRITE_CAP {
+        return None;
+    }
+    if !fields.type_.is_some_and(|value| value.string_eq("request")) {
+        return Some(OversizedWrite::Drop);
+    }
+    let Ok(message) = parse_message(body) else {
+        return Some(OversizedWrite::Drop);
+    };
+    Some(OversizedWrite::Failure(RequestFailure {
+        request_seq: message.get("seq").cloned().unwrap_or(Value::Null),
+        command: message
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        message: "message too large for Godot".to_owned(),
+    }))
 }
 
 fn forward_client(
@@ -617,7 +853,28 @@ fn forward_client(
             }
         }
     }
-    send_to_godot(&mut connection.writer, &message)?;
+    let body = crate::json::to_vec(&message);
+    if body.len() > GODOT_WRITE_CAP {
+        if message.get("type").and_then(Value::as_str) != Some("request") {
+            crate::warn!(
+                "dropping oversized DAP message to Godot, {} bytes",
+                body.len()
+            );
+            return Ok(None);
+        }
+        let request_seq = message.get("seq").cloned().unwrap_or(Value::Null);
+        let command = message
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return Ok(Some(RequestFailure {
+            request_seq,
+            command,
+            message: "message too large for Godot".to_owned(),
+        }));
+    }
+    write_frame(&mut connection.writer, &body, GODOT_WRITE_CAP)?;
     Ok(None)
 }
 
@@ -640,7 +897,10 @@ fn rewrite_launch_or_attach(
     arguments.remove("request");
     arguments.remove("file");
     arguments.remove("project");
-    if command != "launch" {
+    if command == "attach" {
+        if context.mode == Mode::Headless {
+            return Err((request_seq, ATTACH_PRECONDITION.to_owned()));
+        }
         return Ok(());
     }
 
@@ -666,7 +926,7 @@ fn rewrite_launch_or_attach(
 }
 
 fn send_to_godot(writer: &mut TcpStream, message: &Value) -> Result<()> {
-    write_json(writer, message, FRAME_CAP, true)?;
+    write_json(writer, message, GODOT_WRITE_CAP, true)?;
     Ok(())
 }
 
@@ -704,9 +964,158 @@ mod tests {
             &DapContext {
                 project: PathBuf::from("/project"),
                 file: file.map(Path::to_path_buf),
+                mode: Mode::Headless,
                 exclude: Exclude::default(),
             },
         )
+    }
+
+    #[test]
+    fn attach_against_a_headless_owner_is_refused() {
+        let mut message = crate::json!({
+            "type": "request",
+            "seq": 7,
+            "command": "attach",
+            "arguments": {"adapter": "godot", "request": "attach"}
+        });
+        let result = rewrite_launch_or_attach(
+            &mut message,
+            "attach",
+            &DapContext {
+                project: PathBuf::from("/project"),
+                file: None,
+                mode: Mode::Headless,
+                exclude: Exclude::default(),
+            },
+        );
+        assert_eq!(
+            result,
+            Err((crate::json!(7), ATTACH_PRECONDITION.to_owned()))
+        );
+    }
+
+    #[test]
+    fn attach_with_a_gui_or_unmanaged_owner_is_forwarded() {
+        for mode in [Mode::Gui, Mode::Unmanaged] {
+            let mut message = crate::json!({
+                "type": "request",
+                "seq": 8,
+                "command": "attach",
+                "arguments": {"adapter": "godot", "request": "attach", "processId": 42}
+            });
+            let result = rewrite_launch_or_attach(
+                &mut message,
+                "attach",
+                &DapContext {
+                    project: PathBuf::from("/project"),
+                    file: None,
+                    mode,
+                    exclude: Exclude::default(),
+                },
+            );
+            assert!(result.is_ok());
+            assert_eq!(message["arguments"]["processId"], 42);
+            assert!(message["arguments"].get("adapter").is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_client_request_is_refused() {
+        let message = crate::json!({
+            "type": "request",
+            "seq": 9,
+            "command": "evaluate",
+            "arguments": {"expression": ("x".repeat(GODOT_WRITE_CAP))}
+        });
+        let body = crate::json::to_vec(&message);
+        let fields = crate::json::scan_top_level(&body).unwrap();
+        let Some(OversizedWrite::Failure(failure)) = oversized_client_write(&body, &fields) else {
+            panic!("an oversized request must be refused");
+        };
+        assert_eq!(failure.request_seq, crate::json!(9));
+        assert_eq!(failure.command, "evaluate");
+        assert_eq!(failure.message, "message too large for Godot");
+    }
+
+    #[test]
+    fn oversized_client_response_is_dropped() {
+        let message = crate::json!({
+            "type": "response",
+            "request_seq": 3,
+            "body": {"value": ("x".repeat(GODOT_WRITE_CAP))}
+        });
+        let body = crate::json::to_vec(&message);
+        let fields = crate::json::scan_top_level(&body).unwrap();
+        assert!(matches!(
+            oversized_client_write(&body, &fields),
+            Some(OversizedWrite::Drop)
+        ));
+    }
+
+    #[test]
+    fn owner_errors_are_classified() {
+        let project = Path::new("/project");
+        assert!(owner_error_message(&io::Error::from(io::ErrorKind::TimedOut), project).is_none());
+        assert!(owner_error_message(&io::Error::from(io::ErrorKind::NotFound), project).is_none());
+        assert!(
+            owner_error_message(&io::Error::from(io::ErrorKind::ConnectionRefused), project)
+                .is_none()
+        );
+        let denied =
+            owner_error_message(&io::Error::from(io::ErrorKind::PermissionDenied), project)
+                .expect("permission denied fails fast");
+        assert!(
+            denied.contains("cannot talk to the Godot language server"),
+            "{denied}"
+        );
+        let decode = owner_error_message(&io::Error::other("bad json"), project)
+            .expect("a decode error fails fast");
+        assert!(decode.contains("unexpected owner reply"), "{decode}");
+    }
+
+    #[test]
+    fn owner_status_replies_are_classified() {
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"ready","dap_port":4000,"mode":"headless"})),
+            OwnerStatus::Ready {
+                port: 4000,
+                mode: Mode::Headless
+            }
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"ready","dap_port":4000,"mode":"gui"})),
+            OwnerStatus::Ready {
+                port: 4000,
+                mode: Mode::Gui
+            }
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"ready","dap_port":4000})),
+            OwnerStatus::Ready {
+                port: 4000,
+                mode: Mode::Unmanaged
+            }
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"starting"})),
+            OwnerStatus::Busy
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"recovering"})),
+            OwnerStatus::Busy
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"error":"project mismatch"})),
+            OwnerStatus::Mismatch
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"status":"ready"})),
+            OwnerStatus::Unexpected
+        ));
+        assert!(matches!(
+            owner_status(&crate::json!({"unexpected": true})),
+            OwnerStatus::Unexpected
+        ));
     }
 
     #[test]

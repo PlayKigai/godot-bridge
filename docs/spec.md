@@ -197,16 +197,35 @@ Three recoveries in 60 s: showMessage "Godot keeps crashing, see <log>", exit 1.
 Same framing, 8 MiB. Every message to the client gets a bridge `seq` from 1;
 Godot-to-client requests keep a `seq` map so `request_seq` maps back.
 
-1. Hold the client's `initialize`, buffer later messages (8 MiB). Failures
-   below answer it with `success: false` and exit 1.
-2. Resolve root, settings, project. Take `<hash>.dap.lock`: "A debug session
-   for <project> is already running".
-3. `lsp_port` set: connect to `dap_port`. Else find the owner via the socket
-   ("No Godot language server runs for <project>. Open a .gd file of the
-   project in your editor first."), poll every 500 ms until `ready` under the
-   deadline, connect.
-4. Forward `initialize`, flush the buffer.
-5. `launch`/`attach`: drop `adapter`, `request`, `file`, `project`; set
+1. Hold the client's `initialize`, buffer later messages (8 MiB). A first
+   request that is not `initialize` gets a failure response. Failures below
+   answer `initialize` with `success: false` and exit 1. Clients size their
+   own `initialize` timeout from `startup_timeout_s`.
+2. Resolve root, settings, project. `project_dir` set: resolve it exactly
+   like the owner does and join a relative `--file` to it; a file outside it
+   fails with "<file> is outside project_dir <dir>".
+3. `lsp_port` set: mode is unmanaged. Else find the owner via the socket in
+   two phases. Phase 1, 10 s: retry every 500 ms while no owner answers; a
+   project-mismatch reply, permission denied or an undecodable reply fail at
+   once. Only not-found seen: "No Godot language server runs for <project>.
+   Open a .gd file of the project in your editor first." Connection refused
+   seen: "A previous language server for <project> did not exit cleanly;
+   restart it". Phase 2, from the first reply: poll every 500 ms until
+   `ready` under the deadline; transient errors are tolerated, 10 s of
+   consecutive errors fail with "Godot language server for <project> exited
+   while starting". The owner socket is bound before Godot is resolved, so
+   phase 1 normally ends within a second.
+   Then take `<hash>.dap.lock` ("A debug session for <project> is already
+   running (or an editor hand-off is in progress)"), re-read status for the
+   current `dap_port`, connect.
+4. Forward `initialize`, flush the buffer. Requests over 4 MiB get a failure
+   "message too large for Godot"; oversize responses and events are dropped
+   with a warning.
+5. `attach` with a headless owner fails: "attach needs a game started from
+   the Godot editor window: run open-editor, then press Play there. Set
+   lsp_port to use your own editor. Games started by run are not attachable;
+   use launch to debug them." GUI or unmanaged: forwarded untouched.
+   `launch`/`attach`: drop `adapter`, `request`, `file`, `project`; set
    `project` to the project dir; `scene`: `main` or absent stays `main`,
    `current` needs `--file` ("scene current requires --file"), a `.tscn` is
    used directly, a script goes through scene resolution ("No scene uses
@@ -282,8 +301,13 @@ worktrees.
 `GODOT_BRIDGE_SETTINGS` and take the bridge path from user settings only.
 
 Debug adapter: the bridge runs as `["dap", "--file", file]` when a file is
-known, cwd the project. Zed maps a `Launch` `program` ending in `.tscn` to
-`scene`, else `main`; `Attach` ignores `process_id`. Zed substitutes
+known, cwd the project. Zed maps a `Launch` `program` ending in `.gd` or `.tscn` to `scene:
+"current"` with `file`, any other program is an error;
+`Attach` ignores `process_id`. Zed's locator accepts any command ending in
+`godot-bridge`. VS Code resolves `scene: "current"` from the active `.gd` or
+`.tscn` editor and starts the language server first when it is not running.
+Neovim resolves `file` from the configuration, the current buffer, else the
+last `.gd`/`.tscn` buffer seen; the bridge finds or waits for an owner. Zed substitutes
 `$ZED_FILE` in `debug.json`. The `godot` debug locator accepts a
 `godot-bridge run` task and returns a launch scenario with its `--scene` and
 `--file` values, so the shipped `godot: run` tasks debug without a

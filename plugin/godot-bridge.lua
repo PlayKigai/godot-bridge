@@ -12,4 +12,5 @@ command("GodotDoc", "Open the Godot class reference for a symbol", function(args
 end, "?")
 command("GodotStatus", "Show godot-bridge status", bridge.status)
 command("GodotRestart", "Restart the Godot language server", bridge.restart)
+command("GodotDebug", "Start a Godot debug session", bridge.debug)
 command("GodotBridgeInstall", "Download and install the godot-bridge binary", bridge.install)

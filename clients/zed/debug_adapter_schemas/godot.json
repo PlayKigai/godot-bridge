@@ -3,15 +3,17 @@
   "properties": {
     "request": {
       "type": "string",
-      "enum": ["launch", "attach"]
+      "enum": ["launch", "attach"],
+      "description": "launch starts a game; attach connects to a game started from the Godot editor window (open editor, then press Play). cwd, args, envs and stop_on_entry are ignored: Godot's debug launch takes no arguments."
     },
     "scene": {
-      "type": "string"
+      "type": "string",
+      "description": "\"main\" runs the project's main scene, \"current\" runs the scene of the file given in \"file\", or a res:// path to a .tscn scene, e.g. res://scenes/main.tscn."
     },
     "file": {
-      "type": "string"
+      "type": "string",
+      "description": "Path of the .gd or .tscn file used by scene \"current\". A .tscn is normalised to its res:// path; a .gd runs the scene of that script."
     }
   },
-  "required": ["request"],
-  "additionalProperties": false
+  "required": ["request"]
 }

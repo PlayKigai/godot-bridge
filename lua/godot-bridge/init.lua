@@ -1,6 +1,6 @@
 local M = {}
 
-local VERSION = "1.0.4"
+local VERSION = "1.0.5"
 local CARGO_LINE = "cargo install godot-bridge --locked"
 local INSTALL_HINT = "run :GodotBridgeInstall or " .. CARGO_LINE
 local MACOS_MSG = "godot-bridge: macOS is not supported. Linux and Windows only."
@@ -87,7 +87,7 @@ local function first_hash(text)
   return hash and hash:lower() or nil
 end
 
--- Bare and relative names are resolved here because Windows would search the project cwd first.
+-- Bare names are resolved here because Windows would search the project cwd first.
 local function bridge()
   if resolved_bridge then
     return resolved_bridge
@@ -99,10 +99,7 @@ local function bridge()
   if name:match("^~[/\\]") then
     name = vim.fs.joinpath(vim.uv.os_homedir(), name:sub(3))
   end
-  if name ~= vim.fs.basename(name) or name:sub(1, 1) == "~" then
-    if not is_absolute(name) then
-      name = vim.fs.joinpath(vim.uv.os_homedir(), name)
-    end
+  if name ~= vim.fs.basename(name) then
     resolved_bridge = name
     return name
   end
@@ -126,7 +123,9 @@ local function bridge()
     resolved_bridge = cargo
     return cargo
   end
-  return cargo
+  vim.notify("godot-bridge: bridge binary not found; " .. INSTALL_HINT, vim.log.levels.WARN)
+  resolved_bridge = name
+  return name
 end
 
 local function bridge_env()
@@ -145,17 +144,44 @@ local function dap_env()
   return env
 end
 
-local function root_of(bufnr)
-  local file = vim.api.nvim_buf_get_name(bufnr or 0)
-  if file == "" then
+local function is_godot_file(path)
+  return type(path) == "string" and (path:match("%.gd$") ~= nil or path:match("%.tscn$") ~= nil)
+end
+
+local last_godot_file
+
+local function remember_godot_file()
+  local file = vim.api.nvim_buf_get_name(0)
+  if is_godot_file(file) then
+    last_godot_file = file
+  end
+end
+
+local function resolve_dap_file(config)
+  if is_godot_file(config and config.file) then
+    return config.file
+  end
+  local current = vim.api.nvim_buf_get_name(0)
+  if is_godot_file(current) then
+    return current
+  end
+  return last_godot_file
+end
+
+local function project_of(dir)
+  local marker = vim.fs.find("project.godot", { path = dir, upward = true })[1]
+  return marker and vim.fs.dirname(marker) or nil
+end
+
+local function root_of(file)
+  if not file or file == "" then
     return nil
   end
-  local marker = vim.fs.find("project.godot", { path = vim.fs.dirname(file), upward = true })[1]
-  if not marker then
+  local root = project_of(vim.fs.dirname(file))
+  if not root then
     vim.notify("godot-bridge: no project.godot above " .. file, vim.log.levels.WARN)
-    return nil
   end
-  return vim.fs.dirname(marker)
+  return root
 end
 
 local function notify_result(label, result)
@@ -165,7 +191,7 @@ local function notify_result(label, result)
 end
 
 local function run_in_root(args)
-  local root = root_of()
+  local root = root_of(vim.api.nvim_buf_get_name(0))
   if not root then
     return
   end
@@ -190,7 +216,7 @@ local function check_version()
 end
 
 local function start_lsp(bufnr)
-  local root = root_of(bufnr)
+  local root = root_of(vim.api.nvim_buf_get_name(bufnr or 0))
   if not root then
     return
   end
@@ -367,18 +393,42 @@ function M.setup(opts)
       start_lsp(args.buf)
     end,
   })
+  if pcall(require, "dap") then
+    M.dap()
+  end
+end
+
+local function current_scene_or_script()
+  local file = vim.api.nvim_buf_get_name(0)
+  if not is_godot_file(file) then
+    vim.notify("godot-bridge: open a .gd or .tscn file first.", vim.log.levels.WARN)
+    return nil
+  end
+  return file
 end
 
 function M.run()
-  run_in_root({ "run", "--file", vim.api.nvim_buf_get_name(0) })
+  local file = current_scene_or_script()
+  if not file then
+    return
+  end
+  run_in_root({ "run", "--file", file })
 end
 
 function M.run_scene()
-  run_in_root({ "run", "--file", vim.api.nvim_buf_get_name(0), "--scene", "current" })
+  local file = current_scene_or_script()
+  if not file then
+    return
+  end
+  run_in_root({ "run", "--file", file, "--scene", "current" })
 end
 
 function M.open_editor()
-  run_in_root({ "open-editor", "--file", vim.api.nvim_buf_get_name(0) })
+  local file = current_scene_or_script()
+  if not file then
+    return
+  end
+  run_in_root({ "open-editor", "--file", file })
 end
 
 function M.doc(symbol)
@@ -413,26 +463,75 @@ function M.restart()
   end
 end
 
+local DEFAULT_DAP_CONFIGURATIONS = {
+  { type = "godot", request = "launch", name = "Godot: run project", scene = "main" },
+  { type = "godot", request = "launch", name = "Godot: run current scene", scene = "current" },
+  { type = "godot", request = "attach", name = "Godot: attach" },
+}
+
+local function initialize_timeout_s()
+  local settings = type(config.settings) == "table" and config.settings or {}
+  local startup = tonumber(settings.startup_timeout_s) or 600
+  return startup == 0 and 3600 or startup + 40
+end
+
+local function merge_dap_configurations(existing)
+  local merged = {}
+  local seen = {}
+  if type(existing) == "table" then
+    for _, item in ipairs(existing) do
+      merged[#merged + 1] = item
+      if type(item) == "table" and type(item.name) == "string" then
+        seen[item.name] = true
+      end
+    end
+  end
+  for _, item in ipairs(DEFAULT_DAP_CONFIGURATIONS) do
+    if not seen[item.name] then
+      merged[#merged + 1] = vim.deepcopy(item)
+      seen[item.name] = true
+    end
+  end
+  return merged
+end
+
 function M.dap()
   local ok, dap = pcall(require, "dap")
   if not ok then
     vim.notify("godot-bridge: nvim-dap is not installed", vim.log.levels.ERROR)
-    return
+    return nil
   end
-  dap.adapters.godot = function(callback)
-    local file = vim.api.nvim_buf_get_name(0)
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = vim.api.nvim_create_augroup("godot-bridge-dap", { clear = true }),
+    callback = remember_godot_file,
+  })
+  dap.adapters.godot = function(callback, config)
+    if dap.session() or next(dap.sessions()) then
+      vim.notify("godot-bridge: a debug session is already running", vim.log.levels.WARN)
+      return
+    end
+    local file = resolve_dap_file(config)
+    local cwd = root_of(file) or project_of(vim.fn.getcwd()) or vim.fn.getcwd()
     callback({
       type = "executable",
       command = bridge(),
-      args = file ~= "" and { "dap", "--file", file } or { "dap" },
-      options = { cwd = root_of(), env = dap_env() },
+      args = file and { "dap", "--file", file } or { "dap" },
+      options = {
+        cwd = cwd,
+        env = dap_env(),
+        initialize_timeout_sec = initialize_timeout_s(),
+      },
     })
   end
-  dap.configurations.gdscript = dap.configurations.gdscript or {
-    { type = "godot", request = "launch", name = "Godot: run project", scene = "main" },
-    { type = "godot", request = "launch", name = "Godot: run current scene", scene = "current" },
-    { type = "godot", request = "attach", name = "Godot: attach" },
-  }
+  dap.configurations.gdscript = merge_dap_configurations(dap.configurations.gdscript)
+  return dap
+end
+
+function M.debug()
+  local dap = M.dap()
+  if dap then
+    dap.continue()
+  end
 end
 
 return M

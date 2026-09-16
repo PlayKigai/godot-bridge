@@ -2,7 +2,7 @@
   "name": "godot-bridge",
   "displayName": "Godot Bridge",
   "description": "GDScript in VS Code, backed by the Godot editor's own language server and debugger.",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "publisher": "PlayKigai",
   "license": "MIT",
   "repository": {
@@ -207,7 +207,8 @@
                 "enum": [
                   "attach"
                 ],
-                "default": "attach"
+                "default": "attach",
+                "description": "Attaches to a game started from the Godot editor window: run \"Godot: Open Editor\", then press Play there. Set godot.lspPort to attach to your own editor. Games started by \"Godot: Run Project\" are not attachable; use launch to debug them."
               }
             }
           }

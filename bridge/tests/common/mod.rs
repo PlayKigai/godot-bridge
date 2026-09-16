@@ -45,17 +45,38 @@ impl BridgeClient {
         config: Option<&Path>,
         settings: Option<&str>,
     ) -> Self {
-        let config = config
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| runtime.join("config"));
-        std::fs::create_dir_all(&config).unwrap();
         let command = match protocol {
             Protocol::Lsp => "lsp",
             Protocol::Dap => "dap",
         };
+        Self::spawn(&[command], project, runtime, config, settings)
+    }
+
+    #[allow(dead_code)]
+    pub fn start_dap_with_file(project: &Path, runtime: &Path, settings: &str, file: &str) -> Self {
+        Self::spawn(
+            &["dap", "--file", file],
+            project,
+            runtime,
+            None,
+            Some(settings),
+        )
+    }
+
+    fn spawn(
+        args: &[&str],
+        project: &Path,
+        runtime: &Path,
+        config: Option<&Path>,
+        settings: Option<&str>,
+    ) -> Self {
+        let config = config
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| runtime.join("config"));
+        std::fs::create_dir_all(&config).unwrap();
         let mut process = Command::new(env!("CARGO_BIN_EXE_godot-bridge"));
         process
-            .arg(command)
+            .args(args)
             .current_dir(project)
             .env("GODOT_BRIDGE_LOG", "debug")
             .env_remove("GODOT_BRIDGE_SETTINGS")
