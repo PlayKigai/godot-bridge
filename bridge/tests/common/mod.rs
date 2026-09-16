@@ -126,14 +126,20 @@ impl BridgeClient {
     }
 
     pub fn receive_until(
-        &self,
+        &mut self,
         timeout: Duration,
         mut predicate: impl FnMut(&Value) -> bool,
     ) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
-            let message = self.messages.recv_timeout(remaining).unwrap();
+            let message = match self.messages.recv_timeout(remaining) {
+                Ok(message) => message,
+                Err(error) => panic!(
+                    "no message from the bridge: {error}; exit status {:?}",
+                    self.child.try_wait()
+                ),
+            };
             if predicate(&message) {
                 return message;
             }
