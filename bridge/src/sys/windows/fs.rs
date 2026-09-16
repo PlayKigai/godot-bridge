@@ -165,11 +165,13 @@ pub fn fallback_runtime_dir() -> io::Result<PathBuf> {
 }
 
 /// The rendezvous address for one project: a named pipe, which lives in the
-/// kernel object namespace rather than in the runtime directory. The runtime
-/// directory is returned unchanged because Windows has no path length limit
-/// that would force a fallback.
+/// kernel object namespace rather than in the runtime directory. The name
+/// also hashes the runtime directory so bridges with redirected runtime
+/// directories never meet on one pipe. The runtime directory is returned
+/// unchanged because Windows has no path length limit that would force a
+/// fallback.
 pub fn socket_path(runtime: &Path, hash: &str) -> io::Result<(PathBuf, PathBuf)> {
-    Ok((runtime.to_path_buf(), pipe_name(hash)))
+    Ok((runtime.to_path_buf(), pipe_name(runtime, hash)))
 }
 
 /// The rendezvous address that belongs to a state file in the runtime
@@ -180,11 +182,12 @@ pub fn socket_path_for_state(state: &Path) -> PathBuf {
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    pipe_name(&hash)
+    pipe_name(state.parent().unwrap_or(Path::new("")), &hash)
 }
 
-fn pipe_name(hash: &str) -> PathBuf {
-    PathBuf::from(format!(r"\\.\pipe\godot-bridge-{hash}"))
+fn pipe_name(runtime: &Path, hash: &str) -> PathBuf {
+    let runtime = crate::fnv::hash_hex(runtime.to_string_lossy().as_bytes());
+    PathBuf::from(format!(r"\\.\pipe\godot-bridge-{runtime}-{hash}"))
 }
 
 /// Delete a socket left behind by a dead owner. A named pipe disappears with
