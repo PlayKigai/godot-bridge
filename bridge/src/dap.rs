@@ -673,7 +673,13 @@ fn run_session_inner(
     match wait_for_initialize(initialize, output, input, buffer, &mut server_requests)? {
         InitializeWait::Ready => {}
         InitializeWait::ClientEof => return Ok(ExitCode::SUCCESS),
-        InitializeWait::ClientInvalid | InitializeWait::GodotDead => {
+        InitializeWait::ClientInvalid => return Ok(ExitCode::from(1)),
+        InitializeWait::GodotDead => {
+            output.failure(
+                initialize.get("seq").cloned().unwrap_or(Value::Null),
+                "initialize",
+                "Godot closed the debug connection before answering initialize",
+            )?;
             return Ok(ExitCode::from(1));
         }
     }

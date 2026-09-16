@@ -218,7 +218,9 @@ Godot-to-client requests keep a `seq` map so `request_seq` maps back.
    Then take `<hash>.dap.lock` ("A debug session for <project> is already
    running (or an editor hand-off is in progress)"), re-read status for the
    current `dap_port`, connect.
-4. Forward `initialize`, flush the buffer. Requests over 4 MiB get a failure
+4. Forward `initialize`, flush the buffer. Godot closing the connection
+   before it answers fails `initialize` with "Godot closed the debug
+   connection before answering initialize". Requests over 4 MiB get a failure
    "message too large for Godot"; oversize responses and events are dropped
    with a warning.
 5. `attach` with a headless owner fails: "attach needs a game started from

@@ -559,6 +559,7 @@ fn dap_server(listener: TcpListener, stop: &AtomicBool) {
 }
 
 fn serve_dap_client(stream: TcpStream) {
+    stream.set_nonblocking(false).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = stream;
