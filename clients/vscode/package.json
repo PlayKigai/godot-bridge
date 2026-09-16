@@ -2,7 +2,7 @@
   "name": "godot-bridge",
   "displayName": "Godot Bridge",
   "description": "GDScript in VS Code, backed by the Godot editor's own language server and debugger.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "publisher": "PlayKigai",
   "license": "MIT",
   "repository": {
