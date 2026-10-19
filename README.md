@@ -98,6 +98,15 @@ settings go under `lsp.godot.settings`:
 { "lsp": { "godot": { "settings": { "project_dir": "game" } } } }
 ```
 
+The settings editor does not list these keys. Edit the JSON with
+`zed: open settings file`.
+
+The Flatpak build keeps user settings in
+`~/.var/app/dev.zed.Zed/config/zed/settings.json` and the downloaded bridge
+in `~/.var/app/dev.zed.Zed/data/zed/extensions/work/godot`. The bridge and
+Godot run inside the sandbox, which sees your home directory but not the
+host's `/usr`, so Godot must live under your home directory.
+
 Zed applies a project's `.zed/settings.json` only after you trust the
 worktree.
 
@@ -208,6 +217,13 @@ no settings file is read.
   `lsp_port` is set. Open a `.gd` file of the project before starting a debug
   session.
 - One editor window per project. Godot serves one client.
+- Zed reports `No Godot binary` although `godot_path` is set: the bridge
+  reads `godot_path` from your user settings file only, never from what Zed
+  passes it, and finds that file through `XDG_CONFIG_HOME`. The extension
+  starts the bridge with your login shell's environment. With the Flatpak
+  build, a shell profile that exports `XDG_CONFIG_HOME="$HOME/.config"`
+  hides `~/.var/app/dev.zed.Zed/config/zed/settings.json` from the bridge.
+  Remove the export, or export `GODOT` with the path to Godot instead.
 - Reset: quit the editor, `pkill -x godot-bridge; pkill -x godot`, delete
   `$XDG_RUNTIME_DIR/godot-bridge` and `/tmp/godot-bridge-$UID`, the only
   places the bridge writes. On Windows, `taskkill /IM godot-bridge.exe /F`,
